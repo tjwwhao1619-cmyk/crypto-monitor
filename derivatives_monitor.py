@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -53,6 +54,42 @@ class Signal:
     message: str
     key: str
     snapshot: MarketSnapshot | None = None
+
+
+SIGNAL_LOG_FIELDS = [
+    "time",
+    "symbol",
+    "kind",
+    "score",
+    "title",
+    "strength_score",
+    "price",
+    "price_change_percent",
+    "oi_change_percent",
+    "global_long_short_ratio",
+    "top_position_ratio",
+    "top_account_ratio",
+    "taker_buy_sell_ratio",
+    "funding_rate_percent",
+    "net_flow_5m_usd",
+    "net_flow_15m_usd",
+    "net_flow_1h_usd",
+    "net_flow_4h_usd",
+    "net_flow_5m_ratio",
+    "net_flow_15m_ratio",
+    "net_flow_1h_ratio",
+    "net_flow_4h_ratio",
+    "price_position_24h",
+    "high_24h",
+    "low_24h",
+    "quote_volume_24h",
+    "volume_ratio_24h",
+    "short_term_score",
+    "mid_term_score",
+    "flow_alignment_score",
+    "structure_label",
+    "trade_plan",
+]
 
 
 class DerivativesMonitor:
@@ -784,14 +821,24 @@ class DerivativesMonitor:
             "net_flow_15m_ratio": snapshot.net_flow_ratio.get("15m", "") if snapshot else "",
             "net_flow_1h_ratio": snapshot.net_flow_ratio.get("1h", "") if snapshot else "",
             "net_flow_4h_ratio": snapshot.net_flow_ratio.get("4h", "") if snapshot else "",
+            "price_position_24h": snapshot.price_position_24h if snapshot else "",
+            "high_24h": snapshot.high_24h if snapshot else "",
+            "low_24h": snapshot.low_24h if snapshot else "",
+            "quote_volume_24h": snapshot.quote_volume_24h if snapshot else "",
+            "volume_ratio_24h": snapshot.volume_ratio_24h if snapshot else "",
+            "short_term_score": short_term_score(snapshot) if snapshot else "",
+            "mid_term_score": mid_term_score(snapshot) if snapshot else "",
+            "flow_alignment_score": flow_alignment_score(snapshot) if snapshot else "",
+            "structure_label": market_structure_label(snapshot) if snapshot else "",
+            "trade_plan": signal_trade_plan(signal) if snapshot else "",
         }
         path = Path(self.signal_log_path)
-        file_exists = path.exists()
+        fieldnames, write_header = ensure_csv_schema(path, SIGNAL_LOG_FIELDS)
         with path.open("a", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=list(row))
-            if not file_exists:
+            writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
+            if write_header:
                 writer.writeheader()
-            writer.writerow(row)
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
 
     def load_state(self) -> None:
         path = Path(self.state_path)
@@ -1381,6 +1428,68 @@ def resolve_telegram_credentials(config: dict[str, Any]) -> tuple[str | None, st
     if not chat_id and chat_id_env:
         chat_id = os.getenv(str(chat_id_env))
     return bot_token, chat_id
+
+
+
+def ensure_csv_schema(path: Path, required_fields: list[str]) -> tuple[list[str], bool]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or path.stat().st_size == 0:
+        return list(required_fields), True
+
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        existing_fields = [field for field in (reader.fieldnames or []) if field]
+        rows = list(reader)
+        if not existing_fields:
+            backup_path = backup_csv_before_schema_upgrade(path)
+            logging.warning(
+                "Signal CSV had no readable header; backed up before schema reset: path=%s backup=%s",
+                path,
+                backup_path,
+            )
+            rewrite_csv(path, required_fields, [])
+            return list(required_fields), False
+
+        fieldnames = existing_fields + [
+            field for field in required_fields
+            if field not in existing_fields
+        ]
+        if fieldnames == existing_fields:
+            return fieldnames, False
+
+    backup_path = backup_csv_before_schema_upgrade(path)
+    rewrite_csv(path, fieldnames, rows)
+    logging.info(
+        "Upgraded signal CSV schema: path=%s backup=%s added_fields=%s",
+        path,
+        backup_path,
+        ",".join(field for field in fieldnames if field not in existing_fields),
+    )
+    return fieldnames, False
+
+
+
+def backup_csv_before_schema_upgrade(path: Path) -> Path:
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = path.with_name(f"{path.name}.schema_backup_{timestamp}")
+    suffix = 1
+    while backup_path.exists():
+        backup_path = path.with_name(f"{path.name}.schema_backup_{timestamp}_{suffix}")
+        suffix += 1
+    shutil.copy2(path, backup_path)
+    return backup_path
+
+
+
+def rewrite_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    temp_path = path.with_name(f".{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+    temp_path.replace(path)
 
 
 
