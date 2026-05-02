@@ -2317,6 +2317,47 @@ def market_structure_label(snapshot: MarketSnapshot) -> str:
     return "暂无明显诱多/诱空/洗盘结构。"
 
 
+def liquidation_risk_label(snapshot: MarketSnapshot) -> str:
+    high_position = snapshot.price_position_24h is not None and snapshot.price_position_24h >= 75
+    low_position = snapshot.price_position_24h is not None and snapshot.price_position_24h <= 35
+    oi_hot = snapshot.oi_change_percent >= 8
+    oi_expanding = snapshot.oi_change_percent >= 3
+    funding = snapshot.funding_rate_percent or 0
+    funding_hot = snapshot.funding_rate_percent is not None and snapshot.funding_rate_percent >= 0.03
+    funding_negative = snapshot.funding_rate_percent is not None and snapshot.funding_rate_percent <= -0.03
+    longs_crowded = (
+        (snapshot.global_long_short_ratio is not None and snapshot.global_long_short_ratio >= 2)
+        or (snapshot.top_position_ratio is not None and snapshot.top_position_ratio >= 2)
+    )
+    shorts_crowded = (
+        (snapshot.global_long_short_ratio is not None and snapshot.global_long_short_ratio <= 0.75)
+        or (snapshot.top_account_ratio is not None and snapshot.top_account_ratio <= 0.75)
+    )
+    taker_weak = snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio < 1
+    taker_recover = snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio >= 1.15
+    flow15 = summary_flow_value(snapshot, "15m")
+
+    if oi_hot and abs(funding) >= 0.08 and abs(snapshot.price_change_percent) >= 5:
+        return (
+            "双向高波动: OI快速扩张，资金费率偏极端，价格大幅波动，"
+            "上下插针概率都高。"
+        )
+
+    if high_position and oi_expanding and (funding_hot or longs_crowded) and (taker_weak or flow15 < 0):
+        return (
+            "下方扫多风险: 价格处24h高位且OI扩张，多头拥挤/费率偏热，"
+            "短线买盘或资金流转弱。"
+        )
+
+    if low_position and oi_expanding and (funding_negative or shorts_crowded) and (taker_recover or flow15 > 0):
+        return (
+            "上方扫空风险: 价格处24h低位且OI扩张，空头拥挤/费率偏负，"
+            "短线买盘或资金流回暖。"
+        )
+
+    return "暂无明显清算压力: OI、位置、费率和短线资金暂未形成同向挤压。"
+
+
 def ai_signal_review(signal: Signal) -> str:
     snapshot = signal.snapshot
     if snapshot is None:
@@ -2431,6 +2472,7 @@ def format_signal_for_telegram(signal: Signal) -> str:
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_label(mid_term_score(snapshot))})\n"
         f"AI共振复核: {ai_signal_review(signal)}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
+        f"清算风险: {liquidation_risk_label(snapshot)}\n"
         f"交易计划: {signal_trade_plan(signal)}\n"
         f"判断: {reason}\n"
         f"时间: {now}"
@@ -3206,6 +3248,7 @@ def format_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> 
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
         f"信号: {signal_names}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
+        f"清算风险: {liquidation_risk_label(snapshot)}\n"
         f"判断: {diagnose_snapshot(snapshot, signals)}"
     )
 
@@ -3246,6 +3289,7 @@ def format_ask_context(
         f"资金流共振: {flow_score}/10 ({flow_alignment_note(flow_score)})\n\n"
         f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
+        f"清算风险: {liquidation_risk_label(snapshot)}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
         f"综合判断: {diagnose_snapshot(snapshot, signals)}\n\n"
@@ -3394,6 +3438,7 @@ def print_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> N
     print(f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})")
     print(f"信号: {signal_names}")
     print(f"结构判断: {market_structure_label(snapshot)}")
+    print(f"清算风险: {liquidation_risk_label(snapshot)}")
     print(f"判断: {diagnose_snapshot(snapshot, signals)}")
 
 
