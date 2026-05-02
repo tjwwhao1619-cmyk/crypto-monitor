@@ -1011,8 +1011,12 @@ class DerivativesMonitor:
             self.send_telegram_text(
                 bot_token,
                 chat_id,
-                "可用命令:\n/symbol SIGNUSDT - 单币诊断\n/check SIGN - 单币诊断，自动补 USDT\n/summary - 立即查看市场摘要\n/hot - 查看强势过热候选\n/signals - 查看最近信号\n/top - 查看强度最高信号\n/review - 查看最近10条信号\n/perf - 查看最近信号表现\n/regime - 查看市场大方向\n/sectors - 查看热点/冷门板块\n/dev help - DevOps 命令",
+                "可用命令:\n/symbol SIGNUSDT - 单币诊断\n/check SIGN - 单币诊断，自动补 USDT\n/ask SIGN - 生成单币结构化上下文，自动补 USDT\n/summary - 立即查看市场摘要\n/hot - 查看强势过热候选\n/signals - 查看最近信号\n/top - 查看强度最高信号\n/review - 查看最近10条信号\n/perf - 查看最近信号表现\n/regime - 查看市场大方向\n/sectors - 查看热点/冷门板块\n/dev help - DevOps 命令",
             )
+            return
+
+        if command == "/ask":
+            self.handle_ask_command(bot_token, chat_id, parts[1:])
             return
 
         if command == "/summary":
@@ -1068,6 +1072,51 @@ class DerivativesMonitor:
         except Exception as exc:
             logging.exception("Failed to diagnose symbol from Telegram command")
             self.send_telegram_text(bot_token, chat_id, f"{symbol} 查询失败: {type(exc).__name__}: {exc}")
+
+    def handle_ask_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
+        if not args:
+            self.send_telegram_text(bot_token, chat_id, "用法: /ask KNC 或 /ask KNCUSDT")
+            return
+
+        symbol = args[0].upper()
+        if not symbol.endswith("USDT"):
+            symbol = f"{symbol}USDT"
+
+        try:
+            snapshot = self.fetch_snapshot(symbol)
+            signals = self.evaluate_snapshot(snapshot, {"mode": "both"})
+            combined_signal = self.combined_signal(snapshot, signals)
+            display_signals = ([combined_signal] if combined_signal else []) + signals
+            market_snapshots = self.ask_market_snapshots()
+            recent_rows = self.load_recent_symbol_signal_rows(symbol, 3)
+            self.send_telegram_text(
+                bot_token,
+                chat_id,
+                format_ask_context(snapshot, display_signals, market_snapshots, recent_rows),
+            )
+        except Exception as exc:
+            logging.exception("Failed to build ask context from Telegram command")
+            self.send_telegram_text(bot_token, chat_id, f"{symbol} /ask 查询失败: {type(exc).__name__}: {exc}")
+
+    def ask_market_snapshots(self) -> list[MarketSnapshot]:
+        majors = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        snapshots = [self.latest_snapshots[symbol] for symbol in majors if symbol in self.latest_snapshots]
+        if len(snapshots) == len(majors):
+            return snapshots
+
+        by_symbol = {snapshot.symbol: snapshot for snapshot in snapshots}
+        for symbol in majors:
+            if symbol in by_symbol:
+                continue
+            try:
+                by_symbol[symbol] = self.fetch_snapshot(symbol)
+            except Exception:
+                logging.debug("Failed to fetch ask market snapshot: %s", symbol, exc_info=True)
+        return [by_symbol[symbol] for symbol in majors if symbol in by_symbol]
+
+    def load_recent_symbol_signal_rows(self, symbol: str, limit: int = 3) -> list[dict[str, str]]:
+        rows = self.load_recent_signal_rows(1000)
+        return [row for row in rows if row.get("symbol", "").upper() == symbol][:limit]
 
     def handle_dev_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
         if not args or args[0].lower() == "help":
@@ -3161,6 +3210,86 @@ def format_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> 
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"判断: {diagnose_snapshot(snapshot, signals)}"
     )
+
+
+def format_ask_context(
+    snapshot: MarketSnapshot,
+    signals: list[Signal],
+    market_snapshots: list[MarketSnapshot],
+    recent_signal_rows: list[dict[str, str]],
+) -> str:
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    signal_text = format_ask_signal_list(signals)
+    trade_plan = signal_trade_plan(signals[0]) if signals else "暂无交易计划"
+    recent_text = format_recent_symbol_signals(recent_signal_rows)
+    market_text = market_方向_summary(market_snapshots) if market_snapshots else "大盘风向: 暂无 BTC/ETH/SOL 快照"
+    flow_score = flow_alignment_score(snapshot)
+
+    text = (
+        f"[ASK] {snapshot.symbol} 结构化上下文\n"
+        f"时间: {now}\n\n"
+        "基础数据:\n"
+        f"当前价格: {snapshot.close_price:.8g}\n"
+        f"价格变化: {snapshot.price_change_percent:+.2f}%\n"
+        f"OI变化: {snapshot.oi_change_percent:+.2f}%\n"
+        f"24h位置: {format_optional_value(snapshot.price_position_24h)}% ({price_position_label(snapshot)})\n"
+        f"24h高低: {format_optional_value(snapshot.high_24h)} / {format_optional_value(snapshot.low_24h)}\n\n"
+        "衍生品情绪:\n"
+        f"全局多空比: {format_optional_value(snapshot.global_long_short_ratio)}\n"
+        f"大户持仓多空比: {format_optional_value(snapshot.top_position_ratio)}\n"
+        f"大户账户多空比: {format_optional_value(snapshot.top_account_ratio)}\n"
+        f"主动买卖比: {format_optional_value(snapshot.taker_buy_sell_ratio)}\n"
+        f"Funding: {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})\n\n"
+        "资金流:\n"
+        f"5m: {format_usd(snapshot.net_flow_usd.get('5m'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('5m'))}\n"
+        f"15m: {format_usd(snapshot.net_flow_usd.get('15m'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('15m'))}\n"
+        f"1h: {format_usd(snapshot.net_flow_usd.get('1h'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('1h'))}\n"
+        f"4h: {format_usd(snapshot.net_flow_usd.get('4h'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('4h'))}\n"
+        f"资金流共振: {flow_score}/10 ({flow_alignment_note(flow_score)})\n\n"
+        f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}\n"
+        f"结构判断: {market_structure_label(snapshot)}\n"
+        f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
+        f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
+        f"综合判断: {diagnose_snapshot(snapshot, signals)}\n\n"
+        "信号列表:\n"
+        f"{signal_text}\n\n"
+        "交易计划:\n"
+        f"{trade_plan}\n\n"
+        "市场大方向简述:\n"
+        f"{market_text}\n\n"
+        "最近该币信号:\n"
+        f"{recent_text}"
+    )
+    return truncate_text(text, 3500)
+
+
+def format_ask_signal_list(signals: list[Signal]) -> str:
+    if not signals:
+        return "暂无触发信号"
+
+    lines = []
+    for signal in signals:
+        lines.append(
+            f"- {signal.kind}: score={signal.score} 强度={signal_strength_score(signal):.2f} "
+            f"({strength_grade(signal_strength_score(signal))}) - {signal.message}"
+        )
+    return "\n".join(lines)
+
+
+def format_recent_symbol_signals(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return "最近暂无该币信号记录"
+
+    lines = []
+    for row in rows:
+        time_text = row.get("time", "-").replace("T", " ")[:19]
+        lines.append(
+            f"- {time_text} {row.get('kind', '-')} "
+            f"score={row.get('score', '-')} 强度={format_csv_strength(row.get('strength_score'))} "
+            f"价格={format_csv_number(row.get('price_change_percent'))}% "
+            f"OI={format_csv_number(row.get('oi_change_percent'))}%"
+        )
+    return "\n".join(lines)
 
 
 def print_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> None:
