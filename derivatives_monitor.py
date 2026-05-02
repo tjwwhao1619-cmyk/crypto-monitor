@@ -1011,7 +1011,7 @@ class DerivativesMonitor:
             self.send_telegram_text(
                 bot_token,
                 chat_id,
-                "可用命令:\n/symbol SIGNUSDT - 单币诊断\n/check SIGN - 单币诊断，自动补 USDT\n/ask SIGN - 生成单币结构化上下文，自动补 USDT\n/summary - 立即查看市场摘要\n/hot - 查看强势过热候选\n/signals - 查看最近信号\n/top - 查看强度最高信号\n/review - 查看最近10条信号\n/perf - 查看最近信号表现\n/regime - 查看市场大方向\n/sectors - 查看热点/冷门板块\n/dev help - DevOps 命令",
+                "可用命令:\n/check SYMBOL - 单币诊断\n/ask SYMBOL - AI复核单币\n/summary - 市场温度摘要\n/regime - 市场大方向\n/sectors - 热点/冷门板块\n/hot - 强势过热候选\n/signals - 最近信号\n/top - 强度最高信号\n/review - 最近10条信号\n/perf - 最近信号表现\n/dev help - 运维命令入口",
             )
             return
 
