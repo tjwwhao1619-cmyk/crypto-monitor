@@ -3265,10 +3265,26 @@ def format_ask_context(
     recent_text = format_recent_symbol_signals(recent_signal_rows)
     market_text = market_方向_summary(market_snapshots) if market_snapshots else "大盘风向: 暂无 BTC/ETH/SOL 快照"
     flow_score = flow_alignment_score(snapshot)
+    system_direction = diagnose_snapshot(snapshot, signals)
+    triggered_signal_state = "有触发信号" if signals else "无触发信号"
+    available_levels = (
+        f"当前价格 {snapshot.close_price:.8g}；"
+        f"24h高 {format_optional_value(snapshot.high_24h)}；"
+        f"24h低 {format_optional_value(snapshot.low_24h)}；"
+        f"交易计划 {trade_plan}；"
+        f"结构判断 {market_structure_label(snapshot)}；"
+        f"清算风险 {liquidation_risk_label(snapshot)}"
+    )
 
     text = (
         f"[ASK] {snapshot.symbol} 结构化上下文\n"
         f"时间: {now}\n\n"
+        "系统优先结论:\n"
+        f"综合判断: {system_direction}\n"
+        f"信号触发状态: {triggered_signal_state}\n"
+        f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
+        f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
+        f"大盘风向: {market_text}\n\n"
         "基础数据:\n"
         f"当前价格: {snapshot.close_price:.8g}\n"
         f"价格变化: {snapshot.price_change_percent:+.2f}%\n"
@@ -3292,13 +3308,13 @@ def format_ask_context(
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
-        f"综合判断: {diagnose_snapshot(snapshot, signals)}\n\n"
+        f"综合判断: {system_direction}\n\n"
         "信号列表:\n"
         f"{signal_text}\n\n"
         "交易计划:\n"
         f"{trade_plan}\n\n"
-        "市场大方向简述:\n"
-        f"{market_text}\n\n"
+        "确认/失效可用价位来源:\n"
+        f"{available_levels}\n\n"
         "最近该币信号:\n"
         f"{recent_text}"
     )
@@ -3312,13 +3328,16 @@ def ask_ai_review(context_text: str) -> str | None:
 
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     prompt = (
-        "你是一个中文加密货币衍生品交易员复核助手。"
+        "你是中文加密货币衍生品交易系统的严格复核员，不是自由分析师。"
         "你只基于用户提供的结构化上下文复核，不读取、不要求、不推断任何 API key、token 或系统环境变量。"
         "这不是投资建议，只是交易复盘和风险检查。"
-        "必须输出: 方向、置信度、关键依据、主要风险、确认位/失效位、操作倾向。"
-        "方向必须在偏多、偏空、观望中选择；置信度使用低/中/高。"
-        "确认位/失效位如果上下文没有明确价格位，就基于当前价、24h 高低或结构信息给出近似参考并标注'参考'。"
-        "保持简洁，使用中文，避免编造上下文之外的数据。"
+        "最高优先级: 必须优先服从系统上下文里的综合判断、信号列表、交易计划、结构判断、清算风险、短线评分、中线评分、大盘风向。"
+        "如果信号列表为'暂无触发信号'或信号触发状态为'无触发信号'，不得强行给看多/看空，只能写观望、偏观望或等待确认；除非上下文数据明显单边，并且必须说明只是低置信度例外。"
+        "解释规则: OI下降+价格下跌，多为仓位退出/风险释放，不等于新空进场；OI上升+价格上涨，多为空头/多头博弈加剧，需结合主动买卖比和资金流；极端负Funding表示空头拥挤或异常，不等于直接做多，只能提示可能反抽/插针风险；极端正Funding表示多头成本高，不等于直接做空，只能提示追多风险；资金流多周期分歧时，必须降置信度；现货/链上与合约背离时，必须写成风险。"
+        "禁止编造不存在的支撑、阻力、清算位。确认条件和失效条件里的价格位只能来自当前价格、24h高低、交易计划、结构判断、清算风险；没有可用价位就写'上下文无明确价位'。"
+        "如果交易计划为'暂无交易计划'或'暂无交易计划参考'，操作倾向必须包含'暂无交易计划，不建议按 AI 文本直接开仓'。"
+        "固定输出格式，且只输出这些字段: [AI复核]\n系统方向:\nAI复核结论:\n置信度:\n关键依据:\n反向风险:\n确认条件:\n失效条件:\n操作倾向:"
+        "置信度只能用低/中/高。全文控制在1200字以内，中文直接，偏交易复盘风格。"
     )
     payload = {
         "model": model,
@@ -3356,7 +3375,7 @@ def ask_ai_review(context_text: str) -> str | None:
     if not text:
         logging.warning("OpenAI ask review returned no text; falling back to structured context")
         return None
-    return truncate_text(text.strip(), 1800)
+    return truncate_text(text.strip(), 1200)
 
 
 def extract_openai_response_text(data: dict[str, Any]) -> str:
@@ -3384,7 +3403,8 @@ def format_ask_response(context_text: str, ai_review: str | None) -> str:
     if not ai_review:
         return context_text
 
-    prefix = f"[AI复核]\n{ai_review.strip()}\n\n[系统上下文]\n"
+    review_text = ai_review.strip()
+    prefix = f"{review_text}\n\n[系统上下文]\n" if review_text.startswith("[AI复核]") else f"[AI复核]\n{review_text}\n\n[系统上下文]\n"
     remaining = max(0, 3500 - len(prefix))
     return prefix + truncate_text(context_text, remaining)
 
