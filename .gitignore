@@ -10,3 +10,4 @@ telegram_update_offset.txt
 market_cap_cache.json
 signals.csv
 signals.old.csv
+signals.csv.schema_backup_*
