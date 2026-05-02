@@ -5,7 +5,9 @@ import datetime as dt
 import json
 import logging
 import os
+import secrets
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -129,9 +131,11 @@ class DerivativesMonitor:
         self.telegram_commands_config = config.get("telegram_commands", {})
         self.telegram_command_thread_started = False
         self.telegram_update_offset = self.load_telegram_update_offset()
+        self.pending_dev_confirmations: dict[str, tuple[str, float]] = {}
 
     def run_forever(self) -> None:
         self.start_telegram_command_worker()
+        self.send_pending_dev_restart_status()
         self.refresh_symbols_if_due(force=True)
         logging.info("Monitoring %s derivatives symbols", len(self.symbol_configs))
         while True:
@@ -1007,7 +1011,7 @@ class DerivativesMonitor:
             self.send_telegram_text(
                 bot_token,
                 chat_id,
-                "可用命令:\n/symbol SIGNUSDT - 单币诊断\n/check SIGN - 单币诊断，自动补 USDT\n/summary - 立即查看市场摘要\n/hot - 查看强势过热候选\n/signals - 查看最近信号\n/top - 查看强度最高信号\n/review - 查看最近10条信号\n/perf - 查看最近信号表现\n/regime - 查看市场大方向\n/sectors - 查看热点/冷门板块",
+                "可用命令:\n/symbol SIGNUSDT - 单币诊断\n/check SIGN - 单币诊断，自动补 USDT\n/summary - 立即查看市场摘要\n/hot - 查看强势过热候选\n/signals - 查看最近信号\n/top - 查看强度最高信号\n/review - 查看最近10条信号\n/perf - 查看最近信号表现\n/regime - 查看市场大方向\n/sectors - 查看热点/冷门板块\n/dev help - DevOps 命令",
             )
             return
 
@@ -1039,6 +1043,10 @@ class DerivativesMonitor:
             self.handle_sectors_command(bot_token, chat_id)
             return
 
+        if command == "/dev":
+            self.handle_dev_command(bot_token, chat_id, parts[1:])
+            return
+
         if command not in ("/symbol", "/check"):
             return
 
@@ -1060,6 +1068,153 @@ class DerivativesMonitor:
         except Exception as exc:
             logging.exception("Failed to diagnose symbol from Telegram command")
             self.send_telegram_text(bot_token, chat_id, f"{symbol} 查询失败: {type(exc).__name__}: {exc}")
+
+    def handle_dev_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
+        if not args or args[0].lower() == "help":
+            self.send_telegram_text(bot_token, chat_id, dev_help_text())
+            return
+
+        subcommand = args[0].lower()
+        try:
+            if subcommand == "status":
+                ok, output = run_dev_command(["sudo", "-n", "systemctl", "status", "crypto-monitor", "--no-pager"], timeout=10)
+                if not ok:
+                    self.send_telegram_text(bot_token, chat_id, f"状态查询失败: {output}")
+                    return
+                self.send_telegram_text(bot_token, chat_id, format_systemctl_status(output))
+                return
+
+            if subcommand == "logs":
+                ok, output = run_dev_command(["sudo", "-n", "journalctl", "-u", "crypto-monitor", "-n", "30", "--no-pager"], timeout=10)
+                if not ok:
+                    self.send_telegram_text(bot_token, chat_id, f"日志查询失败: {output}")
+                    return
+                self.send_telegram_text(bot_token, chat_id, truncate_text(f"最近日志:\n{output}", 3500))
+                return
+
+            if subcommand == "git":
+                status_ok, status_output = run_dev_command(["git", "status", "--short"], timeout=10)
+                log_ok, log_output = run_dev_command(["git", "log", "--oneline", "--max-count=3"], timeout=10)
+                if not status_ok:
+                    self.send_telegram_text(bot_token, chat_id, f"Git 状态失败: {status_output}")
+                    return
+                if not log_ok:
+                    self.send_telegram_text(bot_token, chat_id, f"Git 日志失败: {log_output}")
+                    return
+                status_text = status_output.strip() or "工作区干净"
+                self.send_telegram_text(bot_token, chat_id, truncate_text(f"Git 状态:\n{status_text}\n\n最近提交:\n{log_output}", 3500))
+                return
+
+            if subcommand == "backtest":
+                ok, output = run_dev_command(
+                    [
+                        "/opt/crypto-monitor/.venv/bin/python",
+                        "/opt/crypto-monitor/backtest_signals.py",
+                        "-c",
+                        "/opt/crypto-monitor/derivatives_config.yaml",
+                        "--limit",
+                        "80",
+                    ],
+                    timeout=60,
+                )
+                if not ok:
+                    self.send_telegram_text(bot_token, chat_id, f"回测失败: {output}")
+                    return
+                self.send_telegram_text(bot_token, chat_id, truncate_text(f"回测摘要:\n{output}", 3500))
+                return
+
+            if subcommand == "restart":
+                code = f"{secrets.randbelow(1_000_000):06d}"
+                self.pending_dev_confirmations[chat_id] = (code, time.time() + 120)
+                self.send_telegram_text(bot_token, chat_id, f"确认重启请在 2 分钟内发送:\n/dev confirm restart {code}")
+                return
+
+            if subcommand == "confirm" and len(args) >= 3 and args[1].lower() == "restart":
+                self.handle_dev_restart_confirmation(bot_token, chat_id, args[2])
+                return
+
+            self.send_telegram_text(bot_token, chat_id, "未知 /dev 命令。发送 /dev help 查看用法。")
+        except Exception:
+            logging.exception("Failed to handle Telegram dev command")
+            self.send_telegram_text(bot_token, chat_id, "DevOps 命令执行失败，请查看服务日志。")
+
+    def handle_dev_restart_confirmation(self, bot_token: str, chat_id: str, code: str) -> None:
+        pending = self.pending_dev_confirmations.get(chat_id)
+        now = time.time()
+        if not pending:
+            self.send_telegram_text(bot_token, chat_id, "没有待确认的重启请求。")
+            return
+
+        expected_code, expires_at = pending
+        if now > expires_at:
+            self.pending_dev_confirmations.pop(chat_id, None)
+            self.send_telegram_text(bot_token, chat_id, "确认码已过期，请重新发送 /dev restart。")
+            return
+
+        if code != expected_code:
+            self.send_telegram_text(bot_token, chat_id, "确认码错误，未执行重启。")
+            return
+
+        self.pending_dev_confirmations.pop(chat_id, None)
+        self.save_pending_dev_restart_notification(chat_id)
+        self.send_telegram_text(bot_token, chat_id, "确认通过，正在重启服务...")
+        ok, output = run_dev_command(["sudo", "-n", "systemctl", "restart", "crypto-monitor"], timeout=20)
+        if not ok:
+            self.clear_pending_dev_restart_notification()
+            self.send_telegram_text(bot_token, chat_id, f"重启失败: {output}")
+            return
+
+        self.clear_pending_dev_restart_notification()
+        status_ok, status_output = run_dev_command(["sudo", "-n", "systemctl", "status", "crypto-monitor", "--no-pager"], timeout=10)
+        if not status_ok:
+            self.send_telegram_text(bot_token, chat_id, f"已执行重启，但状态查询失败: {status_output}")
+            return
+
+        self.send_telegram_text(bot_token, chat_id, "重启完成。\n" + format_systemctl_status(status_output))
+
+    def dev_restart_notification_path(self) -> Path:
+        return Path("/opt/crypto-monitor/dev_restart_notification.json")
+
+    def save_pending_dev_restart_notification(self, chat_id: str) -> None:
+        payload = {"chat_id": chat_id, "created_at": time.time()}
+        self.dev_restart_notification_path().write_text(json.dumps(payload), encoding="utf-8")
+
+    def clear_pending_dev_restart_notification(self) -> None:
+        try:
+            self.dev_restart_notification_path().unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logging.warning("Failed to clear pending dev restart notification", exc_info=True)
+
+    def send_pending_dev_restart_status(self) -> None:
+        path = self.dev_restart_notification_path()
+        if not path.exists():
+            return
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            chat_id = str(payload.get("chat_id", ""))
+            created_at = float(payload.get("created_at", 0))
+        except Exception:
+            logging.warning("Failed to read pending dev restart notification", exc_info=True)
+            self.clear_pending_dev_restart_notification()
+            return
+
+        self.clear_pending_dev_restart_notification()
+        if time.time() - created_at > 300:
+            return
+
+        telegram = self.config.get("notifications", {}).get("telegram", {})
+        bot_token, chat_ids = resolve_telegram_credentials(telegram)
+        if not bot_token or chat_id not in set(split_chat_ids(chat_ids or "")):
+            return
+
+        ok, output = run_dev_command(["sudo", "-n", "systemctl", "status", "crypto-monitor", "--no-pager"], timeout=10)
+        if not ok:
+            self.send_telegram_text(bot_token, chat_id, f"重启后状态查询失败: {output}")
+            return
+        self.send_telegram_text(bot_token, chat_id, "重启完成。\n" + format_systemctl_status(output))
 
     def handle_regime_command(self, bot_token: str, chat_id: str) -> None:
         self.send_telegram_text(bot_token, chat_id, "正在生成市场大方向，请稍等...")
@@ -2698,6 +2853,84 @@ def format_snapshot_lines(
 
 def split_chat_ids(chat_ids: str) -> list[str]:
     return [chat_id.strip() for chat_id in str(chat_ids).split(",") if chat_id.strip()]
+
+
+def truncate_text(text: str, limit: int = 3500) -> str:
+    if len(text) <= limit:
+        return text
+    suffix = "\n...已截断"
+    return text[: max(0, limit - len(suffix))] + suffix
+
+
+def run_dev_command(args: list[str], timeout: int = 20) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            args,
+            cwd="/opt/crypto-monitor",
+            shell=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"命令超时（{timeout}s）"
+    except FileNotFoundError:
+        return False, "命令不存在"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    output = "\n".join(part.strip() for part in (completed.stdout, completed.stderr) if part and part.strip())
+    output = output.strip()
+    if completed.returncode != 0:
+        message = output or f"退出码 {completed.returncode}"
+        return False, truncate_text(message, 1200)
+    return True, output
+
+
+def format_systemctl_status(output: str) -> str:
+    active = "-"
+    main_pid = "-"
+    memory = "-"
+    started_at = "-"
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Active:"):
+            active = line.removeprefix("Active:").strip()
+            marker = " since "
+            if marker in active:
+                before_since, after_since = active.split(marker, 1)
+                active = before_since.strip()
+                started_at = after_since.split(";", 1)[0].strip()
+        elif line.startswith("Main PID:"):
+            main_pid = line.removeprefix("Main PID:").strip()
+        elif line.startswith("Memory:"):
+            memory = line.removeprefix("Memory:").strip()
+
+    status = "运行中" if "active (running)" in active else active
+    return "\n".join(
+        [
+            "crypto-monitor 状态:",
+            f"Active: {status}",
+            f"PID: {main_pid}",
+            f"Memory: {memory}",
+            f"Started: {started_at}",
+        ]
+    )
+
+
+def dev_help_text() -> str:
+    return (
+        "DevOps 命令:\n"
+        "/dev status - 查看服务状态摘要\n"
+        "/dev logs - 查看最近 30 行日志\n"
+        "/dev git - 查看工作区和最近提交\n"
+        "/dev backtest - 执行最近 80 条信号回测\n"
+        "/dev restart - 生成重启确认码\n"
+        "/dev confirm restart <code> - 确认重启服务\n"
+        "/dev help - 查看帮助"
+    )
 
 
 
