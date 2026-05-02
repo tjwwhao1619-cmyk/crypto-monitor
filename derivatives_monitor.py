@@ -131,7 +131,7 @@ class DerivativesMonitor:
         self.telegram_commands_config = config.get("telegram_commands", {})
         self.telegram_command_thread_started = False
         self.telegram_update_offset = self.load_telegram_update_offset()
-        self.pending_dev_confirmations: dict[str, tuple[str, float]] = {}
+        self.pending_dev_confirmations: dict[str, tuple[str, str, float]] = {}
 
     def run_forever(self) -> None:
         self.start_telegram_command_worker()
@@ -1125,12 +1125,22 @@ class DerivativesMonitor:
 
             if subcommand == "restart":
                 code = f"{secrets.randbelow(1_000_000):06d}"
-                self.pending_dev_confirmations[chat_id] = (code, time.time() + 120)
+                self.pending_dev_confirmations[chat_id] = ("restart", code, time.time() + 120)
                 self.send_telegram_text(bot_token, chat_id, f"确认重启请在 2 分钟内发送:\n/dev confirm restart {code}")
+                return
+
+            if subcommand == "deploy":
+                code = f"{secrets.randbelow(1_000_000):06d}"
+                self.pending_dev_confirmations[chat_id] = ("deploy", code, time.time() + 120)
+                self.send_telegram_text(bot_token, chat_id, f"确认部署请在 2 分钟内发送:\n/dev confirm deploy {code}")
                 return
 
             if subcommand == "confirm" and len(args) >= 3 and args[1].lower() == "restart":
                 self.handle_dev_restart_confirmation(bot_token, chat_id, args[2])
+                return
+
+            if subcommand == "confirm" and len(args) >= 3 and args[1].lower() == "deploy":
+                self.handle_dev_deploy_confirmation(bot_token, chat_id, args[2])
                 return
 
             self.send_telegram_text(bot_token, chat_id, "未知 /dev 命令。发送 /dev help 查看用法。")
@@ -1139,18 +1149,12 @@ class DerivativesMonitor:
             self.send_telegram_text(bot_token, chat_id, "DevOps 命令执行失败，请查看服务日志。")
 
     def handle_dev_restart_confirmation(self, bot_token: str, chat_id: str, code: str) -> None:
-        pending = self.pending_dev_confirmations.get(chat_id)
-        now = time.time()
-        if not pending:
+        pending = self.get_pending_dev_confirmation(chat_id, "restart")
+        if pending is None:
             self.send_telegram_text(bot_token, chat_id, "没有待确认的重启请求。")
             return
 
-        expected_code, expires_at = pending
-        if now > expires_at:
-            self.pending_dev_confirmations.pop(chat_id, None)
-            self.send_telegram_text(bot_token, chat_id, "确认码已过期，请重新发送 /dev restart。")
-            return
-
+        expected_code = pending
         if code != expected_code:
             self.send_telegram_text(bot_token, chat_id, "确认码错误，未执行重启。")
             return
@@ -1172,11 +1176,106 @@ class DerivativesMonitor:
 
         self.send_telegram_text(bot_token, chat_id, "重启完成。\n" + format_systemctl_status(status_output))
 
+    def handle_dev_deploy_confirmation(self, bot_token: str, chat_id: str, code: str) -> None:
+        pending = self.get_pending_dev_confirmation(chat_id, "deploy")
+        if pending is None:
+            self.send_telegram_text(bot_token, chat_id, "没有待确认的部署请求。")
+            return
+
+        expected_code = pending
+        if code != expected_code:
+            self.send_telegram_text(bot_token, chat_id, "确认码错误，未执行部署。")
+            return
+
+        self.pending_dev_confirmations.pop(chat_id, None)
+        self.send_telegram_text(bot_token, chat_id, "确认通过，开始部署...")
+
+        status_ok, status_output = run_dev_command(["git", "status", "--short"], timeout=10)
+        if not status_ok:
+            self.send_telegram_text(bot_token, chat_id, f"部署拒绝，Git 状态检查失败: {status_output}")
+            return
+        if status_output.strip():
+            self.send_telegram_text(bot_token, chat_id, truncate_text(f"部署拒绝，工作区存在未提交改动:\n{status_output}", 3500))
+            return
+
+        pull_ok, pull_output = run_dev_command(["git", "pull", "--ff-only", "origin", "main"], timeout=60)
+        if not pull_ok:
+            self.send_telegram_text(bot_token, chat_id, truncate_text(f"部署失败，git pull --ff-only origin main 未通过:\n{pull_output}", 3500))
+            return
+
+        compile_ok, compile_summary = run_dev_compile_checks()
+        if not compile_ok:
+            self.send_telegram_text(
+                bot_token,
+                chat_id,
+                truncate_text(f"部署失败，编译检查未通过。\n\nPull 输出:\n{pull_output or '(无输出)'}\n\n编译结果:\n{compile_summary}", 3500),
+            )
+            return
+
+        self.save_pending_dev_deploy_notification(chat_id, pull_output, compile_summary)
+        restart_ok, restart_output = run_dev_command(["sudo", "-n", "systemctl", "restart", "crypto-monitor"], timeout=20)
+        if not restart_ok:
+            self.clear_pending_dev_restart_notification()
+            self.send_telegram_text(
+                bot_token,
+                chat_id,
+                truncate_text(
+                    f"部署失败，服务重启未通过。\n\nPull 输出:\n{pull_output or '(无输出)'}\n\n编译结果:\n{compile_summary}\n\n重启输出:\n{restart_output}",
+                    3500,
+                ),
+            )
+            return
+
+        status_ok, status_output = run_dev_command(["sudo", "-n", "systemctl", "status", "crypto-monitor", "--no-pager"], timeout=10)
+        if not status_ok:
+            self.send_telegram_text(
+                bot_token,
+                chat_id,
+                truncate_text(
+                    f"部署已执行，但状态查询失败: {status_output}\n\nPull 输出:\n{pull_output or '(无输出)'}\n\n编译结果:\n{compile_summary}",
+                    3500,
+                ),
+            )
+            return
+
+        self.clear_pending_dev_restart_notification()
+        self.send_telegram_text(
+            bot_token,
+            chat_id,
+            format_dev_deploy_summary(pull_output, compile_summary, format_systemctl_status(status_output)),
+        )
+
+    def get_pending_dev_confirmation(self, chat_id: str, action: str) -> str | None:
+        pending = self.pending_dev_confirmations.get(chat_id)
+        now = time.time()
+        if not pending:
+            return None
+
+        pending_action, expected_code, expires_at = pending
+        if now > expires_at:
+            self.pending_dev_confirmations.pop(chat_id, None)
+            return None
+
+        if pending_action != action:
+            return None
+
+        return expected_code
+
     def dev_restart_notification_path(self) -> Path:
         return Path("/opt/crypto-monitor/dev_restart_notification.json")
 
     def save_pending_dev_restart_notification(self, chat_id: str) -> None:
-        payload = {"chat_id": chat_id, "created_at": time.time()}
+        payload = {"type": "restart", "chat_id": chat_id, "created_at": time.time()}
+        self.dev_restart_notification_path().write_text(json.dumps(payload), encoding="utf-8")
+
+    def save_pending_dev_deploy_notification(self, chat_id: str, pull_output: str, compile_summary: str) -> None:
+        payload = {
+            "type": "deploy",
+            "chat_id": chat_id,
+            "created_at": time.time(),
+            "pull_output": pull_output,
+            "compile_summary": compile_summary,
+        }
         self.dev_restart_notification_path().write_text(json.dumps(payload), encoding="utf-8")
 
     def clear_pending_dev_restart_notification(self) -> None:
@@ -1194,6 +1293,7 @@ class DerivativesMonitor:
 
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            notification_type = str(payload.get("type", "restart"))
             chat_id = str(payload.get("chat_id", ""))
             created_at = float(payload.get("created_at", 0))
         except Exception:
@@ -1212,8 +1312,18 @@ class DerivativesMonitor:
 
         ok, output = run_dev_command(["sudo", "-n", "systemctl", "status", "crypto-monitor", "--no-pager"], timeout=10)
         if not ok:
-            self.send_telegram_text(bot_token, chat_id, f"重启后状态查询失败: {output}")
+            if notification_type == "deploy":
+                self.send_telegram_text(bot_token, chat_id, f"部署后状态查询失败: {output}")
+            else:
+                self.send_telegram_text(bot_token, chat_id, f"重启后状态查询失败: {output}")
             return
+
+        if notification_type == "deploy":
+            pull_output = str(payload.get("pull_output", ""))
+            compile_summary = str(payload.get("compile_summary", ""))
+            self.send_telegram_text(bot_token, chat_id, format_dev_deploy_summary(pull_output, compile_summary, format_systemctl_status(output)))
+            return
+
         self.send_telegram_text(bot_token, chat_id, "重启完成。\n" + format_systemctl_status(output))
 
     def handle_regime_command(self, bot_token: str, chat_id: str) -> None:
@@ -2888,6 +2998,20 @@ def run_dev_command(args: list[str], timeout: int = 20) -> tuple[bool, str]:
     return True, output
 
 
+def run_dev_compile_checks() -> tuple[bool, str]:
+    files = ["derivatives_monitor.py", "backtest_signals.py"]
+    lines = []
+    all_ok = True
+    for filename in files:
+        ok, output = run_dev_command(["/opt/crypto-monitor/.venv/bin/python", "-m", "py_compile", filename], timeout=30)
+        if ok:
+            lines.append(f"{filename}: OK")
+        else:
+            all_ok = False
+            lines.append(f"{filename}: FAILED\n{output}")
+    return all_ok, "\n".join(lines)
+
+
 def format_systemctl_status(output: str) -> str:
     active = "-"
     main_pid = "-"
@@ -2920,6 +3044,20 @@ def format_systemctl_status(output: str) -> str:
     )
 
 
+def format_dev_deploy_summary(pull_output: str, compile_summary: str, service_status: str) -> str:
+    return truncate_text(
+        "\n\n".join(
+            [
+                "部署完成。",
+                f"Pull 输出:\n{pull_output.strip() or '(无输出)'}",
+                f"编译结果:\n{compile_summary}",
+                f"服务状态:\n{service_status}",
+            ]
+        ),
+        3500,
+    )
+
+
 def dev_help_text() -> str:
     return (
         "DevOps 命令:\n"
@@ -2929,6 +3067,8 @@ def dev_help_text() -> str:
         "/dev backtest - 执行最近 80 条信号回测\n"
         "/dev restart - 生成重启确认码\n"
         "/dev confirm restart <code> - 确认重启服务\n"
+        "/dev deploy - 生成部署确认码\n"
+        "/dev confirm deploy <code> - 确认部署最新 main 并重启服务\n"
         "/dev help - 查看帮助"
     )
 
