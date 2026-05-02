@@ -1089,11 +1089,9 @@ class DerivativesMonitor:
             display_signals = ([combined_signal] if combined_signal else []) + signals
             market_snapshots = self.ask_market_snapshots()
             recent_rows = self.load_recent_symbol_signal_rows(symbol, 3)
-            self.send_telegram_text(
-                bot_token,
-                chat_id,
-                format_ask_context(snapshot, display_signals, market_snapshots, recent_rows),
-            )
+            context_text = format_ask_context(snapshot, display_signals, market_snapshots, recent_rows)
+            ai_review = ask_ai_review(context_text)
+            self.send_telegram_text(bot_token, chat_id, format_ask_response(context_text, ai_review))
         except Exception as exc:
             logging.exception("Failed to build ask context from Telegram command")
             self.send_telegram_text(bot_token, chat_id, f"{symbol} /ask 查询失败: {type(exc).__name__}: {exc}")
@@ -3261,6 +3259,90 @@ def format_ask_context(
         f"{recent_text}"
     )
     return truncate_text(text, 3500)
+
+
+def ask_ai_review(context_text: str) -> str | None:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    prompt = (
+        "你是一个中文加密货币衍生品交易员复核助手。"
+        "你只基于用户提供的结构化上下文复核，不读取、不要求、不推断任何 API key、token 或系统环境变量。"
+        "这不是投资建议，只是交易复盘和风险检查。"
+        "必须输出: 方向、置信度、关键依据、主要风险、确认位/失效位、操作倾向。"
+        "方向必须在偏多、偏空、观望中选择；置信度使用低/中/高。"
+        "确认位/失效位如果上下文没有明确价格位，就基于当前价、24h 高低或结构信息给出近似参考并标注'参考'。"
+        "保持简洁，使用中文，避免编造上下文之外的数据。"
+    )
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": context_text}],
+            },
+        ],
+        "max_output_tokens": 900,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        logging.warning("OpenAI ask review failed; falling back to structured context", exc_info=True)
+        return None
+
+    text = extract_openai_response_text(data)
+    if not text:
+        logging.warning("OpenAI ask review returned no text; falling back to structured context")
+        return None
+    return truncate_text(text.strip(), 1800)
+
+
+def extract_openai_response_text(data: dict[str, Any]) -> str:
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    parts: list[str] = []
+    for item in data.get("output", []) if isinstance(data.get("output"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for content_item in content:
+            if not isinstance(content_item, dict):
+                continue
+            text = content_item.get("text") or content_item.get("output_text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n".join(parts)
+
+
+def format_ask_response(context_text: str, ai_review: str | None) -> str:
+    if not ai_review:
+        return context_text
+
+    prefix = f"[AI复核]\n{ai_review.strip()}\n\n[系统上下文]\n"
+    remaining = max(0, 3500 - len(prefix))
+    return prefix + truncate_text(context_text, remaining)
 
 
 def format_ask_signal_list(signals: list[Signal]) -> str:
