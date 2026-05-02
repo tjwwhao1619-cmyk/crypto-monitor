@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.bak
+*.safe.*
+.env
+*.env
+monitor_state.json
+telegram_update_offset.txt
+market_cap_cache.json
+signals.csv
+signals.old.csv

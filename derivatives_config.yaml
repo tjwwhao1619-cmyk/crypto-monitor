@@ -1,0 +1,102 @@
+poll_interval_seconds: 300
+period: 5m
+limit: 24
+binance_api_key_env: BINANCE_API_KEY
+screener:
+  enabled: true
+  refresh_interval_seconds: 600
+  quote_asset: USDT
+  min_open_interest_value_usd: 4000000
+  small_mid_market_cap_min: 15000000
+  small_mid_market_cap_max: 300000000
+  coingecko_pages: 8
+  coingecko_per_page: 250
+  coingecko_request_delay_seconds: 8
+  market_cap_cache_path: market_cap_cache.json
+  market_cap_cache_ttl_seconds: 21600
+  max_symbols: 300
+  main_symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - BNBUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - DOGEUSDT
+  - ADAUSDT
+  - AVAXUSDT
+  - LINKUSDT
+  - TONUSDT
+  - TRXUSDT
+  - DOTUSDT
+  include_symbols: []
+  exclude_symbols:
+  - BTCDOMUSDT
+  - PAXGUSDT
+  - USDCUSDT
+  - XAUTUSDT
+  market_cap_filter_enabled: false
+  min_24h_quote_volume_usd: 3000000
+  oi_fetch_workers: 12
+notifications:
+  webhook_url: ''
+  telegram:
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    chat_id_env: TELEGRAM_CHAT_ID
+summary:
+  enabled: true
+  interval_seconds: 600
+  top_n: 5
+symbols:
+  BTCUSDT:
+    mode: both
+  ETHUSDT:
+    mode: both
+rules:
+  discovery:
+    min_price_change_percent: 1.2
+    min_oi_change_percent: 4.0
+    min_taker_buy_sell_ratio: 1.15
+    max_global_long_short_ratio: 1.8
+  top_risk:
+    min_price_change_percent: 3.0
+    min_oi_change_percent: 8.0
+    min_global_long_short_ratio: 2.0
+    max_taker_buy_sell_ratio: 0.95
+    min_funding_rate_percent: 0.03
+  distribution:
+    min_price_change_percent: 2.0
+    max_oi_change_percent: -3.0
+    max_taker_buy_sell_ratio: 0.9
+alert_cooldown_seconds: 3600
+signal_log_path: signals.csv
+telegram_commands:
+  enabled: true
+  poll_interval_seconds: 5
+  offset_path: telegram_update_offset.txt
+scan_workers: 8
+state_path: monitor_state.json
+log_each_symbol: false
+confirmation:
+  enabled: true
+  period: 5m
+  limit: 3
+  discovery_min_price_change_percent: 0
+  discovery_min_oi_change_percent: 0
+  top_risk_min_price_change_percent: -1.5
+  distribution_max_oi_change_percent: 0
+market_filter:
+  enabled: true
+  benchmark_symbol: BTCUSDT
+  discovery_min_benchmark_confirm_price_percent: -0.8
+flow:
+  enabled: true
+  periods:
+  - 5m
+  - 15m
+  - 1h
+  - 4h
+alert_cooldowns:
+  hot_breakout: 1200
+  top_risk: 1800
+  distribution: 1800
+  discovery: 3600
