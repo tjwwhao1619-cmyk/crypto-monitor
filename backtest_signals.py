@@ -1,7 +1,10 @@
 import argparse
+import contextlib
 import csv
 import datetime as dt
+import io
 import statistics
+import sys
 import time
 from pathlib import Path
 
@@ -12,6 +15,7 @@ BASE = "https://fapi.binance.com"
 BULL = {"discovery", "hot_breakout", "bottom_reversal"}
 BEAR = {"top_risk", "distribution", "top_exhaustion"}
 HORIZONS = {"15m": 900, "1h": 3600, "4h": 14400, "12h": 43200, "24h": 86400}
+REPORT_HORIZONS = ["15m", "1h", "4h", "12h", "24h"]
 LONG_FLOW_GROUPS = (
     ("0-3", "长周期弱", 0, 3),
     ("4-6", "长周期分歧", 4, 6),
@@ -99,12 +103,16 @@ def eval_signal(session, row):
         return None
 
     side = direction(kind)
-    out = {"symbol": symbol, "kind": kind, "side": side}
+    out = {"symbol": symbol, "kind": kind, "side": side, "time": t, "time_ts": start}
     out["long_flow_alignment_score"] = parse_int(row.get("long_flow_alignment_score"))
     out["main_asset_score"] = parse_int(row.get("main_asset_score"))
     out["trap_risk_score"] = parse_int(row.get("trap_risk_score"))
+    out["entry_timing_score"] = parse_int(row.get("entry_timing_score"))
+    out["entry_timing_label"] = (row.get("entry_timing_label") or "").strip() or None
     out["signal_priority"] = (row.get("signal_priority") or "").strip().upper() or None
     out["signal_quality_score"] = parse_int(row.get("signal_quality_score"))
+    out["signal_quality_reason"] = row.get("signal_quality_reason") or ""
+    out["funding_rate_percent"] = parse_float(row.get("funding_rate_percent"))
     out["suppressed_from_telegram"] = parse_bool_int(row.get("suppressed_from_telegram"))
     for name in ("12h", "24h"):
         out[f"flow_{name}"] = parse_float(row.get(f"net_flow_{name}_usd"))
@@ -129,6 +137,10 @@ def eval_signal(session, row):
 
 def fmt(v):
     return "-" if v is None else f"{v:+.2f}%"
+
+
+def fmt_stat_value(v):
+    return "-" if v is None else fmt(v)
 
 
 def parse_float(value):
@@ -176,8 +188,51 @@ def fmt_ratio(v):
     return "-" if v is None else f"{v:.4g}"
 
 
+def horizon_values(rows, horizon):
+    return [x[horizon] for x in rows if x.get(horizon) is not None]
+
+
+def stats_for_values(vals):
+    if not vals:
+        return {
+            "n": 0,
+            "wins": 0,
+            "win_rate": None,
+            "avg": None,
+            "median": None,
+            "best": None,
+            "worst": None,
+        }
+    wins = sum(v > 0 for v in vals)
+    return {
+        "n": len(vals),
+        "wins": wins,
+        "win_rate": wins / len(vals) * 100,
+        "avg": statistics.mean(vals),
+        "median": statistics.median(vals),
+        "best": max(vals),
+        "worst": min(vals),
+    }
+
+
+def print_horizon_stat_line(prefix, rows, horizon, include_worst=False):
+    stat = stats_for_values(horizon_values(rows, horizon))
+    if not stat["n"]:
+        print(f"{prefix}{horizon}: 样本=0")
+        return
+    worst_part = f" 最差={fmt_stat_value(stat['worst'])}" if include_worst else ""
+    print(
+        f"{prefix}{horizon}: 样本={stat['n']} 胜率={stat['wins']}/{stat['n']} {stat['win_rate']:.1f}% "
+        f"平均={fmt_stat_value(stat['avg'])}{worst_part}"
+    )
+
+
 def flow_detail(x):
     parts = []
+    entry_label = x.get("entry_timing_label")
+    entry_score = x.get("entry_timing_score")
+    if entry_label and entry_score is not None:
+        parts.append(f"entry={entry_label}/{entry_score}")
     long_flow = x.get("long_flow_alignment_score")
     if long_flow is not None:
         parts.append(f"longFlow={long_flow}/9")
@@ -346,12 +401,194 @@ def print_trap_risk_backtest(results):
     print("")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-c", "--config", default="derivatives_config.yaml")
-    ap.add_argument("--limit", type=int, default=80)
-    args = ap.parse_args()
+def print_entry_timing_backtest(results):
+    labels = sorted({x.get("entry_timing_label") for x in results if x.get("entry_timing_label")})
+    print("[ENTRY TIMING] 入场时机/阶段分组回测")
+    if not labels:
+        print("暂无 entry_timing_label 样本")
+        print("")
+        return
 
+    for label in labels:
+        group_rows = [x for x in results if x.get("entry_timing_label") == label]
+        print(f"{label}: 样本={len(group_rows)}")
+        for h in ["15m", "1h", "4h", "12h", "24h"]:
+            vals = [x[h] for x in group_rows if x[h] is not None]
+            if not vals:
+                print(f"  {h}: 样本=0")
+                continue
+            wins = sum(v > 0 for v in vals)
+            print(
+                f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))} "
+                f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
+            )
+    print("")
+
+
+def kind_average(rows, horizon):
+    vals = horizon_values(rows, horizon)
+    return statistics.mean(vals) if vals else None
+
+
+def print_kind_ranking(results, title, reverse):
+    ranked = []
+    for kind in sorted(set(x["kind"] for x in results)):
+        rows = [x for x in results if x["kind"] == kind]
+        avg_1h = kind_average(rows, "1h")
+        avg_4h = kind_average(rows, "4h")
+        rank_value = avg_1h if avg_1h is not None else avg_4h
+        if rank_value is None:
+            continue
+        ranked.append((rank_value, kind, rows, avg_1h, avg_4h))
+
+    print(title)
+    if not ranked:
+        print("  暂无可排序样本")
+        return
+    ranked.sort(key=lambda item: item[0], reverse=reverse)
+    for rank_value, kind, rows, avg_1h, avg_4h in ranked[:5]:
+        vals_1h = horizon_values(rows, "1h")
+        wins_1h = sum(v > 0 for v in vals_1h)
+        win_text = f"{wins_1h}/{len(vals_1h)} {wins_1h/len(vals_1h)*100:.1f}%" if vals_1h else "-"
+        print(
+            f"  {kind}: 样本={len(rows)} 1h胜率={win_text} "
+            f"1h平均={fmt_stat_value(avg_1h)} 4h平均={fmt_stat_value(avg_4h)} 排序值={fmt_stat_value(rank_value)}"
+        )
+
+
+def print_summary_report(total_signals, results):
+    print("[SUMMARY] 综合总览")
+    print(f"总信号数: {total_signals}")
+    print(f"可评估信号数: {len(results)}")
+    for horizon in REPORT_HORIZONS:
+        stat = stats_for_values(horizon_values(results, horizon))
+        if not stat["n"]:
+            print(f"{horizon}: 样本=0")
+            continue
+        print(
+            f"{horizon}: 胜率={stat['wins']}/{stat['n']} {stat['win_rate']:.1f}% "
+            f"平均={fmt_stat_value(stat['avg'])}"
+        )
+    print_kind_ranking(results, "表现最好 kind TOP5:", reverse=True)
+    print_kind_ranking(results, "表现最差 kind TOP5:", reverse=False)
+    print("")
+
+
+def is_bad_signal(x):
+    loss_1h = x.get("1h") is not None and x["1h"] <= -3
+    loss_4h = x.get("4h") is not None and x["4h"] <= -3
+    adverse_mae = x.get("mae") is not None and x["mae"] <= -5
+    return loss_1h or loss_4h or adverse_mae
+
+
+def bad_signal_causes(x):
+    causes = []
+    trap_score = x.get("trap_risk_score")
+    if trap_score is not None and trap_score >= 6:
+        causes.append("trap 高")
+    long_flow = x.get("long_flow_alignment_score")
+    if long_flow is not None and long_flow <= 3:
+        causes.append("longFlow 弱")
+    if x.get("signal_priority") in ("C", "D"):
+        causes.append("quality C/D")
+    if x.get("entry_timing_label") in ("追高风险", "下跌中继", "不宜追"):
+        causes.append("entry label 风险")
+    quality_reason = str(x.get("signal_quality_reason") or "").lower()
+    if "spot/onchain weak" in quality_reason or "现货弱" in quality_reason or "现货/链上确认偏弱" in quality_reason:
+        causes.append("现货弱")
+    funding = x.get("funding_rate_percent")
+    if funding is not None and abs(funding) >= 0.08:
+        causes.append("Funding 极端")
+    return causes
+
+
+def print_bad_signals_report(results):
+    bad_rows = [x for x in results if is_bad_signal(x)]
+    cause_counts = {
+        "trap 高": 0,
+        "longFlow 弱": 0,
+        "quality C/D": 0,
+        "entry label 风险": 0,
+        "现货弱": 0,
+        "Funding 极端": 0,
+    }
+    multi_cause = 0
+    for row in bad_rows:
+        causes = bad_signal_causes(row)
+        if len(causes) >= 2:
+            multi_cause += 1
+        for cause in causes:
+            cause_counts[cause] += 1
+
+    print("[BAD SIGNALS] 坏信号归因")
+    print(f"坏信号定义: 1h或4h收益<=-3%，或MAE<=-5%")
+    print(f"坏信号样本: {len(bad_rows)}/{len(results)}")
+    if not bad_rows:
+        print("")
+        return
+    print(f"多重原因样本: {multi_cause}/{len(bad_rows)}")
+    for cause, count in sorted(cause_counts.items(), key=lambda item: (-item[1], item[0])):
+        rate = count / len(bad_rows) * 100 if bad_rows else 0
+        print(f"{cause}: {count} ({rate:.1f}%)")
+    print("")
+
+
+def combo_filter_keeps(x):
+    return (
+        x.get("signal_priority") in ("S", "A", "B")
+        and x.get("trap_risk_score") is not None
+        and x["trap_risk_score"] <= 5
+        and x.get("entry_timing_score") is not None
+        and x["entry_timing_score"] >= 5
+        and x.get("long_flow_alignment_score") is not None
+        and x["long_flow_alignment_score"] >= 3
+    )
+
+
+def print_combo_filter_report(results):
+    kept = [x for x in results if combo_filter_keeps(x)]
+    print("[COMBO FILTER] 组合过滤模拟")
+    print("规则: quality in S/A/B; trap<=5; entry>=5; longFlow>=3")
+    for label, rows in (("过滤前", results), ("过滤后", kept)):
+        print(f"{label}: 样本={len(rows)}")
+        for horizon in REPORT_HORIZONS:
+            print_horizon_stat_line("  ", rows, horizon, include_worst=True)
+    print("")
+
+
+def duplicate_groups(results):
+    ordered = sorted([x for x in results if x.get("time_ts") is not None], key=lambda item: item["time_ts"])
+    last_by_key = {}
+    first_rows = []
+    duplicate_rows = []
+    for row in ordered:
+        key = (row["symbol"], row["kind"])
+        previous = last_by_key.get(key)
+        if previous is not None and row["time_ts"] - previous["time_ts"] <= 1800:
+            duplicate_rows.append(row)
+        else:
+            first_rows.append(row)
+        last_by_key[key] = row
+    return first_rows, duplicate_rows
+
+
+def print_duplicate_performance(label, rows):
+    print(f"{label}: 样本={len(rows)}")
+    for horizon in ("1h", "4h"):
+        print_horizon_stat_line("  ", rows, horizon, include_worst=True)
+
+
+def print_duplicates_report(results):
+    first_rows, duplicate_rows = duplicate_groups(results)
+    print("[DUPLICATES] 重复信号分析")
+    print("定义: 同 symbol+kind 30分钟内重复信号")
+    print_duplicate_performance("首次", first_rows)
+    print_duplicate_performance("重复", duplicate_rows)
+    print("")
+
+
+def run_backtest(args):
     cfg = yaml.safe_load(Path(args.config).read_text()) or {}
     path = Path(str(cfg.get("signal_log_path", "signals.csv")))
     if not path.is_absolute():
@@ -395,6 +632,7 @@ def main():
     print_long_flow_backtest(results)
     print_main_asset_score_backtest(results)
     print_trap_risk_backtest(results)
+    print_entry_timing_backtest(results)
 
     print("最近20条:")
     for x in results[:20]:
@@ -404,6 +642,47 @@ def main():
             f"12h={fmt(x['12h'])} 24h={fmt(x['24h'])}"
             f"{flow_detail(x)} MFE={fmt(x['mfe'])} MAE={fmt(x['mae'])}"
         )
+
+    print("")
+    print_summary_report(len(rows), results)
+    print_bad_signals_report(results)
+    print_combo_filter_report(results)
+    print_duplicates_report(results)
+
+
+class Tee:
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, data):
+        for file in self.files:
+            file.write(data)
+        return len(data)
+
+    def flush(self):
+        for file in self.files:
+            file.flush()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-c", "--config", default="derivatives_config.yaml")
+    ap.add_argument("--limit", type=int, default=80)
+    ap.add_argument("--export-report")
+    args = ap.parse_args()
+
+    if not args.export_report:
+        run_backtest(args)
+        return
+
+    buffer = io.StringIO()
+    tee = Tee(sys.stdout, buffer)
+    with contextlib.redirect_stdout(tee):
+        run_backtest(args)
+
+    export_path = Path(args.export_report)
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    export_path.write_text(buffer.getvalue(), encoding="utf-8")
 
 
 if __name__ == "__main__":

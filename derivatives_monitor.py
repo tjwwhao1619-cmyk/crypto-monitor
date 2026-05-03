@@ -160,6 +160,9 @@ SIGNAL_LOG_FIELDS = [
     "trap_risk_score",
     "trap_risk_label",
     "trap_risk_reason",
+    "entry_timing_score",
+    "entry_timing_label",
+    "entry_timing_reason",
     "signal_priority",
     "signal_quality_score",
     "signal_quality_reason",
@@ -1448,6 +1451,7 @@ class DerivativesMonitor:
         main_score = main_asset_score(snapshot) if snapshot else None
         main_score_components = main_score.components if main_score else {}
         trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal) if snapshot else ("", "", "")
+        entry_score, entry_label, entry_reason = entry_timing_score(snapshot, signal) if snapshot else ("", "", "")
         priority, quality_score, quality_reason = signal_priority(signal, snapshot)
         suppressed_from_telegram, _suppressed_reason = self.telegram_signal_suppression(signal, priority, quality_score)
         row = {
@@ -1498,6 +1502,9 @@ class DerivativesMonitor:
             "trap_risk_score": trap_score,
             "trap_risk_label": trap_label,
             "trap_risk_reason": trap_reason,
+            "entry_timing_score": entry_score,
+            "entry_timing_label": entry_label,
+            "entry_timing_reason": entry_reason,
             "signal_priority": priority,
             "signal_quality_score": quality_score,
             "signal_quality_reason": quality_reason,
@@ -3797,6 +3804,153 @@ def signal_direction_label(kind: str | None) -> str:
     return "观察"
 
 
+def entry_timing_direction(kind: str | None) -> str:
+    raw = str(kind or "").strip().lower()
+    normalized = raw.replace("_", " ").replace("-", " ")
+    long_kinds = {
+        "discovery",
+        "hot breakout",
+        "bottom reversal",
+        "early breakout",
+        "possible early breakout",
+    }
+    risk_kinds = {
+        "top risk",
+        "top exhaustion",
+        "distribution",
+        "crowded top risk",
+    }
+    if raw in long_kinds or normalized in long_kinds:
+        return "long"
+    if raw in risk_kinds or normalized in risk_kinds:
+        return "risk"
+    return "neutral"
+
+
+def entry_timing_score(snapshot: MarketSnapshot, signal: Signal) -> tuple[int, str, str]:
+    direction = entry_timing_direction(signal.kind)
+    if direction == "neutral":
+        return 5, "观察", "中性信号"
+
+    score = 5
+    reasons: list[str] = []
+    position = snapshot.price_position_24h
+    price_change = snapshot.price_change_percent
+    oi_change = snapshot.oi_change_percent
+    taker = snapshot.taker_buy_sell_ratio
+    funding = snapshot.funding_rate_percent
+    flow_score = flow_alignment_score(snapshot)
+    long_flow_score = long_flow_alignment_score(snapshot)
+    trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+
+    def add(points: int, reason: str) -> None:
+        nonlocal score
+        score += points
+        reasons.append(reason)
+
+    short_flows = [summary_flow_value(snapshot, period) for period in ("5m", "15m", "1h")]
+    positive_short_flows = sum(value > 0 for value in short_flows)
+    negative_short_flows = sum(value < 0 for value in short_flows)
+    funding_normal_or_light_negative = funding is None or -0.05 <= funding < 0.03
+    funding_hot_or_extreme = funding is not None and funding >= 0.03
+    funding_extreme_positive = funding is not None and funding >= 0.08
+    funding_extreme_negative = funding is not None and funding <= -0.08
+    spot_text = cached_spot_alpha_confirmation(snapshot.symbol)
+    spot_strong = "偏强" in spot_text and "偏弱" not in spot_text
+    liquidation_wash = (
+        "双向强平" in signal.message
+        or "剧烈洗盘" in signal.message
+        or "双向高波动" in liquidation_risk_label(snapshot)
+    )
+
+    if direction == "long":
+        if position is not None and 35 <= position <= 70 and -2 <= price_change <= 5:
+            add(2, "启动窗口")
+        if 2 <= oi_change <= 8:
+            add(2, "温和增仓")
+        if positive_short_flows >= 2:
+            add(1, "短线资金转入")
+        if long_flow_score >= 6:
+            add(1, "长周期支持")
+        if funding_normal_or_light_negative:
+            add(1, "费率健康")
+        if spot_strong:
+            add(1, "现货确认")
+        if trap_score <= 3:
+            add(1, "诱捕低")
+
+        chase_risk = False
+        falling_relay = False
+        if position is not None and position > 75 and price_change > 8:
+            add(-4, "高位大涨")
+            chase_risk = True
+        if oi_change > 10 and price_change > 8:
+            add(-2, "高位增仓拥挤")
+        if long_flow_score <= 3:
+            add(-2, "长周期不支持")
+        if flow_score <= 3:
+            add(-1, "短线资金弱")
+        if funding_extreme_positive:
+            add(-2, "多头拥挤")
+        if trap_score >= 6:
+            add(-2, "诱捕风险高")
+        if signal.kind == "bottom_reversal" and position is not None and position < 25 and summary_flow_value(snapshot, "1h") < 0:
+            add(-3, "低位但资金未回流")
+            falling_relay = True
+        if signal.kind == "bottom_reversal" and taker is not None and taker < 1:
+            add(-2, "抄底买盘弱")
+
+        score = max(0, min(10, int(round(score))))
+        if chase_risk:
+            label = "追高风险"
+        elif falling_relay:
+            label = "下跌中继"
+        elif score >= 8:
+            label = "启动前/启动初期"
+        elif score >= 6:
+            label = "启动观察"
+        elif score <= 4:
+            label = "不宜追"
+        else:
+            label = "观察"
+        return score, label, "；".join(reasons) or "暂无明显阶段特征"
+
+    if position is not None and position > 70:
+        add(2, "高位风险")
+    if price_change > 5 and oi_change > 8:
+        add(2, "拉升增仓")
+    if taker is not None and taker < 1:
+        add(1, "主动买盘转弱")
+    if negative_short_flows >= 2:
+        add(2, "短线资金转出")
+    if funding_hot_or_extreme:
+        add(1, "多头成本高")
+    if signal.kind in ("top_exhaustion", "top_risk") and flow_score <= 4:
+        add(1, "上攻乏力")
+    if liquidation_wash:
+        add(1, "波动风险高")
+
+    if position is not None and position < 40:
+        add(-3, "低位做空风险")
+    if price_change < -8:
+        add(-2, "已大跌")
+    if funding_extreme_negative:
+        add(-2, "空头拥挤")
+    if positive_short_flows >= 2:
+        add(-1, "短线承接")
+
+    score = max(0, min(10, int(round(score))))
+    if score >= 8:
+        label = "逃顶/减仓优先"
+    elif score >= 6:
+        label = "顶部风险观察"
+    elif score <= 4:
+        label = "做空风险/不宜追空"
+    else:
+        label = "风险观察"
+    return score, label, "；".join(reasons) or "暂无明显阶段特征"
+
+
 def direction_badge(direction: str | None) -> str:
     label = str(direction or "").strip()
     if label == "看多":
@@ -4737,6 +4891,7 @@ def format_signal_for_telegram(
     snapshot = signal.snapshot
     strength_score = signal_strength_score(signal)
     trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+    entry_score, entry_label, entry_reason = entry_timing_score(snapshot, signal)
     flow_score = flow_alignment_score(snapshot)
     long_flow_score = long_flow_alignment_score(snapshot)
     direction = signal_direction_label(signal.kind)
@@ -4752,6 +4907,7 @@ def format_signal_for_telegram(
         f"Funding {format_realtime_funding(snapshot.funding_rate_percent)}\n"
         f"资金 {flow_score}/10 | 长周期 {long_flow_score}/9 | "
         f"诱捕 trap{trap_score} {trap_badge(trap_score)} | 24h位置 {format_optional_value(snapshot.price_position_24h)}%{main_part}\n"
+        f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
         f"理由: {reason}\n"
         f"{liquidation_part}"
         f"计划: {compact_trade_plan(signal)}"
@@ -6062,6 +6218,7 @@ def format_ask_context(
     long_flow_score = long_flow_alignment_score(snapshot)
     spot_text = spot_alpha_confirmation(snapshot.symbol)
     trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signals[0] if signals else None)
+    entry_score, entry_label, entry_reason = entry_timing_score(snapshot, signals[0]) if signals else (5, "观察", "中性信号")
     system_direction = diagnose_snapshot(snapshot, signals)
     triggered_signal_state = "有触发信号" if signals else "无触发信号"
     available_levels = (
@@ -6087,6 +6244,7 @@ def format_ask_context(
         f"信号触发状态: {triggered_signal_state}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
+        f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
         f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"{main_score_part}"
         f"大盘风向: {market_text}\n\n"
@@ -6112,6 +6270,7 @@ def format_ask_context(
         f"资金流共振: {flow_score}/10 ({flow_alignment_note(flow_score)})\n"
         f"长周期资金共振: {long_flow_score}/9 ({long_flow_alignment_note(long_flow_score)})\n\n"
         f"现货/链上确认: {spot_text}\n"
+        f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
         f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
@@ -6236,7 +6395,7 @@ def format_ask_response(
     if not full:
         entry_advice = format_ask_entry_advice(snapshot, signals)
         return fix_ask_orderbook_parenthesis(truncate_text(
-            f"{review_text}\n开仓建议: {entry_advice}\n\n{format_ask_core_data(snapshot, liquidation_text, coinglass_text)}",
+            f"{review_text}\n开仓建议: {entry_advice}\n\n{format_ask_core_data(snapshot, signals, liquidation_text, coinglass_text)}",
             1500,
         ))
 
@@ -6297,6 +6456,7 @@ def fallback_ask_ai_review(
 
 def format_ask_core_data(
     snapshot: MarketSnapshot,
+    signals: list[Signal] | None = None,
     liquidation_text: str | None = None,
     coinglass_text: str | None = None,
 ) -> str:
@@ -6313,7 +6473,9 @@ def format_ask_core_data(
     main_score_text = format_main_asset_score_line(snapshot, liquidation_text, coinglass_text)
     main_score_part = f"{main_score_text}\n" if main_score_text else ""
     spot_text = spot_alpha_confirmation(snapshot.symbol)
-    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, None)
+    signal = signals[0] if signals else None
+    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
+    entry_score, entry_label, entry_reason = entry_timing_score(snapshot, signal) if signal else (5, "观察", "中性信号")
     coinglass_part = ""
     if not is_major_asset_tier(snapshot.symbol):
         coinglass_part = f"CoinGlass: {compact_coinglass_market_context(coinglass_text or 'CoinGlass聚合: n/a')}"
@@ -6323,6 +6485,7 @@ def format_ask_core_data(
         f"OI {snapshot.oi_change_percent:+.2f}%; Funding {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})\n"
         f"评分: 短线 {short_term_score(snapshot)}/10; 中线 {mid_term_score(snapshot)}/10; "
         f"资金流共振 {flow_alignment_score(snapshot)}/10; 长周期资金共振 {long_flow_alignment_score(snapshot)}/9\n"
+        f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
         f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"{main_score_part}"
         f"资金: {'; '.join(flow_items)}\n"
@@ -6558,13 +6721,17 @@ def format_ask_signal_list(signals: list[Signal]) -> str:
     for signal in signals:
         priority, quality_score, _quality_reason = signal_priority(signal, signal.snapshot)
         trap_score: int | str = "-"
+        entry_part = ""
         if signal.snapshot:
             trap_score, _trap_label, _trap_reason = trap_risk_score(signal.snapshot, signal)
+            entry_score, entry_label, entry_reason = entry_timing_score(signal.snapshot, signal)
+            entry_part = f" 阶段={entry_label} {entry_score}/10 - {entry_reason}"
         strength_score = signal_strength_score(signal)
         lines.append(
             f"- {priority_badge(priority)} {direction_badge(signal_direction_label(signal.kind))} "
             f"{signal.kind} q{quality_score} score{signal.score} "
-            f"{strength_badge(strength_score)}{strength_score:.1f} {trap_badge(trap_score)} - {signal.message}"
+            f"{strength_badge(strength_score)}{strength_score:.1f} {trap_badge(trap_score)}"
+            f"{entry_part} - {signal.message}"
         )
     return "\n".join(lines)
 
@@ -6576,11 +6743,15 @@ def format_recent_symbol_signals(rows: list[dict[str, str]]) -> str:
     lines = []
     for row in rows:
         time_text = row.get("time", "-").replace("T", " ")[:19]
+        entry_label = row.get("entry_timing_label") or ""
+        entry_score = row.get("entry_timing_score") or ""
+        entry_part = f" entry={entry_label}/{entry_score}" if entry_label and entry_score else ""
         lines.append(
             f"- {time_text} {row.get('kind', '-')} "
             f"score={row.get('score', '-')} 强度={format_csv_strength(row.get('strength_score'))} "
             f"价格={format_csv_number(row.get('price_change_percent'))}% "
             f"OI={format_csv_number(row.get('oi_change_percent'))}%"
+            f"{entry_part}"
         )
     return "\n".join(lines)
 
