@@ -2742,7 +2742,6 @@ class DerivativesMonitor:
         lines = ["高质量信号TOP10"]
         for index, (quality_score, row) in enumerate(scored_rows[:10], start=1):
             kind = row.get("kind", "-")
-            direction = signal_direction_label(kind)
             priority = row.get("signal_priority") or "-"
             trap_score = format_csv_compact_number(row.get("trap_risk_score"), signed=False)
             price_change = format_csv_compact_number(row.get("price_change_percent"), signed=True)
@@ -2751,12 +2750,11 @@ class DerivativesMonitor:
             suppressed = format_suppressed_status(row.get("suppressed_from_telegram"))
             reason = format_quality_reason_short(row.get("signal_quality_reason", "") or "")
             lines.append(
-                f"{index}. {row.get('symbol', '-')} {direction} {kind} "
-                f"{priority}/{quality_score:.0f} "
-                f"trap{trap_score} {price_change}% OI{oi_change}%"
+                f"{index}. {priority_badge(priority)} {direction_badge(signal_direction_label(kind))} "
+                f"{row.get('symbol', '-')} {kind} q{quality_score:.0f} trap{trap_score}"
             )
             lines.append(
-                f"   强度{strength} | {suppressed} | {reason}"
+                f"   {price_change}% OI{oi_change}% {strength_badge(strength)}{strength} | {suppressed} | {reason}"
             )
         self.send_telegram_text(bot_token, chat_id, "\n".join(lines))
 
@@ -3799,6 +3797,54 @@ def signal_direction_label(kind: str | None) -> str:
     return "观察"
 
 
+def direction_badge(direction: str | None) -> str:
+    label = str(direction or "").strip()
+    if label == "看多":
+        return "🟢看多"
+    if label == "看空":
+        return "🔴看空"
+    return "⚪观察"
+
+
+def priority_badge(priority: str | None) -> str:
+    label = str(priority or "").strip().upper()
+    if label == "S":
+        return "🟣S"
+    if label == "A":
+        return "🔵A"
+    if label == "B":
+        return "🟡B"
+    if label in ("C", "D"):
+        return f"⚫{label}"
+    return "⚫-"
+
+
+def strength_badge(strength: float | int | str | None) -> str:
+    score = parse_float(strength)
+    if score is None:
+        return "·弱"
+    if score >= 50:
+        return "🔥极强"
+    if score >= 30:
+        return "🔥强"
+    if score >= 20:
+        return "⚡中"
+    return "·弱"
+
+
+def trap_badge(score: float | int | str | None) -> str:
+    value = parse_float(score)
+    if value is None:
+        return "🟢低诱捕"
+    if value >= 8:
+        return "⚠️极高诱捕"
+    if value >= 6:
+        return "⚠️高诱捕"
+    if value >= 3:
+        return "🟠中诱捕"
+    return "🟢低诱捕"
+
+
 def format_suppressed_status(value: Any) -> str:
     text = "" if value is None else str(value).strip()
     if text == "0":
@@ -4620,6 +4666,31 @@ def format_why_signal_row(row: dict[str, str]) -> str:
     )
 
 
+def format_realtime_funding(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:+.4g}%"
+
+
+def compact_realtime_liquidation_line(liquidation_text: str | None) -> str:
+    text = str(liquidation_text or "")
+    if not text or "暂无明显强平" in text or "暂无缓存" in text or text == "真实强平: n/a":
+        return ""
+    if "多头强平主导" in text:
+        return "强平: 多头主导"
+    if "空头强平主导" in text:
+        return "强平: 空头主导"
+    if "双向强平" in text or "剧烈洗盘" in text:
+        return "强平: 双向洗盘"
+    if "强平分散" in text or "方向分散" in text:
+        return "强平: 分散"
+    return ""
+
+
+def compact_trade_plan(signal: Signal, max_length: int = 120) -> str:
+    return truncate_text(" ".join(signal_trade_plan(signal).split()), max_length)
+
+
 def why_symbol_conclusion(rows: list[dict[str, str]]) -> str:
     if not rows:
         return "最近暂无该币信号。"
@@ -4649,71 +4720,43 @@ def format_signal_for_telegram(
     quality_score: int | None = None,
     quality_reason: str | None = None,
 ) -> str:
-    labels = {
-        "discovery": ("🟢 [看多]", "发现启动信号"),
-        "distribution": ("🟡 [减仓]", "疑似派发"),
-        "top_risk": ("🔴 [看空]", "逃顶风险"),
-        "hot_breakout": ("🔥 [过热]", "强势过热"),
-        "bottom_reversal": ("🟢 [抄底]", "抄底观察"),
-        "top_exhaustion": ("🔴 [逃顶]", "逃顶衰竭"),
-        "test": ("⚪ [测试]", "测试推送"),
-    }
-    prefix, label = labels.get(signal.kind, ("⚪ [信号]", signal.kind))
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if priority is None or quality_score is None or quality_reason is None:
         priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
 
     if signal.snapshot is None:
+        direction = signal_direction_label(signal.kind)
         return (
-            f"{prefix} {label}\n\n{signal.title}\n{signal.message}\n"
-            f"信号等级: {priority} 质量分 {quality_score} - {quality_reason}\n\n时间: {now}"
+            f"{priority_badge(priority)} {direction_badge(direction)} {signal.symbol} {signal.kind} "
+            f"q{quality_score} score{signal.score}\n"
+            f"理由: {format_quality_reason_short(quality_reason or signal.message)}\n"
+            f"时间: {now}"
         )
 
     snapshot = signal.snapshot
-    reason = {
-        "discovery": "价格和 OI 同步上升，主动买盘支持，且多头拥挤度没有过高。",
-        "distribution": "价格仍在高位或反弹中，但 OI 下降、主动买盘走弱，可能有减仓派发。",
-        "top_risk": "价格快速拉升，同时杠杆和多头拥挤度偏高，追多风险上升。",
-        "hot_breakout": "启动动能很强，但多头拥挤或 funding 已过热，适合重点观察，谨慎追高。",
-        "bottom_reversal": "超跌后出现资金回流和止跌迹象，属于抄底观察，不是无脑接飞刀。",
-        "top_exhaustion": "高位拉升后出现资金或主动买盘衰竭，追多风险高，适合防守。",
-    }.get(signal.kind, signal.message)
-
-    strength = signal_strength_label(signal)
     strength_score = signal_strength_score(signal)
-    strength_badge = "🚨极强" if strength_score >= 60 else ("⭐强" if strength_score >= 30 else "普通")
-    max_score = 7 if signal.kind in ("bottom_reversal", "top_exhaustion") else (5 if signal.kind == "top_risk" else 4)
-
-    return (
-        f"{prefix} {label}: {signal.symbol}\n"
-        f"方向: {prefix} | 等级: {strength} | {strength_badge}\n\n"
-        f"级别: {signal.score}/{max_score}\n"
-        f"强度分: {strength_score:.2f} ({strength_grade(strength_score)})\n"
-        f"信号等级: {priority} 质量分 {quality_score} - {quality_reason}\n"
-        f"价格: {snapshot.close_price:.8g}\n"
-        f"价格变化: {snapshot.price_change_percent:+.2f}%\n"
-        f"OI变化: {snapshot.oi_change_percent:+.2f}%\n"
-        f"全局多空比: {format_optional_value(snapshot.global_long_short_ratio)}\n"
-        f"大户持仓多空比: {format_optional_value(snapshot.top_position_ratio)}\n"
-        f"大户账户多空比: {format_optional_value(snapshot.top_account_ratio)}\n"
-        f"主动买卖比: {format_optional_value(snapshot.taker_buy_sell_ratio)}\n"
-        f"Funding: {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})\n"
-        f"24h位置: {format_optional_value(snapshot.price_position_24h)}% ({price_position_label(snapshot)}) / 高 {format_optional_value(snapshot.high_24h)} / 低 {format_optional_value(snapshot.low_24h)}\n"
-        f"资金流: {format_flow_summary(snapshot)}\n"
-        f"资金流共振: {flow_alignment_score(snapshot)}/10 ({flow_alignment_note(flow_alignment_score(snapshot))})\n"
-        f"长周期资金共振: {long_flow_alignment_score(snapshot)}/9 ({long_flow_alignment_note(long_flow_alignment_score(snapshot))})\n"
-        f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}\n"
-        f"短线评分: {short_term_score(snapshot)}/10 ({score_label(short_term_score(snapshot))})\n"
-        f"中线评分: {mid_term_score(snapshot)}/10 ({score_label(mid_term_score(snapshot))})\n"
-        f"AI共振复核: {ai_signal_review(signal)}\n"
-        f"结构判断: {market_structure_label(snapshot)}\n"
-        f"清算风险: {liquidation_risk_label(snapshot)}\n"
-        f"{liquidation_text or '真实强平: n/a'}\n"
-        f"交易计划: {signal_trade_plan(signal)}\n"
-        f"判断: {reason}\n"
-        f"时间: {now}"
+    trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+    flow_score = flow_alignment_score(snapshot)
+    long_flow_score = long_flow_alignment_score(snapshot)
+    direction = signal_direction_label(signal.kind)
+    reason = format_quality_reason_short(quality_reason or signal.message)
+    main_score = main_asset_score(snapshot, liquidation_text)
+    main_part = f" | 主流 {main_score.total_score}/100" if main_score else ""
+    liquidation_line = compact_realtime_liquidation_line(liquidation_text)
+    liquidation_part = f"{liquidation_line}\n" if liquidation_line else ""
+    text = (
+        f"{priority_badge(priority)} {direction_badge(direction)} {signal.symbol} {signal.kind} "
+        f"q{quality_score} score{signal.score} {strength_badge(strength_score)}{strength_score:.1f}\n"
+        f"价格 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}% | "
+        f"Funding {format_realtime_funding(snapshot.funding_rate_percent)}\n"
+        f"资金 {flow_score}/10 | 长周期 {long_flow_score}/9 | "
+        f"诱捕 trap{trap_score} {trap_badge(trap_score)} | 24h位置 {format_optional_value(snapshot.price_position_24h)}%{main_part}\n"
+        f"理由: {reason}\n"
+        f"{liquidation_part}"
+        f"计划: {compact_trade_plan(signal)}"
     )
+    return truncate_text(text, 900)
 
 
 def format_optional_value(value: float | None) -> str:
@@ -6513,9 +6556,15 @@ def format_ask_signal_list(signals: list[Signal]) -> str:
 
     lines = []
     for signal in signals:
+        priority, quality_score, _quality_reason = signal_priority(signal, signal.snapshot)
+        trap_score: int | str = "-"
+        if signal.snapshot:
+            trap_score, _trap_label, _trap_reason = trap_risk_score(signal.snapshot, signal)
+        strength_score = signal_strength_score(signal)
         lines.append(
-            f"- {signal.kind}: score={signal.score} 强度={signal_strength_score(signal):.2f} "
-            f"({strength_grade(signal_strength_score(signal))}) - {signal.message}"
+            f"- {priority_badge(priority)} {direction_badge(signal_direction_label(signal.kind))} "
+            f"{signal.kind} q{quality_score} score{signal.score} "
+            f"{strength_badge(strength_score)}{strength_score:.1f} {trap_badge(trap_score)} - {signal.message}"
         )
     return "\n".join(lines)
 
