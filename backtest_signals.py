@@ -43,6 +43,13 @@ CONVICTION_GROUPS = (
     ("65-79", "中高", 65, 79),
     ("80-100", "高", 80, 100),
 )
+EVIDENCE_DIRECTION_GROUPS = ("看多", "看空/风险", "观察")
+EVIDENCE_SCORE_GROUPS = (
+    ("<=-5", "风险强", None, -5),
+    ("-4..0", "风险/观察", -4, 0),
+    ("1..4", "偏多", 1, 4),
+    (">=5", "多头强", 5, None),
+)
 
 
 def parse_time(value):
@@ -134,6 +141,10 @@ def eval_signal(session, row):
     out["market_intent_label"] = (row.get("market_intent_label") or "").strip() or None
     out["flow_trend_label"] = (row.get("flow_trend_label") or "").strip() or None
     out["basis_state"] = (row.get("basis_state") or "").strip() or None
+    out["evidence_score"] = parse_int(row.get("evidence_score"))
+    out["evidence_direction"] = (row.get("evidence_direction") or "").strip() or None
+    out["evidence_summary"] = (row.get("evidence_summary") or "").strip() or None
+    out["evidence_items"] = row.get("evidence_items") or ""
     out["funding_rate_percent"] = parse_float(row.get("funding_rate_percent"))
     out["suppressed_from_telegram"] = parse_bool_int(row.get("suppressed_from_telegram"))
     for name in ("12h", "24h", "48h", "72h", "96h", "120h", "144h"):
@@ -283,6 +294,11 @@ def flow_detail(x):
         parts.append(f"div={div_label}/{div_score}")
     if major_label and major_score is not None:
         parts.append(f"major={major_label}/{major_score}")
+    evidence_direction = x.get("evidence_direction")
+    evidence_score = x.get("evidence_score")
+    evidence_summary = x.get("evidence_summary")
+    if evidence_direction and evidence_score is not None:
+        parts.append(f"ev={evidence_direction}/{abs(evidence_score)} {evidence_summary or '-'}")
     for name in ("12h", "24h", "72h", "144h"):
         flow = x.get(f"flow_{name}")
         ratio = x.get(f"flow_{name}_ratio")
@@ -323,6 +339,15 @@ def conviction_group(score):
         return None
     for label, name, low, high in CONVICTION_GROUPS:
         if low <= score <= high:
+            return label, name
+    return None
+
+
+def evidence_score_group(score):
+    if score is None:
+        return None
+    for label, name, low, high in EVIDENCE_SCORE_GROUPS:
+        if (low is None or score >= low) and (high is None or score <= high):
             return label, name
     return None
 
@@ -571,6 +596,81 @@ def print_basis_state_backtest(results):
     print_label_group_backtest(results, "[BASIS STATE] 基差状态分组回测", "basis_state", None)
 
 
+def print_evidence_direction_backtest(results):
+    print_label_group_backtest(
+        results,
+        "[Evidence Direction] 证据方向分组回测",
+        "evidence_direction",
+        EVIDENCE_DIRECTION_GROUPS,
+    )
+
+
+def print_evidence_score_backtest(results):
+    grouped = [
+        (x, evidence_score_group(x.get("evidence_score")))
+        for x in results
+    ]
+    if not any(group for _x, group in grouped):
+        print("[Evidence Score] 证据分数分组回测")
+        print("暂无 evidence_score 样本")
+        print("")
+        return
+
+    print("[Evidence Score] 证据分数分组回测")
+    for label, name, _low, _high in EVIDENCE_SCORE_GROUPS:
+        group_rows = [
+            x
+            for x, group in grouped
+            if group == (label, name)
+        ]
+        print(f"{label} {name}: 样本={len(group_rows)}")
+        for h in REPORT_HORIZONS:
+            vals = [x[h] for x in group_rows if x[h] is not None]
+            if not vals:
+                print(f"  {h}: 样本=0")
+                continue
+            wins = sum(v > 0 for v in vals)
+            print(
+                f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))} "
+                f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
+            )
+    print("")
+
+
+def print_evidence_summary_backtest(results):
+    summaries = {}
+    for row in results:
+        summary = row.get("evidence_summary")
+        if not summary:
+            continue
+        summaries[summary] = summaries.get(summary, 0) + 1
+
+    print("[Evidence Summary] 证据总结TOP10分组回测")
+    if not summaries:
+        print("暂无 evidence_summary 样本")
+        print("")
+        return
+    top_summaries = [
+        summary
+        for summary, _count in sorted(summaries.items(), key=lambda item: (-item[1], item[0]))[:10]
+    ]
+    for summary in top_summaries:
+        group_rows = [x for x in results if x.get("evidence_summary") == summary]
+        print(f"{summary}: 样本={len(group_rows)}")
+        for h in REPORT_HORIZONS:
+            vals = [x[h] for x in group_rows if x[h] is not None]
+            if not vals:
+                print(f"  {h}: 样本=0")
+                continue
+            wins = sum(v > 0 for v in vals)
+            print(
+                f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))}"
+            )
+    print("")
+
+
 def kind_average(rows, horizon):
     vals = horizon_values(rows, horizon)
     return statistics.mean(vals) if vals else None
@@ -803,6 +903,9 @@ def run_backtest(args):
     print_market_intent_backtest(results)
     print_flow_trend_backtest(results)
     print_basis_state_backtest(results)
+    print_evidence_direction_backtest(results)
+    print_evidence_score_backtest(results)
+    print_evidence_summary_backtest(results)
 
     print("最近20条:")
     for x in results[:20]:

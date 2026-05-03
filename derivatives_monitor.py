@@ -93,6 +93,15 @@ class Signal:
 
 
 @dataclass(frozen=True)
+class EvidenceItem:
+    label: str
+    points: int
+    polarity: str
+    horizon: str
+    source: str
+
+
+@dataclass(frozen=True)
 class TelegramSignalDigestItem:
     created_at: float
     symbol: str
@@ -226,6 +235,10 @@ SIGNAL_LOG_FIELDS = [
     "market_intent_label",
     "market_intent_score",
     "market_intent_reason",
+    "evidence_score",
+    "evidence_direction",
+    "evidence_summary",
+    "evidence_items",
     "conviction_score",
     "conviction_label",
     "conviction_reason",
@@ -1582,6 +1595,7 @@ class DerivativesMonitor:
         squeeze_label, squeeze_score, squeeze_reason = squeeze_state(snapshot) if snapshot else ("", "", "")
         absorption_label, absorption_score, absorption_reason = spot_absorption_state(snapshot, signal) if snapshot else ("", "", "")
         intent_label, intent_score, intent_reason = market_intent(snapshot, signal) if snapshot else ("", "", "")
+        ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal) if snapshot else ("", "", "", [])
         conv_score, conv_label, conv_reason = conviction_score(snapshot, signal) if snapshot else ("", "", "")
         priority, quality_score, quality_reason = signal_priority(signal, snapshot)
         suppressed_from_telegram, _suppressed_reason = self.telegram_signal_suppression(signal, priority, quality_score)
@@ -1675,6 +1689,10 @@ class DerivativesMonitor:
             "market_intent_label": intent_label,
             "market_intent_score": intent_score,
             "market_intent_reason": intent_reason,
+            "evidence_score": ev_score,
+            "evidence_direction": ev_direction,
+            "evidence_summary": ev_summary,
+            "evidence_items": evidence_items_compact(ev_items, 20),
             "conviction_score": conv_score,
             "conviction_label": conv_label,
             "conviction_reason": conv_reason,
@@ -3097,9 +3115,11 @@ class DerivativesMonitor:
             status = "高把握" if conviction_score_value >= 80 else "观察"
             status_icon = "🔴" if conviction_score_value >= 80 and direction == "看空" else "🟢" if conviction_score_value >= 80 else "🟡"
             symbol = str(row.get("symbol", "-")).replace("USDT", "")
+            evidence_summary = str(row.get("evidence_summary") or "").strip()
+            evidence_part = f" | {evidence_summary}" if evidence_summary else ""
             lines.append(
                 f"{index}. {status_icon}{status} {direction_icon_text} {symbol} {signal_kind_label(kind)} | "
-                f"把握{conviction_score_value:.0f} | {action}"
+                f"把握{conviction_score_value:.0f}{evidence_part} | {action}"
             )
             lines.append(
                 f"   {price_change}% OI{oi_change}% | 短{short_flow} 中{mid_flow} 长{long_flow} | {intent}"
@@ -5371,6 +5391,216 @@ def market_intent(snapshot: MarketSnapshot, signal: Signal | None = None) -> tup
     return "震荡分歧", max(4, min(6, (short_flow + mid_flow + long_flow) // 3)), flow_label
 
 
+def evidence_item_icon(item: EvidenceItem) -> str:
+    if item.polarity == "positive":
+        return "🟢"
+    if item.polarity == "risk":
+        return "🔴"
+    return "🟡"
+
+
+def evidence_item_signed_points(item: EvidenceItem) -> int:
+    return -abs(item.points) if item.polarity == "risk" else abs(item.points)
+
+
+def evidence_items_compact(items: list[EvidenceItem], limit: int = 8) -> str:
+    parts = []
+    for item in items[:limit]:
+        points = evidence_item_signed_points(item)
+        parts.append(f"{item.label}({points:+d})")
+    return "; ".join(parts)
+
+
+def evidence_display_score(direction_hint: str, items: list[EvidenceItem], total_score: int) -> int:
+    positive_points = sum(abs(item.points) for item in items if item.polarity == "positive")
+    risk_points = sum(abs(item.points) for item in items if item.polarity == "risk")
+    if direction_hint == "看多":
+        return positive_points
+    if direction_hint == "看空/风险":
+        return risk_points
+    return abs(total_score)
+
+
+def evidence_score(snapshot: MarketSnapshot, signal: Signal | None = None) -> tuple[int, str, str, list[EvidenceItem]]:
+    items: list[EvidenceItem] = []
+    notes: list[str] = []
+
+    def add(label: str, points: int, polarity: str, horizon: str, source: str, note: str | None = None) -> None:
+        if len(items) >= 20:
+            return
+        items.append(EvidenceItem(label, abs(int(points)), polarity, horizon, source))
+        if note:
+            notes.append(note)
+
+    price = snapshot.price_change_percent
+    oi = snapshot.oi_change_percent
+    price_pos = snapshot.price_position_24h
+    taker = snapshot.taker_buy_sell_ratio
+    funding = snapshot.funding_rate_percent
+    global_lsr = snapshot.global_long_short_ratio
+    top_position_lsr = snapshot.top_position_ratio
+    top_account_lsr = snapshot.top_account_ratio
+
+    if price > 3 and oi > 5:
+        add("OI增仓推涨", 2, "positive", "mid", "OI", "主力建仓")
+    if price > 8 and oi > 10:
+        add("高位增仓追涨", 2, "risk", "mid", "OI", "高位拥挤")
+        if price_pos is not None and price_pos > 70:
+            add("高位增仓", 1, "risk", "mid", "OI", "高位拥挤")
+    if price > 3 and oi < -3:
+        add("空头回补推涨", 1, "neutral", "short", "OI", "短线逼空")
+    if price < -3 and oi > 5:
+        add("跌中增仓承压", 2, "risk", "mid", "OI", "空头建仓")
+        if taker is not None and taker < 1:
+            add("主动卖盘配合", 1, "risk", "short", "FLOW")
+    if price < -3 and oi < -5:
+        add("仓位退出/风险释放", 1, "neutral", "short", "OI", "风险释放")
+
+    if snapshot.confirm_price_change_percent is not None and snapshot.confirm_oi_change_percent is not None:
+        if snapshot.confirm_price_change_percent > 0 and snapshot.confirm_oi_change_percent > 0:
+            add("短线增仓推涨", 1, "positive", "short", "OI")
+        if abs(snapshot.confirm_price_change_percent) <= 0.5 and snapshot.confirm_oi_change_percent > 5:
+            add("增仓分歧/可能派发", 2, "risk", "short", "OI", "资金分歧")
+    if price > 0 and oi >= 8:
+        add("中线持续建仓", 2, "positive", "mid", "OI", "主力建仓")
+    if price <= 0.5 and oi >= 10:
+        add("增仓分歧/可能派发", 2, "risk", "mid", "OI", "资金分歧")
+
+    short_flow, mid_flow, long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    if taker is not None and taker > 1.15:
+        add("主动买盘强", 2, "positive", "short", "FLOW")
+    if taker is not None and taker < 0.85:
+        add("主动卖盘强", 2, "risk", "short", "FLOW", "主动卖盘")
+    if short_flow >= 7:
+        add("短线主力流入", 2, "positive", "short", "FLOW")
+    if mid_flow >= 7:
+        add("中线主力流入", 2, "positive", "mid", "FLOW")
+    if long_flow >= 7:
+        add("长线主力流入", 2, "positive", "long", "FLOW")
+    if short_flow <= 3:
+        add("短线资金不支持", 1, "risk", "short", "FLOW")
+    if mid_flow <= 3:
+        add("中线资金不支持", 2, "risk", "mid", "FLOW")
+    if long_flow <= 3:
+        add("长线资金不支持", 2, "risk", "long", "FLOW")
+    if short_flow >= 7 and mid_flow <= 5:
+        add("短强中弱，谨慎追", 1, "risk", "general", "FLOW", "资金分歧")
+    if short_flow <= 4 and mid_flow >= 7:
+        add("回踩承接观察", 1, "positive", "mid", "FLOW")
+
+    if global_lsr is not None and global_lsr > 1.8:
+        add("散户多头拥挤", 1, "risk", "general", "LSR", "高位拥挤")
+    if global_lsr is not None and global_lsr < 0.7:
+        add("散户空头拥挤", 1, "positive", "general", "LSR", "空头拥挤")
+    if top_position_lsr is not None and top_position_lsr > 1.3 and oi > 0:
+        add("大户偏多建仓", 2, "positive", "mid", "WHALE", "主力建仓")
+    if top_position_lsr is not None and top_position_lsr < 0.8 and oi > 0:
+        add("大户偏空建仓", 2, "risk", "mid", "WHALE", "空头建仓")
+    if top_account_lsr is not None and top_account_lsr > 1.3 and (top_position_lsr is None or top_position_lsr <= 1.15):
+        add("散户多/大户不跟", 1, "risk", "general", "WHALE")
+    if top_account_lsr is not None and top_account_lsr < 0.8 and top_position_lsr is not None and top_position_lsr > 1.3:
+        add("散户空/大户偏多", 1, "positive", "general", "WHALE")
+
+    if funding is not None:
+        if funding > 0.15:
+            if oi < 0:
+                add("多头风险释放", 1, "neutral", "short", "FUNDING", "风险释放")
+            else:
+                add("费率极热", 2, "risk", "general", "FUNDING", "高位拥挤")
+        elif funding > 0.08:
+            if oi < 0:
+                add("多头风险释放", 1, "neutral", "short", "FUNDING", "风险释放")
+            else:
+                add("费率偏热", 1, "risk", "general", "FUNDING", "高位拥挤")
+        if funding < -0.15:
+            if oi < 0:
+                add("空头风险释放", 1, "neutral", "short", "FUNDING", "风险释放")
+            else:
+                add("空头极度拥挤", 2, "positive", "general", "FUNDING", "空头拥挤")
+        elif funding < -0.08:
+            if oi < 0:
+                add("空头风险释放", 1, "neutral", "short", "FUNDING", "风险释放")
+            else:
+                add("空头拥挤", 1, "positive", "general", "FUNDING", "空头拥挤")
+
+    basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    if basis_label == "明显溢价":
+        add("合约溢价偏高", 1, "risk", "general", "BASIS", "高位拥挤")
+    if basis_label == "极端溢价":
+        add("合约溢价极高", 2, "risk", "general", "BASIS", "高位拥挤")
+    if basis_label == "明显贴水":
+        add("合约贴水偏深", 1, "positive", "general", "BASIS", "空头拥挤")
+    if basis_label == "极端贴水":
+        add("合约贴水极深", 2, "positive", "general", "BASIS", "空头拥挤")
+    if basis_label in ("明显溢价", "极端溢价") and funding is not None and funding > 0.08 and oi > 0:
+        add("合约多头拥挤", 2, "risk", "general", "BASIS", "高位拥挤")
+    if basis_label in ("明显贴水", "极端贴水") and funding is not None and funding < -0.08 and oi > 0:
+        add("空头挤压条件", 2, "positive", "general", "BASIS", "空头拥挤")
+
+    spot_score, _spot_label, _spot_reason = spot_onchain_score(snapshot, signal)
+    absorption_label, _absorption_score, _absorption_reason = spot_absorption_state(snapshot, signal)
+    if spot_score >= 7:
+        add("现货/链上确认", 2, "positive", "mid", "SPOT", "现货确认")
+    if absorption_label in ("现货承接", "链上承接"):
+        add("现货承接", 2, "positive", "short", "SPOT", "现货确认")
+    if absorption_label in ("现货出货", "链上出货"):
+        add("现货/链上出货", 2, "risk", "short", "SPOT", "出货")
+    if price_pos is not None and price_pos > 70 and spot_score <= 3:
+        add("高位现货未确认", 2, "risk", "mid", "SPOT", "合约先行")
+    spot_text = cached_spot_alpha_confirmation(snapshot.symbol) or spot_alpha_confirmation(snapshot.symbol)
+    dex_1h_change = dex_period_change(spot_text, "1h")
+    dex_24h_change = dex_period_change(spot_text, "24h")
+    liquidity = dex_liquidity_usd(spot_text)
+    if liquidity is not None and liquidity >= 100000 and price >= -0.3:
+        add("流动性增加", 1, "positive", "long", "LIQ")
+    if price > 3 and ((dex_1h_change is not None and dex_1h_change < -1) or (dex_24h_change is not None and dex_24h_change < -5)):
+        add("流动性下降拉盘", 2, "risk", "long", "LIQ", "出货")
+
+    liq_label = liquidation_risk_label(snapshot)
+    squeeze_label, _squeeze_score, _squeeze_reason = squeeze_state(snapshot)
+    if "空头强平" in liq_label or "上方扫空" in liq_label:
+        add("空头被挤压", 1, "neutral", "short", "LIQ", "短线逼空")
+    if "多头强平" in liq_label or "下方扫多" in liq_label:
+        add("多头止损释放", 1, "risk", "short", "LIQ")
+    if "双向" in liq_label or "洗盘" in liq_label or squeeze_label == "双向挤压":
+        add("双向洗盘", 2, "risk", "short", "LIQ", "资金分歧")
+    if squeeze_label == "空头挤压" and absorption_label in ("现货承接", "链上承接"):
+        add("空头挤压+现货承接", 2, "positive", "short", "LIQ", "现货确认")
+    if squeeze_label == "多头挤压" and absorption_label in ("现货出货", "链上出货"):
+        add("多头挤压+现货出货", 2, "risk", "short", "LIQ", "出货")
+
+    positive_points = sum(item.points for item in items if item.polarity == "positive")
+    risk_points = sum(item.points for item in items if item.polarity == "risk")
+    total_score = positive_points - risk_points
+    if total_score >= 4:
+        direction_hint = "看多"
+    elif risk_points - positive_points >= 4:
+        direction_hint = "看空/风险"
+    else:
+        direction_hint = "观察"
+
+    note_set = set(notes)
+    if {"高位拥挤", "出货"} & note_set:
+        summary = "高位拥挤，注意出货"
+    elif "合约先行" in note_set:
+        summary = "合约先行，现货未跟"
+    elif "主力建仓" in note_set and "现货确认" in note_set:
+        summary = "主力建仓，现货确认"
+    elif "空头拥挤" in note_set:
+        summary = "空头拥挤，等待逼空确认"
+    elif flow_label == "资金分歧" or "资金分歧" in note_set:
+        summary = "资金分歧，观望"
+    elif "主力建仓" in note_set:
+        summary = "主力建仓，等待现货确认"
+    elif "现货确认" in note_set:
+        summary = "现货确认，资金等待共振"
+    elif "风险释放" in note_set:
+        summary = "风险释放，不急追单"
+    else:
+        summary = "资金分歧，观望" if items else "证据不足，观察"
+    return total_score, direction_hint, summary, items[:20]
+
+
 def conviction_label(score: int) -> str:
     if score >= 80:
         return "高"
@@ -5438,6 +5668,26 @@ def conviction_score(snapshot: MarketSnapshot, signal: Signal | None = None) -> 
         adjust(5, "逼空反弹")
     if pos_label == "高位多头拥挤" and spot_label in ("现货出货", "链上出货"):
         adjust(8, "风控确认")
+
+    evidence_total, _evidence_direction, evidence_summary, evidence_items = evidence_score(snapshot, signal)
+    evidence_positive = sum(item.points for item in evidence_items if item.polarity == "positive")
+    evidence_risk = sum(item.points for item in evidence_items if item.polarity == "risk")
+    signal_direction = signal_direction_label(signal.kind if signal else None)
+    risk_signal = signal_direction == "看空"
+    if evidence_positive >= 8 and evidence_risk <= 4:
+        adjust(15, "证据强多")
+    elif evidence_positive >= 5:
+        adjust(8, "证据偏多")
+    if evidence_risk >= 8:
+        adjust(10 if risk_signal else -15, "证据风险")
+    if "高位拥挤" in evidence_summary or "出货" in evidence_summary:
+        adjust(10 if risk_signal else -15, "高位拥挤/出货")
+    if "主力建仓" in evidence_summary or "现货确认" in evidence_summary:
+        adjust(10 if not risk_signal else -8, "主力建仓/现货确认")
+    if "资金分歧" in evidence_summary:
+        adjust(-8, "资金分歧")
+    if evidence_total <= -5 and not risk_signal:
+        score = min(score, 72)
 
     final_score = clamp_int(score, 0, 100)
     if not reasons:
@@ -6479,26 +6729,14 @@ def normalize_trigger_phrase(text: str) -> str:
 
 
 def trader_panel_triggers(snapshot: MarketSnapshot, signal: Signal, merged_kinds: list[str]) -> list[str]:
-    conv_score, _conv_label, conv_reason = conviction_score(snapshot, signal)
-    intent_label, _intent_score, intent_reason = market_intent(snapshot, signal)
-    pos_label, _pos_score, pos_reason = position_behavior(snapshot, signal)
-    squeeze_label, _squeeze_score, squeeze_reason = squeeze_state(snapshot)
-    _basis_pct, _basis_label, _basis_reason = basis_state(snapshot)
+    _ev_score, _ev_direction, _ev_summary, evidence_items = evidence_score(snapshot, signal)
     triggers: list[str] = []
     if len(merged_kinds) > 1:
         triggers.append(f"信号: {' + '.join(merged_kinds)}")
-    if snapshot.price_position_24h is not None and snapshot.price_position_24h >= 75 and snapshot.oi_change_percent > 0:
-        triggers.append("高位增仓")
-    if snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio < 1:
-        triggers.append("主买转弱")
-    if snapshot.funding_rate_percent is not None and snapshot.funding_rate_percent >= 0.03:
-        triggers.append("费率偏热")
-    for source in (conv_reason, intent_reason, pos_reason, squeeze_reason, intent_label, pos_label, squeeze_label):
-        for part in re.split(r"[；,/，|]", str(source or "")):
-            phrase = normalize_trigger_phrase(part)
-            if phrase:
-                triggers.append(phrase)
-    return list(dict.fromkeys(triggers))[:5]
+    for item in evidence_items:
+        points = evidence_item_signed_points(item)
+        triggers.append(f"{evidence_item_icon(item)} {item.label} {points:+d}")
+    return list(dict.fromkeys(triggers))[:6]
 
 
 def format_trader_panel(
@@ -6529,6 +6767,8 @@ def format_trader_panel(
     position_text = format_optional_value(snapshot.top_position_ratio)
     basis_text = "n/a" if basis_pct is None else f"{basis_pct:+.2f}%"
     triggers = trader_panel_triggers(snapshot, signal, kinds)
+    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
+    ev_display_score = evidence_display_score(ev_direction, ev_items, ev_score)
 
     lines = [
         title,
@@ -6558,7 +6798,7 @@ def format_trader_panel(
         " | ".join(flow_panel_value(snapshot, period) for period in ("72h", "144h")),
         f"趋势: {trader_panel_flow_trend(snapshot)}",
         "━━━━━━━━━━━━",
-        "🎯 触发",
+        f"🎯 触发证据（共{ev_display_score}分）",
     ]
     lines.extend(f"- {trigger}" for trigger in triggers)
     lines.extend(
@@ -8008,6 +8248,8 @@ def format_symbol_diagnosis(
     signal = signals[0] if signals else None
     spot_text = spot_alpha_confirmation(snapshot.symbol)
     conviction_part = "\n".join(format_conviction_model_lines(snapshot, signal))
+    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
+    ev_display_score = evidence_display_score(ev_direction, ev_items, ev_score)
     rule_lines = "\n".join(format_rule_optimization_lines(snapshot, signal, spot_text, coinglass_text))
     return (
         f"{snapshot.symbol}\n"
@@ -8023,6 +8265,7 @@ def format_symbol_diagnosis(
         f"资金流共振: {flow_alignment_score(snapshot)}/10 ({flow_alignment_note(flow_alignment_score(snapshot))})\n"
         f"长周期资金共振: {long_flow_alignment_score(snapshot)}/9 ({long_flow_alignment_note(long_flow_alignment_score(snapshot))})\n"
         f"{conviction_part}\n"
+        f"证据: {ev_direction} {ev_display_score}分 - {ev_summary}\n"
         f"现货/链上确认: {spot_text}\n"
         f"{rule_lines}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
@@ -8054,10 +8297,14 @@ def format_ask_context(
     flow_score = flow_alignment_score(snapshot)
     long_flow_score = long_flow_alignment_score(snapshot)
     spot_text = spot_alpha_confirmation(snapshot.symbol)
-    conviction_part = "\n".join(format_conviction_model_lines(snapshot, signals[0] if signals else None))
-    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signals[0] if signals else None)
+    signal = signals[0] if signals else None
+    conviction_part = "\n".join(format_conviction_model_lines(snapshot, signal))
+    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
+    ev_display_score = evidence_display_score(ev_direction, ev_items, ev_score)
+    evidence_part = f"证据: {ev_direction} {ev_display_score}分 - {ev_summary}\n"
+    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
     entry_score, entry_label, entry_reason = entry_timing_score(snapshot, signals[0]) if signals else (5, "观察", "中性信号")
-    rule_lines = "\n".join(format_rule_optimization_lines(snapshot, signals[0] if signals else None, spot_text, coinglass_text))
+    rule_lines = "\n".join(format_rule_optimization_lines(snapshot, signal, spot_text, coinglass_text))
     system_direction = diagnose_snapshot(snapshot, signals)
     triggered_signal_state = "有触发信号" if signals else "无触发信号"
     available_levels = (
@@ -8084,6 +8331,7 @@ def format_ask_context(
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
         f"{conviction_part}\n"
+        f"{evidence_part}"
         f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
         f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"{rule_lines}\n"
@@ -8111,6 +8359,7 @@ def format_ask_context(
         f"资金流共振: {flow_score}/10 ({flow_alignment_note(flow_score)})\n"
         f"长周期资金共振: {long_flow_score}/9 ({long_flow_alignment_note(long_flow_score)})\n\n"
         f"{conviction_part}\n\n"
+        f"{evidence_part}\n"
         f"现货/链上确认: {spot_text}\n"
         f"{rule_lines}\n"
         f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
@@ -8318,6 +8567,9 @@ def format_ask_core_data(
     spot_text = spot_alpha_confirmation(snapshot.symbol)
     signal = signals[0] if signals else None
     conviction_part = "\n".join(format_conviction_model_lines(snapshot, signal))
+    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
+    ev_display_score = evidence_display_score(ev_direction, ev_items, ev_score)
+    evidence_part = f"证据: {ev_direction} {ev_display_score}分 - {ev_summary}\n"
     trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
     entry_score, entry_label, entry_reason = entry_timing_score(snapshot, signal) if signal else (5, "观察", "中性信号")
     rule_lines = "\n".join(format_rule_optimization_lines(snapshot, signal, spot_text, coinglass_text))
@@ -8331,6 +8583,7 @@ def format_ask_core_data(
         f"评分: 短线 {short_term_score(snapshot)}/10; 中线 {mid_term_score(snapshot)}/10; "
         f"资金流共振 {flow_alignment_score(snapshot)}/10; 长周期资金共振 {long_flow_alignment_score(snapshot)}/9\n"
         f"{conviction_part}\n"
+        f"{evidence_part}"
         f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
         f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"{rule_lines}\n"
@@ -8629,6 +8882,11 @@ def print_symbol_diagnosis(
     signal = signals[0] if signals else None
     for line in format_conviction_model_lines(snapshot, signal):
         print(line)
+    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
+    ev_display_score = evidence_display_score(ev_direction, ev_items, ev_score)
+    print(f"证据: {ev_direction} {ev_display_score}分 - {ev_summary}")
+    for item in ev_items[:8]:
+        print(f"{evidence_item_icon(item)} {item.label} {evidence_item_signed_points(item):+d}")
     for line in format_rule_optimization_lines(snapshot, signal, spot_text, coinglass_text):
         print(line)
     print(f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})")
