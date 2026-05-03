@@ -43,6 +43,10 @@ FLOW_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h"]
 COINGLASS_TAKER_LONG_RANGES = ("24h", "7d")
 COINGLASS_BALANCE_LONG_RANGES = ("24h", "7d", "30d")
 COINGLASS_FUNDING_ACCUMULATED_RANGES = ("24h", "7d")
+DEFAULT_TELEGRAM_REALTIME_PRIORITIES = ("S", "A", "B")
+DEFAULT_TELEGRAM_DIGEST_PRIORITIES = ("C", "D")
+DEFAULT_TELEGRAM_DIGEST_INTERVAL_MINUTES = 30
+DEFAULT_TELEGRAM_DIGEST_MAX_PER_PRIORITY = 8
 
 
 @dataclass(frozen=True)
@@ -76,6 +80,20 @@ class Signal:
     message: str
     key: str
     snapshot: MarketSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class TelegramSignalDigestItem:
+    created_at: float
+    symbol: str
+    kind: str
+    priority: str
+    quality_score: int
+    trap_score: int | str
+    main_asset_score: int | None
+    signal_score: int
+    strength_score: float
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -199,6 +217,21 @@ class DerivativesMonitor:
         self.coinglass_liquidation_cache: dict[str, tuple[float, dict[str, float]]] = {}
         self.coinglass_market_context_cache: dict[str, tuple[float, str]] = {}
         self.telegram_signal_cooldowns: dict[str, tuple[float, int]] = {}
+        self.telegram_signal_digest_queue: list[TelegramSignalDigestItem] = []
+        self.telegram_signal_digest_lock = threading.Lock()
+        self.last_telegram_signal_digest_at = time.time()
+        self.runtime_realtime_priorities_override: set[str] | None = None
+        self.runtime_realtime_priorities_lock = threading.Lock()
+        self.signal_quality_stats = {
+            "total": 0,
+            "realtime_sent": 0,
+            "suppressed": 0,
+            "by_priority": {priority: 0 for priority in ("S", "A", "B", "C", "D")},
+            "by_kind": {},
+            "by_symbol": {},
+            "suppressed_by_priority": {priority: 0 for priority in ("S", "A", "B", "C", "D")},
+        }
+        self.signal_quality_stats_lock = threading.Lock()
 
     def run_forever(self) -> None:
         self.start_liquidation_stream_worker()
@@ -212,6 +245,7 @@ class DerivativesMonitor:
                 self.refresh_symbols_if_due()
                 self.run_cycle()
                 self.send_summary_if_due()
+                self.flush_telegram_signal_digest_if_due()
             except Exception:
                 logging.exception("Derivatives monitor cycle failed")
 
@@ -1525,6 +1559,7 @@ class DerivativesMonitor:
         if bot_token and chat_ids:
             priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
             suppressed, suppressed_reason = self.telegram_signal_suppression(signal, priority, quality_score)
+            self.update_signal_quality_stats(signal, priority, suppressed)
             if suppressed:
                 logging.info(
                     "Telegram signal suppressed: %s %s priority=%s quality=%s reason=%s",
@@ -1534,10 +1569,32 @@ class DerivativesMonitor:
                     quality_score,
                     suppressed_reason or quality_reason,
                 )
+                self.enqueue_telegram_signal_digest(signal, priority, quality_score)
                 return
             for chat_id in split_chat_ids(chat_ids):
                 self.send_telegram(bot_token, chat_id, signal, priority, quality_score, quality_reason)
             self.telegram_signal_cooldowns[self.telegram_signal_key(signal)] = (time.time(), quality_score)
+
+    def update_signal_quality_stats(self, signal: Signal, priority: str, suppressed: bool) -> None:
+        with self.signal_quality_stats_lock:
+            self.signal_quality_stats["total"] += 1
+            if suppressed:
+                self.signal_quality_stats["suppressed"] += 1
+            else:
+                self.signal_quality_stats["realtime_sent"] += 1
+
+            by_priority = self.signal_quality_stats["by_priority"]
+            by_priority[priority] = by_priority.get(priority, 0) + 1
+
+            by_kind = self.signal_quality_stats["by_kind"]
+            by_kind[signal.kind] = by_kind.get(signal.kind, 0) + 1
+
+            by_symbol = self.signal_quality_stats["by_symbol"]
+            by_symbol[signal.symbol] = by_symbol.get(signal.symbol, 0) + 1
+
+            if suppressed:
+                suppressed_by_priority = self.signal_quality_stats["suppressed_by_priority"]
+                suppressed_by_priority[priority] = suppressed_by_priority.get(priority, 0) + 1
 
     def get(self, path: str, params: dict[str, Any]) -> Any:
         response = self.session.get(f"{BINANCE_FAPI_BASE}{path}", params=params, timeout=10)
@@ -1561,8 +1618,49 @@ class DerivativesMonitor:
     def telegram_signal_key(self, signal: Signal) -> str:
         return f"{signal.symbol}/{signal.kind}"
 
+    def telegram_signal_filter_settings(self) -> tuple[set[str], list[str], int, int]:
+        config = self.config.get("telegram_signal_filter", {})
+        if not isinstance(config, dict):
+            config = {}
+        realtime_priorities = parse_priority_list(
+            config.get("realtime_priorities"),
+            DEFAULT_TELEGRAM_REALTIME_PRIORITIES,
+        )
+        digest_priorities = parse_priority_list(
+            config.get("digest_priorities"),
+            DEFAULT_TELEGRAM_DIGEST_PRIORITIES,
+        )
+        digest_interval_minutes = parse_positive_int(
+            config.get("digest_interval_minutes"),
+            DEFAULT_TELEGRAM_DIGEST_INTERVAL_MINUTES,
+        )
+        digest_max_per_priority = parse_positive_int(
+            config.get("digest_max_per_priority"),
+            DEFAULT_TELEGRAM_DIGEST_MAX_PER_PRIORITY,
+        )
+        with self.runtime_realtime_priorities_lock:
+            if self.runtime_realtime_priorities_override is not None:
+                realtime_priorities = list(self.runtime_realtime_priorities_override)
+        return set(realtime_priorities), digest_priorities, digest_interval_minutes, digest_max_per_priority
+
+    def configured_realtime_priorities(self) -> set[str]:
+        config = self.config.get("telegram_signal_filter", {})
+        if not isinstance(config, dict):
+            config = {}
+        return set(parse_priority_list(config.get("realtime_priorities"), DEFAULT_TELEGRAM_REALTIME_PRIORITIES))
+
+    def runtime_realtime_priorities_status(self) -> tuple[set[str], bool]:
+        with self.runtime_realtime_priorities_lock:
+            override = self.runtime_realtime_priorities_override
+            if override is None:
+                return self.configured_realtime_priorities(), False
+            return set(override), True
+
     def telegram_signal_suppression(self, signal: Signal, priority: str, quality_score: int) -> tuple[bool, str]:
-        if priority not in ("S", "A", "B"):
+        realtime_priorities, _digest_priorities, _digest_interval_minutes, _digest_max_per_priority = (
+            self.telegram_signal_filter_settings()
+        )
+        if priority not in realtime_priorities:
             return True, f"priority {priority} below realtime Telegram threshold"
 
         key = self.telegram_signal_key(signal)
@@ -1595,6 +1693,73 @@ class DerivativesMonitor:
             "text": format_signal_for_telegram(signal, liquidation_text, priority, quality_score, quality_reason),
         }
         self.post_json(url, payload)
+
+    def enqueue_telegram_signal_digest(self, signal: Signal, priority: str, quality_score: int) -> None:
+        _realtime_priorities, digest_priorities, _digest_interval_minutes, _digest_max_per_priority = (
+            self.telegram_signal_filter_settings()
+        )
+        if priority not in set(digest_priorities):
+            return
+
+        snapshot = signal.snapshot
+        trap_score: int | str = ""
+        main_score_value: int | None = None
+        if snapshot:
+            trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+            main_score = main_asset_score(snapshot)
+            main_score_value = main_score.total_score if main_score else None
+
+        item = TelegramSignalDigestItem(
+            created_at=time.time(),
+            symbol=signal.symbol,
+            kind=signal.kind,
+            priority=priority,
+            quality_score=quality_score,
+            trap_score=trap_score,
+            main_asset_score=main_score_value,
+            signal_score=signal.score,
+            strength_score=signal_strength_score(signal),
+            reason=compact_digest_reason(signal.message),
+        )
+        with self.telegram_signal_digest_lock:
+            self.telegram_signal_digest_queue.append(item)
+
+    def flush_telegram_signal_digest_if_due(self) -> None:
+        _realtime_priorities, digest_priorities, digest_interval_minutes, digest_max_per_priority = (
+            self.telegram_signal_filter_settings()
+        )
+        now = time.time()
+        if now - self.last_telegram_signal_digest_at < digest_interval_minutes * 60:
+            return
+        self.last_telegram_signal_digest_at = now
+
+        with self.telegram_signal_digest_lock:
+            items = self.telegram_signal_digest_queue
+            self.telegram_signal_digest_queue = []
+        digest_priority_set = set(digest_priorities)
+        digest_items = [item for item in items if item.priority in digest_priority_set]
+        if not digest_items:
+            return
+
+        notifications = self.config.get("notifications", {})
+        telegram = notifications.get("telegram", {})
+        bot_token, chat_ids = resolve_telegram_credentials(telegram)
+        if not bot_token or not chat_ids:
+            return
+
+        message = format_telegram_signal_digest(
+            digest_items,
+            digest_priorities,
+            digest_interval_minutes,
+            digest_max_per_priority,
+        )
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        for chat_id in split_chat_ids(chat_ids):
+            try:
+                response = self.session.post(url, json={"chat_id": chat_id, "text": message}, timeout=5)
+                response.raise_for_status()
+            except Exception:
+                logging.exception("Failed to send Telegram signal digest to chat_id=%s", chat_id)
 
     def notify_status(self, title: str, message: str) -> None:
         notifications = self.config.get("notifications", {})
@@ -1714,6 +1879,26 @@ class DerivativesMonitor:
             self.handle_signals_command(bot_token, chat_id)
             return
 
+        if command == "/quality":
+            self.handle_quality_command(bot_token, chat_id)
+            return
+
+        if command == "/digest":
+            self.handle_digest_command(bot_token, chat_id, parts[1:])
+            return
+
+        if command == "/topq":
+            self.handle_topq_command(bot_token, chat_id)
+            return
+
+        if command == "/quiet":
+            self.handle_quiet_command(bot_token, chat_id, parts[1:])
+            return
+
+        if command == "/why":
+            self.handle_why_command(bot_token, chat_id, parts[1:])
+            return
+
         if command == "/top":
             self.handle_top_command(bot_token, chat_id)
             return
@@ -1767,6 +1952,169 @@ class DerivativesMonitor:
         except Exception as exc:
             logging.exception("Failed to diagnose symbol from Telegram command")
             self.send_telegram_text(bot_token, chat_id, f"{symbol} 查询失败: {type(exc).__name__}: {exc}")
+
+    def handle_quality_command(self, bot_token: str, chat_id: str) -> None:
+        self.send_telegram_text(bot_token, chat_id, self.format_signal_quality_stats())
+
+    def handle_digest_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
+        if not args or args[0].lower() != "now":
+            return
+        self.send_telegram_text(bot_token, chat_id, self.format_current_telegram_signal_digest())
+
+    def format_current_telegram_signal_digest(self) -> str:
+        _realtime_priorities, digest_priorities, digest_interval_minutes, digest_max_per_priority = (
+            self.telegram_signal_filter_settings()
+        )
+        with self.telegram_signal_digest_lock:
+            items = list(self.telegram_signal_digest_queue)
+
+        digest_priority_set = set(digest_priorities)
+        digest_items = [item for item in items if item.priority in digest_priority_set]
+        if not digest_items:
+            return "当前暂无静默信号。"
+
+        return format_telegram_signal_digest(
+            digest_items,
+            digest_priorities,
+            digest_interval_minutes,
+            digest_max_per_priority,
+            title="当前静默信号摘要预览",
+        )
+
+    def format_signal_quality_stats(self) -> str:
+        with self.signal_quality_stats_lock:
+            stats = {
+                "total": self.signal_quality_stats["total"],
+                "realtime_sent": self.signal_quality_stats["realtime_sent"],
+                "suppressed": self.signal_quality_stats["suppressed"],
+                "by_priority": dict(self.signal_quality_stats["by_priority"]),
+                "by_kind": dict(self.signal_quality_stats["by_kind"]),
+                "by_symbol": dict(self.signal_quality_stats["by_symbol"]),
+                "suppressed_by_priority": dict(self.signal_quality_stats["suppressed_by_priority"]),
+            }
+
+        priorities = ("S", "A", "B", "C", "D")
+        priority_text = " ".join(f"{priority}:{stats['by_priority'].get(priority, 0)}" for priority in priorities)
+        suppressed_text = " ".join(
+            f"{priority}:{stats['suppressed_by_priority'].get(priority, 0)}" for priority in priorities
+        )
+        top_kinds = format_top_quality_counts(stats["by_kind"])
+        top_symbols = format_top_quality_counts(stats["by_symbol"])
+        return "\n".join(
+            [
+                "信号质量统计（本次服务启动后）",
+                f"总信号: {stats['total']}",
+                f"实时推送: {stats['realtime_sent']}",
+                f"静默: {stats['suppressed']}",
+                f"等级分布: {priority_text}",
+                f"静默分布: {suppressed_text}",
+                f"Top kinds: {top_kinds}",
+                f"Top symbols: {top_symbols}",
+            ]
+        )
+
+    def handle_quiet_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
+        if not args:
+            self.send_telegram_text(bot_token, chat_id, "用法: /quiet status|normal|strict|ultra")
+            return
+
+        mode = args[0].lower()
+        if mode == "status":
+            self.send_telegram_text(bot_token, chat_id, self.format_quiet_status())
+            return
+        if mode == "normal":
+            with self.runtime_realtime_priorities_lock:
+                self.runtime_realtime_priorities_override = None
+            self.send_telegram_text(bot_token, chat_id, self.format_quiet_status())
+            return
+        if mode == "strict":
+            with self.runtime_realtime_priorities_lock:
+                self.runtime_realtime_priorities_override = {"S", "A"}
+            self.send_telegram_text(bot_token, chat_id, self.format_quiet_status())
+            return
+        if mode == "ultra":
+            with self.runtime_realtime_priorities_lock:
+                self.runtime_realtime_priorities_override = {"S"}
+            self.send_telegram_text(bot_token, chat_id, self.format_quiet_status())
+            return
+
+        self.send_telegram_text(bot_token, chat_id, "用法: /quiet status|normal|strict|ultra")
+
+    def format_quiet_status(self) -> str:
+        realtime_priorities, digest_priorities, _digest_interval_minutes, _digest_max_per_priority = (
+            self.telegram_signal_filter_settings()
+        )
+        _current_realtime, override_enabled = self.runtime_realtime_priorities_status()
+        return "\n".join(
+            [
+                "Telegram 临时静音等级",
+                f"实时等级: {format_priority_set(realtime_priorities)}",
+                f"摘要等级: {format_priority_set(set(digest_priorities))}",
+                f"override: {'on' if override_enabled else 'off'}",
+            ]
+        )
+
+    def handle_why_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
+        if not args:
+            self.send_telegram_text(bot_token, chat_id, "用法: /why SYMBOL")
+            return
+
+        symbol = normalize_usdt_symbol(args[0])
+        try:
+            message = self.format_why_symbol(symbol)
+        except Exception:
+            logging.exception("Failed to build /why response for %s", symbol)
+            self.send_telegram_text(bot_token, chat_id, f"{symbol} 查询失败，请查看服务日志。")
+            return
+        self.send_telegram_text(bot_token, chat_id, message)
+
+    def format_why_symbol(self, symbol: str) -> str:
+        snapshot = self.latest_snapshots.get(symbol)
+        if snapshot is None:
+            snapshot = self.fetch_snapshot(symbol)
+
+        try:
+            recent_rows = self.load_recent_symbol_signal_rows(symbol, 5, 300)
+        except Exception:
+            logging.exception("Failed to read recent symbol rows for /why: %s", symbol)
+            recent_rows = []
+
+        trap_score, trap_label, _trap_reason = trap_risk_score(snapshot, None)
+        main_score = main_asset_score(snapshot)
+        lines = [
+            f"WHY {symbol}",
+            "当前:",
+            f"- 短线评分 {short_term_score(snapshot)}/10，中线评分 {mid_term_score(snapshot)}/10",
+            f"- 资金流共振 {flow_alignment_score(snapshot)}/10，长周期 {long_flow_alignment_score(snapshot)}/9",
+            f"- 诱多/诱空风险 {trap_score}/10 {trap_label}",
+        ]
+        if main_score:
+            lines.append(f"- 主流评分 {main_score.total_score}/100")
+        coinglass_text = self.cached_coinglass_judgement(symbol)
+        if coinglass_text:
+            lines.append(f"- CoinGlass判断 {coinglass_text}")
+
+        lines.append("最近信号:")
+        if recent_rows:
+            for row in recent_rows:
+                lines.append(f"- {format_why_signal_row(row)}")
+        else:
+            lines.append("- 最近暂无该币信号。")
+
+        lines.append("结论:")
+        lines.append(f"- {why_symbol_conclusion(recent_rows)}")
+        return truncate_text("\n".join(lines), 3500)
+
+    def cached_coinglass_judgement(self, symbol: str) -> str:
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        cache_key = f"{base}:{symbol}"
+        cached = self.coinglass_market_context_cache.get(cache_key)
+        if not cached:
+            return ""
+        cached_at, text = cached
+        if time.time() - cached_at > COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS:
+            return ""
+        return extract_coinglass_judgement(text)
 
     def handle_ask_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
         if not args:
@@ -1879,8 +2227,8 @@ class DerivativesMonitor:
             return 0
         return max(0, int(now - self.latest_snapshots_updated_at))
 
-    def load_recent_symbol_signal_rows(self, symbol: str, limit: int = 3) -> list[dict[str, str]]:
-        rows = self.load_recent_signal_rows(1000)
+    def load_recent_symbol_signal_rows(self, symbol: str, limit: int = 3, scan_limit: int = 1000) -> list[dict[str, str]]:
+        rows = self.load_recent_signal_rows(scan_limit)
         return [row for row in rows if row.get("symbol", "").upper() == symbol][:limit]
 
     def handle_dev_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
@@ -2368,6 +2716,47 @@ class DerivativesMonitor:
                 f"score={row.get('score', '-')} "
                 f"价格={format_csv_number(row.get('price_change_percent'))}% "
                 f"OI={format_csv_number(row.get('oi_change_percent'))}%"
+            )
+        self.send_telegram_text(bot_token, chat_id, "\n".join(lines))
+
+    def handle_topq_command(self, bot_token: str, chat_id: str) -> None:
+        try:
+            rows = self.load_recent_signal_rows(200)
+        except Exception:
+            logging.exception("Failed to read quality signal rows")
+            self.send_telegram_text(bot_token, chat_id, "读取信号记录失败，请查看服务日志。")
+            return
+
+        scored_rows = []
+        for row in rows:
+            quality_score = parse_float(row.get("signal_quality_score"))
+            if quality_score is None:
+                continue
+            scored_rows.append((quality_score, row))
+
+        if not scored_rows:
+            self.send_telegram_text(bot_token, chat_id, "暂无质量评分信号，请等待新信号积累。")
+            return
+
+        scored_rows.sort(key=lambda item: item[0], reverse=True)
+        lines = ["高质量信号TOP10"]
+        for index, (quality_score, row) in enumerate(scored_rows[:10], start=1):
+            time_text = row.get("time", "-").replace("T", " ")[:19]
+            reason = compact_digest_reason(row.get("signal_quality_reason", "") or "-")
+            lines.append(
+                f"{index}. {row.get('symbol', '-')} {row.get('kind', '-')} "
+                f"q={row.get('signal_priority', '-')}/{quality_score:.0f} "
+                f"score={row.get('score', '-')} "
+                f"strength={format_csv_strength(row.get('strength_score'))} "
+                f"trap={row.get('trap_risk_score', '-')} "
+                f"main={row.get('main_asset_score', '-') or '-'} "
+                f"suppressed={row.get('suppressed_from_telegram', '-')}"
+            )
+            lines.append(
+                f"   {time_text} "
+                f"{format_csv_number(row.get('price_change_percent'))}% "
+                f"{format_csv_number(row.get('oi_change_percent'))}% "
+                f"{reason}"
             )
         self.send_telegram_text(bot_token, chat_id, "\n".join(lines))
 
@@ -4055,6 +4444,112 @@ def min_priority_cap(priority: str, cap: str, order: dict[str, int], reverse: di
     return reverse[min(order.get(priority, 0), order.get(cap, 0))]
 
 
+def compact_digest_reason(text: str) -> str:
+    compact = " ".join(str(text).split())
+    return truncate_text(compact, 120)
+
+
+def format_telegram_signal_digest(
+    items: list[TelegramSignalDigestItem],
+    digest_priorities: list[str],
+    interval_minutes: int,
+    max_per_priority: int,
+    title: str | None = None,
+) -> str:
+    lines = [title or f"近{interval_minutes}分钟静默信号摘要"]
+    counts = {priority: 0 for priority in digest_priorities}
+    for item in items:
+        if item.priority in counts:
+            counts[item.priority] += 1
+
+    for priority in digest_priorities:
+        priority_items = [item for item in items if item.priority == priority]
+        if not priority_items:
+            continue
+        lines.append("")
+        lines.append(f"{priority}:")
+        for item in priority_items[:max_per_priority]:
+            main_text = str(item.main_asset_score) if item.main_asset_score is not None else "空"
+            lines.append(
+                f"{item.symbol} {item.kind} "
+                f"q={item.quality_score} trap={item.trap_score} main={main_text} "
+                f"score={item.signal_score} strength={item.strength_score:.1f} {item.reason}"
+            )
+
+    lines.append("")
+    stats = [f"{priority}: {counts[priority]}" for priority in digest_priorities]
+    lines.append(f"总静默: {sum(counts.values())}；" + "；".join(stats))
+    return truncate_text("\n".join(lines), 3500)
+
+
+def format_top_quality_counts(counts: dict[str, int], limit: int = 5) -> str:
+    if not counts:
+        return "-"
+    top_items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    return ", ".join(f"{key} {value}" for key, value in top_items)
+
+
+def format_priority_set(priorities: set[str]) -> str:
+    order = ["S", "A", "B", "C", "D"]
+    ordered = [priority for priority in order if priority in priorities]
+    ordered.extend(sorted(priority for priority in priorities if priority not in order))
+    return "/".join(ordered) if ordered else "-"
+
+
+def normalize_usdt_symbol(value: str) -> str:
+    symbol = str(value).strip().upper()
+    return symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+
+
+def extract_coinglass_judgement(text: str) -> str:
+    if not text:
+        return ""
+    match = re.search(r"判断:\s*([^\n；]+)", text)
+    if match:
+        return match.group(1).strip()
+    first_line = text.splitlines()[0].strip()
+    return truncate_text(first_line, 120) if first_line and "n/a" not in first_line else ""
+
+
+def format_why_signal_row(row: dict[str, str]) -> str:
+    quality_score = row.get("signal_quality_score") or "-"
+    priority = row.get("signal_priority") or "-"
+    reason = compact_digest_reason(row.get("signal_quality_reason", "") or row.get("message", "") or "-")
+    time_text = row.get("time", "-").replace("T", " ")[:19]
+    return (
+        f"{time_text} {row.get('kind', '-')} "
+        f"q={priority}/{quality_score} "
+        f"suppressed={row.get('suppressed_from_telegram', '-')} "
+        f"trap={row.get('trap_risk_score', '-')} "
+        f"main={row.get('main_asset_score', '-') or '-'} "
+        f"score={row.get('score', '-')} "
+        f"strength={format_csv_strength(row.get('strength_score'))} "
+        f"{reason}"
+    )
+
+
+def why_symbol_conclusion(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return "最近暂无该币信号。"
+
+    high_quality = False
+    low_quality_count = 0
+    for row in rows:
+        priority = (row.get("signal_priority") or "").upper()
+        suppressed = str(row.get("suppressed_from_telegram") or "").strip() == "1"
+        trap_score = parse_float(row.get("trap_risk_score"))
+        if priority in ("A", "S") and (trap_score is None or trap_score <= 5):
+            high_quality = True
+        if priority in ("C", "D") or suppressed:
+            low_quality_count += 1
+
+    if high_quality:
+        return "有较高质量信号，可重点盯确认位。"
+    if low_quality_count >= max(1, (len(rows) + 1) // 2):
+        return "最近信号质量偏低，适合观察不追。"
+    return "最近信号质量中性，等待更明确确认。"
+
+
 def format_signal_for_telegram(
     signal: Signal,
     liquidation_text: str | None = None,
@@ -5054,6 +5549,25 @@ def split_chat_ids(chat_ids: str) -> list[str]:
     return [chat_id.strip() for chat_id in str(chat_ids).split(",") if chat_id.strip()]
 
 
+def parse_priority_list(value: Any, default: tuple[str, ...]) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return list(default)
+    priorities = []
+    for item in value:
+        priority = str(item).strip().upper()
+        if priority and priority not in priorities:
+            priorities.append(priority)
+    return priorities or list(default)
+
+
+def parse_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def truncate_text(text: str, limit: int = 3500) -> str:
     if len(text) <= limit:
         return text
@@ -5176,6 +5690,11 @@ def telegram_help_text() -> str:
         "信号:\n"
         " /hot - 强势过热候选\n"
         " /signals - 最近信号\n"
+        " /quality - 信号质量统计\n"
+        " /digest now - 查看当前静默摘要\n"
+        " /topq - 高质量信号排行\n"
+        " /quiet status|normal|strict|ultra - 临时调整实时推送等级\n"
+        " /why SYMBOL - 快速解释最近信号质量\n"
         " /top - 强度最高信号\n"
         " /review - 最近10条信号\n"
         " /perf - 最近信号表现\n\n"
