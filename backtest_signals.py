@@ -23,6 +23,12 @@ MAIN_ASSET_SCORE_GROUPS = (
     ("60-79", "主流强", 60, 79),
     ("80-100", "主流极强", 80, 100),
 )
+TRAP_RISK_GROUPS = (
+    ("0-2", "低", 0, 2),
+    ("3-5", "中", 3, 5),
+    ("6-7", "高", 6, 7),
+    ("8-10", "极高", 8, 10),
+)
 
 
 def parse_time(value):
@@ -95,6 +101,7 @@ def eval_signal(session, row):
     out = {"symbol": symbol, "kind": kind, "side": side}
     out["long_flow_alignment_score"] = parse_int(row.get("long_flow_alignment_score"))
     out["main_asset_score"] = parse_int(row.get("main_asset_score"))
+    out["trap_risk_score"] = parse_int(row.get("trap_risk_score"))
     for name in ("12h", "24h"):
         out[f"flow_{name}"] = parse_float(row.get(f"net_flow_{name}_usd"))
         out[f"flow_{name}_ratio"] = parse_float(row.get(f"net_flow_{name}_ratio"))
@@ -162,6 +169,9 @@ def flow_detail(x):
     main_score = x.get("main_asset_score")
     if main_score is not None:
         parts.append(f"mainScore={main_score}/100")
+    trap_score = x.get("trap_risk_score")
+    if trap_score is not None:
+        parts.append(f"trap={trap_score}/10")
     for name in ("12h", "24h"):
         flow = x.get(f"flow_{name}")
         ratio = x.get(f"flow_{name}_ratio")
@@ -183,6 +193,15 @@ def main_asset_score_group(score):
     if score is None:
         return None
     for label, name, low, high in MAIN_ASSET_SCORE_GROUPS:
+        if low <= score <= high:
+            return label, name
+    return None
+
+
+def trap_risk_group(score):
+    if score is None:
+        return None
+    for label, name, low, high in TRAP_RISK_GROUPS:
         if low <= score <= high:
             return label, name
     return None
@@ -254,6 +273,35 @@ def print_main_asset_score_backtest(results):
     print("")
 
 
+def print_trap_risk_backtest(results):
+    grouped = [
+        (x, trap_risk_group(x.get("trap_risk_score")))
+        for x in results
+    ]
+
+    print("[TRAP RISK] 诱多/诱空过滤评分分组回测")
+    for label, name, _low, _high in TRAP_RISK_GROUPS:
+        group_rows = [
+            x
+            for x, group in grouped
+            if group == (label, name)
+        ]
+
+        print(f"{label} {name}: 样本={len(group_rows)}")
+        for h in ["15m", "1h", "4h", "12h", "24h"]:
+            vals = [x[h] for x in group_rows if x[h] is not None]
+            if not vals:
+                print(f"  {h}: 样本=0")
+                continue
+            wins = sum(v > 0 for v in vals)
+            print(
+                f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))} "
+                f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
+            )
+    print("")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--config", default="derivatives_config.yaml")
@@ -301,6 +349,7 @@ def main():
 
     print_long_flow_backtest(results)
     print_main_asset_score_backtest(results)
+    print_trap_risk_backtest(results)
 
     print("最近20条:")
     for x in results[:20]:

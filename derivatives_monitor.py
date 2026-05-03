@@ -139,6 +139,9 @@ SIGNAL_LOG_FIELDS = [
     "main_asset_derivatives_score",
     "main_asset_spot_orderbook_score",
     "main_asset_risk_penalty",
+    "trap_risk_score",
+    "trap_risk_label",
+    "trap_risk_reason",
 ]
 
 
@@ -1408,6 +1411,7 @@ class DerivativesMonitor:
         snapshot = signal.snapshot
         main_score = main_asset_score(snapshot) if snapshot else None
         main_score_components = main_score.components if main_score else {}
+        trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal) if snapshot else ("", "", "")
         row = {
             "time": dt.datetime.now(dt.UTC).isoformat(),
             "symbol": signal.symbol,
@@ -1453,6 +1457,9 @@ class DerivativesMonitor:
             "main_asset_derivatives_score": main_score_components.get("衍生品", ""),
             "main_asset_spot_orderbook_score": main_score_components.get("现货订单簿", ""),
             "main_asset_risk_penalty": main_score_components.get("风险扣分", ""),
+            "trap_risk_score": trap_score,
+            "trap_risk_label": trap_label,
+            "trap_risk_reason": trap_reason,
         }
         path = Path(self.signal_log_path)
         fieldnames, write_header = ensure_csv_schema(path, SIGNAL_LOG_FIELDS)
@@ -3485,6 +3492,13 @@ def spot_alpha_confirmation(symbol: str) -> str:
     return result
 
 
+def cached_spot_alpha_confirmation(symbol: str) -> str:
+    cached = _SPOT_CHAIN_CACHE.get(str(symbol).upper())
+    if cached and time.time() - cached[0] < 180:
+        return cached[1]
+    return ""
+
+
 def fetch_spot_confirmation(symbol: str) -> str | None:
     for spot_symbol in spot_symbol_candidates(symbol):
         summaries = []
@@ -4155,6 +4169,82 @@ def extract_coinglass_taker_ratios(text: str | None) -> tuple[float | None, floa
 
 def is_extreme_funding(snapshot: MarketSnapshot) -> bool:
     return snapshot.funding_rate_percent is not None and abs(snapshot.funding_rate_percent) >= 0.08
+
+
+def trap_risk_score(snapshot: MarketSnapshot, signal: Signal | None) -> tuple[int, str, str]:
+    score = 0
+    reasons = []
+    position = snapshot.price_position_24h
+    high_position = position is not None and position > 75
+    low_position = position is not None and position < 25
+    flow_1h = summary_flow_value(snapshot, "1h")
+    flow_4h = summary_flow_value(snapshot, "4h")
+    flow_12h = summary_flow_value(snapshot, "12h")
+    taker = snapshot.taker_buy_sell_ratio
+    funding = snapshot.funding_rate_percent
+
+    if high_position and (flow_4h <= 0 or flow_12h <= 0):
+        score += 2
+        reasons.append("高位但4h/12h资金流不支持")
+    if low_position and ((taker is not None and taker < 1) or flow_1h <= 0 or flow_4h <= 0):
+        score += 2
+        reasons.append("低位但主动买盘或1h/4h资金流偏弱")
+    if snapshot.oi_change_percent > 10 and taker is not None and taker < 1:
+        score += 2
+        reasons.append("OI扩张>10%但主动买卖比<1")
+    if funding is not None and funding >= 0.08 and high_position:
+        score += 2
+        reasons.append("极端正Funding叠加高位")
+    if funding is not None and funding <= -0.08 and low_position:
+        score += 1
+        reasons.append("极端负Funding叠加低位")
+
+    long_flow_score = long_flow_alignment_score(snapshot)
+    if long_flow_score <= 3:
+        score += 2
+        reasons.append("长周期资金共振<=3")
+    flow_score = flow_alignment_score(snapshot)
+    if flow_score <= 3:
+        score += 1
+        reasons.append("资金流共振<=3")
+
+    spot_text = cached_spot_alpha_confirmation(snapshot.symbol)
+    if spot_confirmation_is_weak(spot_text):
+        score += 1
+        reasons.append("现货/链上确认偏弱")
+
+    structure_text = market_structure_label(snapshot)
+    liquidation_text = liquidation_risk_label(snapshot)
+    signal_text = f"{signal.title} {signal.message}" if signal else ""
+    if any(item in f"{structure_text} {liquidation_text} {signal_text}" for item in ("洗盘", "双向强平/剧烈洗盘")):
+        score += 1
+        reasons.append("清算/结构提示洗盘风险")
+
+    score = min(score, 10)
+    label = trap_risk_label(score)
+    reason = "；".join(reasons) if reasons else "暂无明显诱多/诱空过滤项"
+    return score, label, reason
+
+
+def trap_risk_label(score: int) -> str:
+    if score <= 2:
+        return "低"
+    if score <= 5:
+        return "中"
+    if score <= 7:
+        return "高"
+    return "极高"
+
+
+def spot_confirmation_is_weak(text: str) -> bool:
+    if not text:
+        return False
+    return any(item in text for item in ("偏弱", "无标准现货", "无方向"))
+
+
+def format_trap_risk_line(snapshot: MarketSnapshot, signal: Signal | None = None) -> str:
+    score, label, reason = trap_risk_score(snapshot, signal)
+    return f"诱多/诱空风险: {score}/10 {label} - {reason}"
 
 
 def liquidation_score(liquidation_text: str | None) -> int:
@@ -5128,6 +5218,8 @@ def format_ask_context(
     market_text = market_方向_summary(market_snapshots) if market_snapshots else "大盘风向: 暂无 BTC/ETH/SOL 快照"
     flow_score = flow_alignment_score(snapshot)
     long_flow_score = long_flow_alignment_score(snapshot)
+    spot_text = spot_alpha_confirmation(snapshot.symbol)
+    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signals[0] if signals else None)
     system_direction = diagnose_snapshot(snapshot, signals)
     triggered_signal_state = "有触发信号" if signals else "无触发信号"
     available_levels = (
@@ -5153,6 +5245,7 @@ def format_ask_context(
         f"信号触发状态: {triggered_signal_state}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
+        f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"{main_score_part}"
         f"大盘风向: {market_text}\n\n"
         "基础数据:\n"
@@ -5176,7 +5269,8 @@ def format_ask_context(
         f"24h: {format_usd(snapshot.net_flow_usd.get('24h'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('24h'))}\n"
         f"资金流共振: {flow_score}/10 ({flow_alignment_note(flow_score)})\n"
         f"长周期资金共振: {long_flow_score}/9 ({long_flow_alignment_note(long_flow_score)})\n\n"
-        f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}\n"
+        f"现货/链上确认: {spot_text}\n"
+        f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
         f"{liquidation_text or '真实强平: n/a'}\n"
@@ -5376,6 +5470,8 @@ def format_ask_core_data(
     orderbook_part = f"订单簿: {orderbook_text}\n" if orderbook_text else ""
     main_score_text = format_main_asset_score_line(snapshot, liquidation_text, coinglass_text)
     main_score_part = f"{main_score_text}\n" if main_score_text else ""
+    spot_text = spot_alpha_confirmation(snapshot.symbol)
+    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, None)
     coinglass_part = ""
     if not is_major_asset_tier(snapshot.symbol):
         coinglass_part = f"CoinGlass: {compact_coinglass_market_context(coinglass_text or 'CoinGlass聚合: n/a')}"
@@ -5385,10 +5481,11 @@ def format_ask_core_data(
         f"OI {snapshot.oi_change_percent:+.2f}%; Funding {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})\n"
         f"评分: 短线 {short_term_score(snapshot)}/10; 中线 {mid_term_score(snapshot)}/10; "
         f"资金流共振 {flow_alignment_score(snapshot)}/10; 长周期资金共振 {long_flow_alignment_score(snapshot)}/9\n"
+        f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"{main_score_part}"
         f"资金: {'; '.join(flow_items)}\n"
         f"长周期: {long_flow_alignment_note(long_flow_alignment_score(snapshot))}\n"
-        f"现货/链上: {spot_alpha_confirmation(snapshot.symbol)}\n"
+        f"现货/链上: {spot_text}\n"
         f"清算推断: {liquidation_risk_label(snapshot)}\n"
         f"真实强平: {liq_text}\n"
         f"{major_long_part}"
