@@ -142,6 +142,10 @@ SIGNAL_LOG_FIELDS = [
     "trap_risk_score",
     "trap_risk_label",
     "trap_risk_reason",
+    "signal_priority",
+    "signal_quality_score",
+    "signal_quality_reason",
+    "suppressed_from_telegram",
 ]
 
 
@@ -194,6 +198,7 @@ class DerivativesMonitor:
         self.coinglass_api_key = os.getenv("COINGLASS_API_KEY", "").strip()
         self.coinglass_liquidation_cache: dict[str, tuple[float, dict[str, float]]] = {}
         self.coinglass_market_context_cache: dict[str, tuple[float, str]] = {}
+        self.telegram_signal_cooldowns: dict[str, tuple[float, int]] = {}
 
     def run_forever(self) -> None:
         self.start_liquidation_stream_worker()
@@ -1402,9 +1407,6 @@ class DerivativesMonitor:
             self.log_signal(signal)
         except Exception:
             logging.exception("Failed to write signal log")
-        if not self.should_push_signal(signal):
-            logging.info("Signal logged but not pushed: %s 强度=%.2f", signal.title, signal_strength_score(signal))
-            return
         self.notify(signal)
 
     def log_signal(self, signal: Signal) -> None:
@@ -1412,6 +1414,8 @@ class DerivativesMonitor:
         main_score = main_asset_score(snapshot) if snapshot else None
         main_score_components = main_score.components if main_score else {}
         trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal) if snapshot else ("", "", "")
+        priority, quality_score, quality_reason = signal_priority(signal, snapshot)
+        suppressed_from_telegram, _suppressed_reason = self.telegram_signal_suppression(signal, priority, quality_score)
         row = {
             "time": dt.datetime.now(dt.UTC).isoformat(),
             "symbol": signal.symbol,
@@ -1460,6 +1464,10 @@ class DerivativesMonitor:
             "trap_risk_score": trap_score,
             "trap_risk_label": trap_label,
             "trap_risk_reason": trap_reason,
+            "signal_priority": priority,
+            "signal_quality_score": quality_score,
+            "signal_quality_reason": quality_reason,
+            "suppressed_from_telegram": int(suppressed_from_telegram),
         }
         path = Path(self.signal_log_path)
         fieldnames, write_header = ensure_csv_schema(path, SIGNAL_LOG_FIELDS)
@@ -1515,8 +1523,21 @@ class DerivativesMonitor:
             self.post_json(webhook_url, payload)
         bot_token, chat_ids = resolve_telegram_credentials(telegram)
         if bot_token and chat_ids:
+            priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
+            suppressed, suppressed_reason = self.telegram_signal_suppression(signal, priority, quality_score)
+            if suppressed:
+                logging.info(
+                    "Telegram signal suppressed: %s %s priority=%s quality=%s reason=%s",
+                    signal.symbol,
+                    signal.kind,
+                    priority,
+                    quality_score,
+                    suppressed_reason or quality_reason,
+                )
+                return
             for chat_id in split_chat_ids(chat_ids):
-                self.send_telegram(bot_token, chat_id, signal)
+                self.send_telegram(bot_token, chat_id, signal, priority, quality_score, quality_reason)
+            self.telegram_signal_cooldowns[self.telegram_signal_key(signal)] = (time.time(), quality_score)
 
     def get(self, path: str, params: dict[str, Any]) -> Any:
         response = self.session.get(f"{BINANCE_FAPI_BASE}{path}", params=params, timeout=10)
@@ -1537,10 +1558,42 @@ class DerivativesMonitor:
         except Exception:
             logging.warning("Failed to send notification", exc_info=True)
 
-    def send_telegram(self, bot_token: str, chat_id: str, signal: Signal) -> None:
+    def telegram_signal_key(self, signal: Signal) -> str:
+        return f"{signal.symbol}/{signal.kind}"
+
+    def telegram_signal_suppression(self, signal: Signal, priority: str, quality_score: int) -> tuple[bool, str]:
+        if priority not in ("S", "A", "B"):
+            return True, f"priority {priority} below realtime Telegram threshold"
+
+        key = self.telegram_signal_key(signal)
+        last = self.telegram_signal_cooldowns.get(key)
+        if last:
+            last_pushed_at, last_quality_score = last
+            age = time.time() - last_pushed_at
+            if age < 1800 and quality_score < 75:
+                return True, (
+                    f"duplicate {key} within 30m quality={quality_score}<75 "
+                    f"last_quality={last_quality_score}"
+                )
+        return False, ""
+
+    def send_telegram(
+        self,
+        bot_token: str,
+        chat_id: str,
+        signal: Signal,
+        priority: str | None = None,
+        quality_score: int | None = None,
+        quality_reason: str | None = None,
+    ) -> None:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         liquidation_text = self.format_liquidation_stats(signal.symbol)
-        payload = {"chat_id": chat_id, "text": format_signal_for_telegram(signal, liquidation_text)}
+        if priority is None or quality_score is None or quality_reason is None:
+            priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
+        payload = {
+            "chat_id": chat_id,
+            "text": format_signal_for_telegram(signal, liquidation_text, priority, quality_score, quality_reason),
+        }
         self.post_json(url, payload)
 
     def notify_status(self, title: str, message: str) -> None:
@@ -3880,7 +3933,135 @@ def ai_signal_review(signal: Signal) -> str:
     return f"{decision}。依据: {detail or '暂无明显共振'}。"
 
 
-def format_signal_for_telegram(signal: Signal, liquidation_text: str | None = None) -> str:
+def signal_priority(signal: Signal, snapshot: MarketSnapshot | None) -> tuple[str, int, str]:
+    if snapshot is None:
+        score = 50 + (15 if signal.score >= 7 else 8 if signal.score >= 5 else 0)
+        priority = priority_from_quality_score(score)
+        return priority, score, "no snapshot; base quality only"
+
+    quality_score = 50
+    reasons: list[str] = ["base 50"]
+
+    def add(points: int, reason: str) -> None:
+        nonlocal quality_score
+        quality_score += points
+        reasons.append(f"{points:+d} {reason}")
+
+    strength = signal_strength_score(signal)
+    flow_score = flow_alignment_score(snapshot)
+    long_flow_score = long_flow_alignment_score(snapshot)
+    short_score = short_term_score(snapshot)
+    mid_score = mid_term_score(snapshot)
+    main_score = main_asset_score(snapshot)
+    main_total = main_score.total_score if main_score else None
+    trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+    spot_text = cached_spot_alpha_confirmation(snapshot.symbol)
+
+    if signal.score >= 7:
+        add(15, "signal.score>=7")
+    elif signal.score >= 5:
+        add(8, "signal.score>=5")
+
+    if strength >= 30:
+        add(10, "strength>=30")
+    elif strength >= 20:
+        add(5, "strength>=20")
+
+    if flow_score >= 7:
+        add(10, "flow_alignment>=7")
+    if long_flow_score >= 6:
+        add(10, "long_flow_alignment>=6")
+    if short_score >= 7:
+        add(8, "short_term>=7")
+    if mid_score >= 7:
+        add(8, "mid_term>=7")
+    if main_total is not None and main_total >= 60:
+        add(10, "main_asset_score>=60")
+    if trap_score <= 2:
+        add(8, "trap_risk<=2")
+    if "偏强" in spot_text and "偏弱" not in spot_text:
+        add(5, "spot/onchain strong")
+
+    if trap_score >= 8:
+        add(-30, "trap_risk>=8")
+    elif trap_score >= 6:
+        add(-20, "trap_risk>=6")
+    if long_flow_score <= 3:
+        add(-12, "long_flow_alignment<=3")
+    if flow_score <= 3:
+        add(-10, "flow_alignment<=3")
+    if short_score <= 3:
+        add(-8, "short_term<=3")
+    if mid_score <= 3:
+        add(-8, "mid_term<=3")
+    if spot_confirmation_is_weak(spot_text):
+        add(-8, "spot/onchain weak")
+    if signal.kind in ("hot_breakout", "discovery") and long_flow_score <= 3:
+        add(-15, "breakout without long-flow support")
+    if signal.kind == "bottom_reversal" and ((snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio < 1) or summary_flow_value(snapshot, "1h") < 0):
+        add(-12, "bottom_reversal weak taker or 1h flow")
+    if signal.kind in ("top_risk", "top_exhaustion") and snapshot.price_position_24h is not None and snapshot.price_position_24h < 40:
+        add(-10, "top signal below 40% 24h position")
+    if "双向强平" in signal.message or "剧烈洗盘" in signal.message or "双向高波动" in liquidation_risk_label(snapshot):
+        add(-10, "two-way liquidation/wash risk")
+
+    quality_score = max(0, min(100, int(round(quality_score))))
+    priority = priority_from_quality_score(quality_score)
+    capped_priority = capped_signal_priority(priority, signal, snapshot, quality_score, trap_score, flow_score, long_flow_score)
+    if capped_priority != priority:
+        reasons.append(f"cap {priority}->{capped_priority}")
+        priority = capped_priority
+
+    return priority, quality_score, "; ".join(reasons)
+
+
+def priority_from_quality_score(score: int) -> str:
+    if score >= 85:
+        return "S"
+    if score >= 70:
+        return "A"
+    if score >= 55:
+        return "B"
+    if score >= 40:
+        return "C"
+    return "D"
+
+
+def capped_signal_priority(
+    priority: str,
+    signal: Signal,
+    snapshot: MarketSnapshot,
+    quality_score: int,
+    trap_score: int,
+    flow_score: int,
+    long_flow_score: int,
+) -> str:
+    order = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+    reverse = {value: key for key, value in order.items()}
+    max_priority = priority
+
+    if trap_score >= 8 and not is_major_asset_tier(snapshot.symbol):
+        max_priority = min_priority_cap(max_priority, "B", order, reverse)
+    trade_plan = signal_trade_plan(signal)
+    if signal.kind in ("discovery", "hot_breakout") and ("暂无交易计划" in trade_plan or "入场区" not in trade_plan):
+        max_priority = min_priority_cap(max_priority, "B", order, reverse)
+    if long_flow_score <= 3 and flow_score <= 3 and signal.score < 8:
+        max_priority = min_priority_cap(max_priority, "C", order, reverse)
+
+    return max_priority
+
+
+def min_priority_cap(priority: str, cap: str, order: dict[str, int], reverse: dict[int, str]) -> str:
+    return reverse[min(order.get(priority, 0), order.get(cap, 0))]
+
+
+def format_signal_for_telegram(
+    signal: Signal,
+    liquidation_text: str | None = None,
+    priority: str | None = None,
+    quality_score: int | None = None,
+    quality_reason: str | None = None,
+) -> str:
     labels = {
         "discovery": ("🟢 [看多]", "发现启动信号"),
         "distribution": ("🟡 [减仓]", "疑似派发"),
@@ -3893,8 +4074,14 @@ def format_signal_for_telegram(signal: Signal, liquidation_text: str | None = No
     prefix, label = labels.get(signal.kind, ("⚪ [信号]", signal.kind))
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    if priority is None or quality_score is None or quality_reason is None:
+        priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
+
     if signal.snapshot is None:
-        return f"{prefix} {label}\n\n{signal.title}\n{signal.message}\n\n时间: {now}"
+        return (
+            f"{prefix} {label}\n\n{signal.title}\n{signal.message}\n"
+            f"信号等级: {priority} 质量分 {quality_score} - {quality_reason}\n\n时间: {now}"
+        )
 
     snapshot = signal.snapshot
     reason = {
@@ -3916,6 +4103,7 @@ def format_signal_for_telegram(signal: Signal, liquidation_text: str | None = No
         f"方向: {prefix} | 等级: {strength} | {strength_badge}\n\n"
         f"级别: {signal.score}/{max_score}\n"
         f"强度分: {strength_score:.2f} ({strength_grade(strength_score)})\n"
+        f"信号等级: {priority} 质量分 {quality_score} - {quality_reason}\n"
         f"价格: {snapshot.close_price:.8g}\n"
         f"价格变化: {snapshot.price_change_percent:+.2f}%\n"
         f"OI变化: {snapshot.oi_change_percent:+.2f}%\n"

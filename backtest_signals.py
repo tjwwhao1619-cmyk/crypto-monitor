@@ -29,6 +29,7 @@ TRAP_RISK_GROUPS = (
     ("6-7", "高", 6, 7),
     ("8-10", "极高", 8, 10),
 )
+SIGNAL_PRIORITY_GROUPS = ("S", "A", "B", "C", "D")
 
 
 def parse_time(value):
@@ -102,6 +103,9 @@ def eval_signal(session, row):
     out["long_flow_alignment_score"] = parse_int(row.get("long_flow_alignment_score"))
     out["main_asset_score"] = parse_int(row.get("main_asset_score"))
     out["trap_risk_score"] = parse_int(row.get("trap_risk_score"))
+    out["signal_priority"] = (row.get("signal_priority") or "").strip().upper() or None
+    out["signal_quality_score"] = parse_int(row.get("signal_quality_score"))
+    out["suppressed_from_telegram"] = parse_bool_int(row.get("suppressed_from_telegram"))
     for name in ("12h", "24h"):
         out[f"flow_{name}"] = parse_float(row.get(f"net_flow_{name}_usd"))
         out[f"flow_{name}_ratio"] = parse_float(row.get(f"net_flow_{name}_ratio"))
@@ -145,6 +149,17 @@ def parse_int(value):
         return None
 
 
+def parse_bool_int(value):
+    if value in (None, ""):
+        return None
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes"):
+        return 1
+    if text in ("0", "false", "no"):
+        return 0
+    return None
+
+
 def fmt_usd(v):
     if v is None:
         return "-"
@@ -169,6 +184,13 @@ def flow_detail(x):
     main_score = x.get("main_asset_score")
     if main_score is not None:
         parts.append(f"mainScore={main_score}/100")
+    priority = x.get("signal_priority")
+    quality = x.get("signal_quality_score")
+    suppressed = x.get("suppressed_from_telegram")
+    if priority and quality is not None:
+        parts.append(f"q={priority}/{quality}")
+    if suppressed is not None:
+        parts.append(f"suppressed={suppressed}")
     trap_score = x.get("trap_risk_score")
     if trap_score is not None:
         parts.append(f"trap={trap_score}/10")
@@ -240,6 +262,28 @@ def print_long_flow_backtest(results):
                 )
             print(" ".join(parts))
         print("")
+
+
+def print_signal_quality_backtest(results):
+    if not any(x.get("signal_priority") for x in results):
+        return
+
+    print("[SIGNAL QUALITY] 信号质量分组回测")
+    for priority in SIGNAL_PRIORITY_GROUPS:
+        group_rows = [x for x in results if x.get("signal_priority") == priority]
+        print(f"{priority}: 样本={len(group_rows)}")
+        for h in ["15m", "1h", "4h", "12h", "24h"]:
+            vals = [x[h] for x in group_rows if x[h] is not None]
+            if not vals:
+                print(f"  {h}: 样本=0")
+                continue
+            wins = sum(v > 0 for v in vals)
+            print(
+                f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))} "
+                f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
+            )
+    print("")
 
 
 def print_main_asset_score_backtest(results):
@@ -347,6 +391,7 @@ def main():
             )
         print("")
 
+    print_signal_quality_backtest(results)
     print_long_flow_backtest(results)
     print_main_asset_score_backtest(results)
     print_trap_risk_backtest(results)
