@@ -29,6 +29,34 @@ PAIR = "BTCUSDT"
 INTERVAL = "1h"
 LIMIT = "5"
 RANGE = "24h"
+LONG_RANGE_VALUES = ("24h", "3d", "7d", "30d")
+LONG_RANGE_ENDPOINTS = (
+    (
+        "range probe taker buy/sell exchange list",
+        "/api/futures/taker-buy-sell-volume/exchange-list",
+        {"symbol": COIN},
+    ),
+    (
+        "range probe exchange balance list",
+        "/api/exchange/balance/list",
+        {"symbol": COIN},
+    ),
+    (
+        "range probe exchange balance chart",
+        "/api/exchange/balance/chart",
+        {"symbol": COIN},
+    ),
+    (
+        "range probe open interest exchange list",
+        "/api/futures/open-interest/exchange-list",
+        {"symbol": COIN},
+    ),
+    (
+        "range probe accumulated funding exchange list",
+        "/api/futures/funding-rate/accumulated-exchange-list",
+        {"symbol": COIN},
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -178,7 +206,7 @@ def coin_history_params(**extra: Any) -> dict[str, Any]:
 def build_probes() -> list[Probe]:
     time_window = last_24h_window_ms()
 
-    return [
+    probes = [
         # Existing Startup-usable probes to keep tracking.
         Probe(
             name="liquidation history",
@@ -351,6 +379,24 @@ def build_probes() -> list[Probe]:
             },
         ),
     ]
+    probes.extend(build_long_range_probes())
+    return probes
+
+
+def build_long_range_probes() -> list[Probe]:
+    probes: list[Probe] = []
+    for name, endpoint, base_params in LONG_RANGE_ENDPOINTS:
+        for range_value in LONG_RANGE_VALUES:
+            params = dict(base_params)
+            params["range"] = range_value
+            probes.append(
+                Probe(
+                    name=f"{name} range={range_value}",
+                    endpoint=endpoint,
+                    params=params,
+                )
+            )
+    return probes
 
 
 def print_summary(results: list[ProbeResult]) -> None:

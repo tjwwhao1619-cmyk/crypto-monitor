@@ -33,12 +33,16 @@ BINANCE_FORCE_ORDER_WS_HOST = "fstream.binance.com"
 BINANCE_FORCE_ORDER_WS_PATH = "/ws/!forceOrder@arr"
 COINGLASS_LIQUIDATION_HISTORY_URL = "https://open-api-v4.coinglass.com/api/futures/liquidation/history"
 COINGLASS_LIQUIDATION_AGGREGATED_HISTORY_URL = "https://open-api-v4.coinglass.com/api/futures/liquidation/aggregated-history"
+COINGLASS_SPOT_ORDERBOOK_ASK_BIDS_HISTORY_ENDPOINT = "/api/spot/orderbook/ask-bids-history"
 COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS = 300
 COINGLASS_BASE_URL = "https://open-api-v4.coinglass.com"
 COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS = 300
 TELEGRAM_SNAPSHOT_CACHE_TTL_SECONDS = 600
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 FLOW_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h"]
+COINGLASS_TAKER_LONG_RANGES = ("24h", "7d")
+COINGLASS_BALANCE_LONG_RANGES = ("24h", "7d", "30d")
+COINGLASS_FUNDING_ACCUMULATED_RANGES = ("24h", "7d")
 
 
 @dataclass(frozen=True)
@@ -450,8 +454,172 @@ class DerivativesMonitor:
                 "sell_vol_usd": parse_float(taker_row.get("sell_vol_usd")),
             }
 
-        useful_keys = {"open_interest", "funding_oi_weight", "funding_distribution", "taker_flow"}
+        if market_tier(symbol) in ("core", "large"):
+            orderbook_context = self.fetch_coinglass_orderbook_context(symbol, headers)
+            if orderbook_context:
+                context["orderbook"] = orderbook_context
+
+            long_context = self.fetch_coinglass_major_long_context(base_symbol, headers)
+            if long_context:
+                context["major_long"] = long_context
+
+        useful_keys = {"open_interest", "funding_oi_weight", "funding_distribution", "taker_flow", "major_long", "orderbook"}
         return context if useful_keys.intersection(context) else None
+
+    def fetch_coinglass_orderbook_context(self, symbol: str, headers: dict[str, str]) -> dict[str, float | None] | None:
+        end_time = int(time.time() * 1000)
+        start_time = end_time - 8 * 60 * 60 * 1000
+        data = self.fetch_coinglass_json(
+            COINGLASS_SPOT_ORDERBOOK_ASK_BIDS_HISTORY_ENDPOINT,
+            {
+                "exchange": "Binance",
+                "symbol": symbol,
+                "interval": "1h",
+                "limit": 8,
+                "range": 1,
+                "start_time": start_time,
+                "end_time": end_time,
+            },
+            headers,
+        )
+        return coinglass_orderbook_context_from_rows(coinglass_rows(data))
+
+    def fetch_coinglass_major_long_context(self, base_symbol: str, headers: dict[str, str]) -> dict[str, Any]:
+        long_context: dict[str, Any] = {}
+
+        taker_ranges: dict[str, dict[str, float | None]] = {}
+        for range_value in COINGLASS_TAKER_LONG_RANGES:
+            taker_data = self.fetch_coinglass_json(
+                "/api/futures/taker-buy-sell-volume/exchange-list",
+                {"symbol": base_symbol, "range": range_value},
+                headers,
+            )
+            taker_row = coinglass_find_exchange_row(taker_data, "All") or coinglass_first_metric_row(
+                taker_data,
+                ["buy_ratio", "sell_ratio", "buy_vol_usd", "sell_vol_usd"],
+            )
+            if taker_row:
+                taker_ranges[range_value] = {
+                    "buy_ratio": parse_float(taker_row.get("buy_ratio")),
+                    "sell_ratio": parse_float(taker_row.get("sell_ratio")),
+                    "buy_vol_usd": parse_float(taker_row.get("buy_vol_usd")),
+                    "sell_vol_usd": parse_float(taker_row.get("sell_vol_usd")),
+                }
+        if taker_ranges:
+            long_context["taker_ranges"] = taker_ranges
+
+        balance_ranges = self.fetch_coinglass_balance_ranges(base_symbol, headers)
+        if not balance_ranges:
+            balance_ranges = {}
+            for range_value in COINGLASS_BALANCE_LONG_RANGES:
+                balance = self.fetch_coinglass_balance_range(base_symbol, range_value, headers)
+                if balance:
+                    balance_ranges[range_value] = balance
+        if balance_ranges:
+            long_context["balance_ranges"] = balance_ranges
+
+        funding_ranges: dict[str, dict[str, float | None]] = {}
+        for range_value in COINGLASS_FUNDING_ACCUMULATED_RANGES:
+            funding_data = self.fetch_coinglass_json(
+                "/api/futures/funding-rate/accumulated-exchange-list",
+                {"symbol": base_symbol, "range": range_value},
+                headers,
+            )
+            funding_row = coinglass_find_exchange_row(funding_data, "All") or coinglass_first_metric_row(
+                funding_data,
+                ["funding_rate", "funding_rate_percent", "accumulated_funding_rate", "accumulated_funding_rate_percent"],
+            )
+            if funding_row:
+                funding_ranges[range_value] = {
+                    "rate": coinglass_first_float(
+                        funding_row,
+                        [
+                            "accumulated_funding_rate",
+                            "accumulated_funding_rate_percent",
+                            "funding_rate",
+                            "funding_rate_percent",
+                            "rate",
+                        ],
+                    )
+                }
+        if funding_ranges:
+            long_context["funding_accumulated_ranges"] = funding_ranges
+
+        return long_context
+
+    def fetch_coinglass_balance_ranges(
+        self,
+        base_symbol: str,
+        headers: dict[str, str],
+    ) -> dict[str, dict[str, float | str | None]]:
+        list_data = self.fetch_coinglass_json(
+            "/api/exchange/balance/list",
+            {"symbol": base_symbol},
+            headers,
+        )
+        all_row = coinglass_find_exchange_row(list_data, "All")
+        if all_row:
+            ranges = coinglass_balance_ranges_from_row(all_row, source=None)
+            if ranges:
+                return ranges
+
+        summed_ranges = coinglass_summed_balance_ranges(list_data, base_symbol)
+        if summed_ranges:
+            return summed_ranges
+
+        binance_row = coinglass_find_exchange_row(list_data, "Binance")
+        if binance_row:
+            return coinglass_balance_ranges_from_row(binance_row, source="Binance")
+
+        return {}
+
+    def fetch_coinglass_balance_range(
+        self,
+        base_symbol: str,
+        range_value: str,
+        headers: dict[str, str],
+    ) -> dict[str, float | None] | None:
+        list_data = self.fetch_coinglass_json(
+            "/api/exchange/balance/list",
+            {"symbol": base_symbol, "range": range_value},
+            headers,
+        )
+        row = coinglass_find_exchange_row(list_data, "All") or coinglass_find_exchange_row(list_data, "Binance")
+        if row is None:
+            row = coinglass_first_metric_row(
+                list_data,
+                ["balance", "balance_usd", "change_percent", "balance_change_percent"],
+            )
+        if row:
+            return {
+                "balance": coinglass_first_float(row, ["balance", "amount", "value", "total_balance"]),
+                "balance_usd": coinglass_first_float(row, ["balance_usd", "usd", "value_usd", "total_balance_usd"]),
+                "change_percent": coinglass_first_float(
+                    row,
+                    ["change_percent", "balance_change_percent", "change_percentage", "netflow_percent"],
+                ),
+                "change": coinglass_first_float(row, ["change", "balance_change", "netflow", "net_flow"]),
+            }
+
+        chart_data = self.fetch_coinglass_json(
+            "/api/exchange/balance/chart",
+            {"symbol": base_symbol, "range": range_value},
+            headers,
+        )
+        chart_rows = coinglass_rows(chart_data)
+        values = [
+            value
+            for value in (coinglass_first_float(item, ["balance", "amount", "value", "total_balance"]) for item in chart_rows)
+            if value is not None
+        ]
+        if len(values) < 2:
+            return None
+        return {
+            "balance": values[-1],
+            "balance_usd": None,
+            "change_percent": percent_change(values[0], values[-1]) if values[0] else None,
+            "change": values[-1] - values[0],
+        }
 
     def fetch_coinglass_json(self, endpoint: str, params: dict[str, Any], headers: dict[str, str]) -> Any:
         try:
@@ -477,6 +645,8 @@ class DerivativesMonitor:
         context = self.fetch_coinglass_market_context(symbol)
         if not context:
             text = "CoinGlass聚合: n/a"
+            if is_major_asset_tier(symbol):
+                text = f"{text}\nCoinGlass订单簿: n/a"
         else:
             text = format_coinglass_market_context_text(context)
         self.coinglass_market_context_cache[cache_key] = (now, text)
@@ -2186,6 +2356,10 @@ def market_tier(symbol: str) -> str:
     return "normal"
 
 
+def is_major_asset_tier(symbol: str) -> bool:
+    return market_tier(symbol) in ("core", "large")
+
+
 def tier_threshold(symbol: str, rule: dict[str, Any], name: str, default: float) -> float:
     tier = market_tier(symbol)
     key = f"{tier}_{name}"
@@ -2462,6 +2636,100 @@ def coinglass_first_metric_row(data: Any, keys: list[str]) -> dict[str, Any] | N
     return None
 
 
+def coinglass_first_float(row: dict[str, Any], keys: list[str]) -> float | None:
+    for key in keys:
+        value = parse_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def coinglass_balance_ranges_from_row(
+    row: dict[str, Any],
+    source: str | None,
+) -> dict[str, dict[str, float | str | None]]:
+    ranges: dict[str, dict[str, float | str | None]] = {}
+    for range_value, suffixes in {
+        "24h": ("1d", "24h"),
+        "7d": ("7d",),
+        "30d": ("30d",),
+    }.items():
+        change = coinglass_first_float(row, coinglass_balance_change_keys(suffixes))
+        change_percent = coinglass_first_float(row, coinglass_balance_change_percent_keys(suffixes))
+        if change is None and change_percent is None:
+            continue
+        ranges[range_value] = {
+            "balance": coinglass_first_float(row, ["balance", "amount", "value", "total_balance"]),
+            "balance_usd": coinglass_first_float(row, ["balance_usd", "usd", "value_usd", "total_balance_usd"]),
+            "change_percent": change_percent,
+            "change": change,
+            "source": source,
+        }
+    return ranges
+
+
+def coinglass_summed_balance_ranges(data: Any, base_symbol: str) -> dict[str, dict[str, float | str | None]]:
+    rows = [
+        row
+        for row in coinglass_rows(data)
+        if not coinglass_node_symbol_mismatches(row, base_symbol)
+        and coinglass_row_exchange_name(row).lower() != "all"
+    ]
+    ranges: dict[str, dict[str, float | str | None]] = {}
+    for range_value, suffixes in {
+        "24h": ("1d", "24h"),
+        "7d": ("7d",),
+        "30d": ("30d",),
+    }.items():
+        total = 0.0
+        found = False
+        for row in rows:
+            change = coinglass_first_float(row, coinglass_balance_change_keys(suffixes))
+            if change is None:
+                continue
+            total += change
+            found = True
+        if found:
+            ranges[range_value] = {
+                "balance": None,
+                "balance_usd": None,
+                "change_percent": None,
+                "change": total,
+                "source": None,
+            }
+    return ranges
+
+
+def coinglass_balance_change_keys(suffixes: tuple[str, ...]) -> list[str]:
+    keys: list[str] = []
+    for suffix in suffixes:
+        keys.extend(
+            [
+                f"balance_change_{suffix}",
+                f"change_{suffix}",
+                f"netflow_{suffix}",
+                f"net_flow_{suffix}",
+            ]
+        )
+    return keys
+
+
+def coinglass_balance_change_percent_keys(suffixes: tuple[str, ...]) -> list[str]:
+    keys: list[str] = []
+    for suffix in suffixes:
+        keys.extend(
+            [
+                f"balance_change_percent_{suffix}",
+                f"balance_change_percentage_{suffix}",
+                f"change_percent_{suffix}",
+                f"change_percentage_{suffix}",
+                f"netflow_percent_{suffix}",
+                f"net_flow_percent_{suffix}",
+            ]
+        )
+    return keys
+
+
 def coinglass_stablecoin_margin_rows(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, dict):
         stablecoin_rows = data.get("stablecoin_margin_list")
@@ -2641,14 +2909,220 @@ def format_coinglass_market_context_text(context: dict[str, Any]) -> str:
         if has_distribution
         else "Funding交易所分布 n/a"
     )
-    return (
+    text = (
         "CoinGlass聚合: "
         f"OI 1h {format_percent_optional(oi_1h)} / 4h {format_percent_optional(oi_4h)} / 24h {format_percent_optional(oi_24h)}；"
         f"Funding OI加权 {format_percent_optional(funding_oi_weight)}{exchange_text}，"
         f"{funding_distribution_text}；"
         f"主动买卖 24h 买{format_ratio_percent(buy_ratio)} / 卖{format_ratio_percent(sell_ratio)}"
+        f"{format_coinglass_major_long_suffix(context.get('major_long'))}"
         f"；判断: {judgement}"
     )
+    if is_major_asset_tier(str(context.get("symbol") or "")):
+        text = f"{text}\n{format_coinglass_orderbook_context_text(context.get('orderbook'))}"
+    return text
+
+
+def coinglass_orderbook_context_from_rows(rows: list[dict[str, Any]]) -> dict[str, float | None] | None:
+    usable_rows = []
+    for row in rows:
+        bids_usd = parse_float(row.get("bids_usd"))
+        asks_usd = parse_float(row.get("asks_usd"))
+        if bids_usd is None and asks_usd is None:
+            continue
+        usable_rows.append(
+            {
+                "time": parse_float(row.get("time")),
+                "bids_usd": bids_usd,
+                "asks_usd": asks_usd,
+                "bids_quantity": parse_float(row.get("bids_quantity")),
+                "asks_quantity": parse_float(row.get("asks_quantity")),
+            }
+        )
+
+    if not usable_rows:
+        return None
+
+    if all(row.get("time") is not None for row in usable_rows):
+        usable_rows.sort(key=lambda row: float(row.get("time") or 0))
+
+    recent = usable_rows[-1]
+    recent_bids = recent.get("bids_usd")
+    recent_asks = recent.get("asks_usd")
+    last_4h = usable_rows[-4:]
+    avg_bids_4h = average_optional([row.get("bids_usd") for row in last_4h])
+    avg_asks_4h = average_optional([row.get("asks_usd") for row in last_4h])
+    ratio = recent_bids / recent_asks if recent_bids is not None and recent_asks and recent_asks > 0 else None
+
+    return {
+        "bids_usd_1h": recent_bids,
+        "asks_usd_1h": recent_asks,
+        "bids_usd_avg_4h": avg_bids_4h,
+        "asks_usd_avg_4h": avg_asks_4h,
+        "bid_ask_ratio": ratio,
+    }
+
+
+def average_optional(values: list[float | None]) -> float | None:
+    numeric_values = [value for value in values if value is not None]
+    if not numeric_values:
+        return None
+    return sum(numeric_values) / len(numeric_values)
+
+
+def format_coinglass_orderbook_context_text(orderbook: Any) -> str:
+    if not isinstance(orderbook, dict):
+        return "CoinGlass订单簿: n/a"
+    return (
+        "CoinGlass订单簿: "
+        f"近1h 买盘{format_usd(orderbook.get('bids_usd_1h'))} / 卖盘{format_usd(orderbook.get('asks_usd_1h'))}；"
+        f"4h均值 买盘{format_usd(orderbook.get('bids_usd_avg_4h'))} / 卖盘{format_usd(orderbook.get('asks_usd_avg_4h'))}；"
+        f"判断: {coinglass_orderbook_judgement(orderbook.get('bid_ask_ratio'))}"
+    )
+
+
+def coinglass_orderbook_judgement(ratio: Any) -> str:
+    if ratio is None:
+        return "n/a"
+    try:
+        value = float(ratio)
+    except (TypeError, ValueError):
+        return "n/a"
+    if value >= 1.25:
+        return "下方承接偏强"
+    if value <= 0.8:
+        return "上方卖压偏强"
+    return "买卖盘相对均衡"
+
+
+def format_coinglass_major_long_suffix(major_long: Any) -> str:
+    if not isinstance(major_long, dict):
+        return ""
+    taker_ranges = major_long.get("taker_ranges") if isinstance(major_long.get("taker_ranges"), dict) else {}
+    balance_ranges = major_long.get("balance_ranges") if isinstance(major_long.get("balance_ranges"), dict) else {}
+    funding_ranges = (
+        major_long.get("funding_accumulated_ranges")
+        if isinstance(major_long.get("funding_accumulated_ranges"), dict)
+        else {}
+    )
+    balance_label = "交易所余额"
+    balance_source = coinglass_balance_ranges_source(balance_ranges)
+    if balance_source:
+        balance_label = f"{balance_label}({balance_source})"
+    return (
+        f"；CoinGlass主动买卖 7d {format_taker_range(taker_ranges.get('7d'))}"
+        f"；{balance_label}: 1d {format_balance_range(balance_ranges.get('24h'))} / "
+        f"7d {format_balance_range(balance_ranges.get('7d'))} / "
+        f"30d {format_balance_range(balance_ranges.get('30d'))}"
+        f"；Funding累计: 1d {format_funding_accumulated_range(funding_ranges.get('24h'))} / "
+        f"7d {format_funding_accumulated_range(funding_ranges.get('7d'))}"
+    )
+
+
+def format_major_long_cycle_context(snapshot: MarketSnapshot, coinglass_text: str | None = None) -> str:
+    if not is_major_asset_tier(snapshot.symbol):
+        return ""
+    oi_text = extract_labeled_segment(coinglass_text, "OI ", "；") or "OI n/a"
+    taker_24h = extract_labeled_segment(coinglass_text, "主动买卖 24h", "；")
+    taker_7d = extract_labeled_segment(coinglass_text, "CoinGlass主动买卖 7d", "；")
+    taker_text = " / ".join(part for part in (taker_24h, taker_7d) if part) or "n/a"
+    balance_text = extract_labeled_segment(coinglass_text, "交易所余额", "；") or "交易所余额 n/a"
+    funding_text = extract_labeled_segment(coinglass_text, "Funding累计", "；") or "Funding累计 n/a"
+    return (
+        "主流币长周期确认:\n"
+        f"- 合约资金: 1h {format_usd(snapshot.net_flow_usd.get('1h'))} / "
+        f"4h {format_usd(snapshot.net_flow_usd.get('4h'))} / "
+        f"12h {format_usd(snapshot.net_flow_usd.get('12h'))} / "
+        f"24h {format_usd(snapshot.net_flow_usd.get('24h'))}\n"
+        f"- 长周期资金共振: {long_flow_alignment_score(snapshot)}/9\n"
+        f"- CoinGlass OI: {oi_text}\n"
+        f"- CoinGlass主动买卖: {taker_text}\n"
+        f"- {balance_text}\n"
+        f"- {funding_text}"
+    )
+
+
+def format_major_long_cycle_one_line(snapshot: MarketSnapshot, coinglass_text: str | None = None) -> str:
+    if not is_major_asset_tier(snapshot.symbol):
+        return ""
+    oi_text = extract_labeled_segment(coinglass_text, "OI ", "；") or "OI n/a"
+    taker_text = extract_labeled_segment(coinglass_text, "主动买卖 24h", "；")
+    taker_7d = extract_labeled_segment(coinglass_text, "CoinGlass主动买卖 7d", "；")
+    balance_text = extract_labeled_segment(coinglass_text, "交易所余额", "；") or "余额 n/a"
+    funding_text = extract_labeled_segment(coinglass_text, "Funding累计", "；") or "Funding n/a"
+    funds_text = (
+        f"资金 1h {format_usd(snapshot.net_flow_usd.get('1h'))}/"
+        f"4h {format_usd(snapshot.net_flow_usd.get('4h'))}/"
+        f"12h {format_usd(snapshot.net_flow_usd.get('12h'))}/"
+        f"24h {format_usd(snapshot.net_flow_usd.get('24h'))}; "
+        f"共振 {long_flow_alignment_score(snapshot)}/9"
+    )
+    taker_parts = [part for part in (taker_text, taker_7d) if part]
+    taker_summary = "主动买卖 " + " / ".join(taker_parts) if taker_parts else "主动买卖 n/a"
+    return f"主流长周期: {oi_text}; {funds_text}; {taker_summary}; {balance_text}; {funding_text}"
+
+
+def extract_labeled_segment(text: str | None, start: str, end: str) -> str | None:
+    if not text:
+        return None
+    index = text.find(start)
+    if index < 0:
+        return None
+    segment = text[index:]
+    end_index = segment.find(end)
+    if end_index >= 0:
+        segment = segment[:end_index]
+    return segment.strip()
+
+
+def format_taker_range(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "n/a"
+    return f"买{format_ratio_percent(value.get('buy_ratio'))} / 卖{format_ratio_percent(value.get('sell_ratio'))}"
+
+
+def format_balance_range(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "n/a"
+    change_percent = value.get("change_percent")
+    change = value.get("change")
+    if change_percent is not None:
+        return format_percent_optional(change_percent)
+    if change is not None:
+        return format_token_amount(change)
+    return "n/a"
+
+
+def format_funding_accumulated_range(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "n/a"
+    rate = value.get("rate")
+    if rate is None:
+        return "n/a"
+    return format_percent_optional(rate)
+
+
+def coinglass_balance_ranges_source(balance_ranges: dict[Any, Any]) -> str:
+    sources = {
+        str(value.get("source")).strip()
+        for value in balance_ranges.values()
+        if isinstance(value, dict) and value.get("source")
+    }
+    if len(sources) == 1:
+        return next(iter(sources))
+    return ""
+
+
+def format_token_amount(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    abs_value = abs(value)
+    sign = "+" if value >= 0 else "-"
+    if abs_value >= 1_000_000:
+        return f"{sign}{abs_value / 1_000_000:.2f}M"
+    if abs_value >= 1_000:
+        return f"{sign}{abs_value / 1_000:.1f}K"
+    return f"{sign}{abs_value:.4g}"
 
 
 def format_coinglass_exchange_funding(exchange_rates: Any) -> str:
@@ -4355,6 +4829,8 @@ def format_symbol_diagnosis(
     coinglass_text: str | None = None,
 ) -> str:
     signal_names = ", ".join(signal.kind for signal in signals) or "-"
+    major_long_text = format_major_long_cycle_context(snapshot, coinglass_text)
+    major_long_part = f"{major_long_text}\n" if major_long_text else ""
     return (
         f"{snapshot.symbol}\n"
         f"价格: {snapshot.close_price:.8g}\n"
@@ -4375,6 +4851,7 @@ def format_symbol_diagnosis(
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
         f"{liquidation_text or '真实强平: n/a'}\n"
+        f"{major_long_part}"
         f"{coinglass_text or 'CoinGlass聚合: n/a'}\n"
         f"判断: {diagnose_snapshot(snapshot, signals)}"
     )
@@ -4407,6 +4884,8 @@ def format_ask_context(
         f"{liquidation_text or '真实强平: n/a'}；"
         f"{coinglass_text or 'CoinGlass聚合: n/a'}"
     )
+    major_long_text = format_major_long_cycle_context(snapshot, coinglass_text)
+    major_long_part = f"{major_long_text}\n" if major_long_text else ""
 
     text = (
         f"[ASK] {snapshot.symbol} 结构化上下文\n"
@@ -4442,6 +4921,7 @@ def format_ask_context(
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
         f"{liquidation_text or '真实强平: n/a'}\n"
+        f"{major_long_part}"
         f"{coinglass_text or 'CoinGlass聚合: n/a'}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
@@ -4631,6 +5111,10 @@ def format_ask_core_data(
             f"{period} {format_usd(snapshot.net_flow_usd.get(period))}/r{format_optional_value(snapshot.net_flow_ratio.get(period))}"
         )
     liq_text = compact_liquidation_text(liquidation_text or "真实强平: n/a")
+    major_long_text = format_major_long_cycle_one_line(snapshot, coinglass_text)
+    major_long_part = f"{major_long_text}\n" if major_long_text else ""
+    orderbook_text = compact_coinglass_orderbook_context(snapshot, coinglass_text)
+    orderbook_part = f"订单簿: {orderbook_text}\n" if orderbook_text else ""
     return (
         "[核心数据]\n"
         f"价格/OI/Funding: {snapshot.close_price:.8g}; 价格 {snapshot.price_change_percent:+.2f}%; "
@@ -4642,6 +5126,8 @@ def format_ask_core_data(
         f"现货/链上: {spot_alpha_confirmation(snapshot.symbol)}\n"
         f"清算推断: {liquidation_risk_label(snapshot)}\n"
         f"真实强平: {liq_text}\n"
+        f"{major_long_part}"
+        f"{orderbook_part}"
         f"CoinGlass: {compact_coinglass_market_context(coinglass_text or 'CoinGlass聚合: n/a')}"
     )
 
@@ -4709,7 +5195,17 @@ def post_process_ask_ai_review(review_text: str, context_text: str) -> str:
 
 
 def compact_coinglass_market_context(text: str) -> str:
-    return text.removeprefix("CoinGlass聚合: ").strip()
+    first_line = str(text).splitlines()[0] if str(text).splitlines() else str(text)
+    return first_line.removeprefix("CoinGlass聚合: ").strip()
+
+
+def compact_coinglass_orderbook_context(snapshot: MarketSnapshot, coinglass_text: str | None) -> str:
+    if not is_major_asset_tier(snapshot.symbol):
+        return ""
+    orderbook_text = extract_labeled_segment(coinglass_text, "CoinGlass订单簿: ", "\n")
+    if not orderbook_text:
+        return "n/a"
+    return orderbook_text.removeprefix("CoinGlass订单簿: ").strip()
 
 
 def normalize_ai_review_text(text: str) -> str:
@@ -4855,6 +5351,9 @@ def print_symbol_diagnosis(
     print(f"结构判断: {market_structure_label(snapshot)}")
     print(f"清算风险: {liquidation_risk_label(snapshot)}")
     print(liquidation_text or "真实强平: n/a")
+    major_long_text = format_major_long_cycle_context(snapshot, coinglass_text)
+    if major_long_text:
+        print(major_long_text)
     print(coinglass_text or "CoinGlass聚合: n/a")
     print(f"判断: {diagnose_snapshot(snapshot, signals)}")
 
