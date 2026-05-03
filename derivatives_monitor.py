@@ -2741,22 +2741,22 @@ class DerivativesMonitor:
         scored_rows.sort(key=lambda item: item[0], reverse=True)
         lines = ["高质量信号TOP10"]
         for index, (quality_score, row) in enumerate(scored_rows[:10], start=1):
-            time_text = row.get("time", "-").replace("T", " ")[:19]
-            reason = compact_digest_reason(row.get("signal_quality_reason", "") or "-")
+            kind = row.get("kind", "-")
+            direction = signal_direction_label(kind)
+            priority = row.get("signal_priority") or "-"
+            trap_score = format_csv_compact_number(row.get("trap_risk_score"), signed=False)
+            price_change = format_csv_compact_number(row.get("price_change_percent"), signed=True)
+            oi_change = format_csv_compact_number(row.get("oi_change_percent"), signed=True)
+            strength = format_csv_compact_number(row.get("strength_score"), signed=False)
+            suppressed = format_suppressed_status(row.get("suppressed_from_telegram"))
+            reason = format_quality_reason_short(row.get("signal_quality_reason", "") or "")
             lines.append(
-                f"{index}. {row.get('symbol', '-')} {row.get('kind', '-')} "
-                f"q={row.get('signal_priority', '-')}/{quality_score:.0f} "
-                f"score={row.get('score', '-')} "
-                f"strength={format_csv_strength(row.get('strength_score'))} "
-                f"trap={row.get('trap_risk_score', '-')} "
-                f"main={row.get('main_asset_score', '-') or '-'} "
-                f"suppressed={row.get('suppressed_from_telegram', '-')}"
+                f"{index}. {row.get('symbol', '-')} {direction} {kind} "
+                f"{priority}/{quality_score:.0f} "
+                f"trap{trap_score} {price_change}% OI{oi_change}%"
             )
             lines.append(
-                f"   {time_text} "
-                f"{format_csv_number(row.get('price_change_percent'))}% "
-                f"{format_csv_number(row.get('oi_change_percent'))}% "
-                f"{reason}"
+                f"   强度{strength} | {suppressed} | {reason}"
             )
         self.send_telegram_text(bot_token, chat_id, "\n".join(lines))
 
@@ -3763,6 +3763,51 @@ def format_csv_number(value: str | None) -> str:
         return str(value)
 
 
+def format_csv_compact_number(value: Any, signed: bool = False) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        number = float(value)
+    except Exception:
+        return str(value)
+    text = f"{number:+.2f}" if signed else f"{number:.2f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def signal_direction_label(kind: str | None) -> str:
+    raw = str(kind or "").strip().lower()
+    normalized = raw.replace("_", " ").replace("-", " ")
+    bullish = {
+        "discovery",
+        "hot breakout",
+        "bottom reversal",
+        "early breakout",
+        "possible early breakout",
+    }
+    bearish = {
+        "top risk",
+        "top exhaustion",
+        "distribution",
+        "crowded top risk",
+    }
+    if raw in bullish or normalized in bullish:
+        return "看多"
+    if raw in bearish or normalized in bearish:
+        return "看空"
+    return "观察"
+
+
+def format_suppressed_status(value: Any) -> str:
+    text = "" if value is None else str(value).strip()
+    if text == "0":
+        return "已推送"
+    if text == "1":
+        return "已静默"
+    return "未知"
+
+
 def funding_note(value: float | None) -> str:
     if value is None:
         return "未知"
@@ -4447,6 +4492,53 @@ def min_priority_cap(priority: str, cap: str, order: dict[str, int], reverse: di
 def compact_digest_reason(text: str) -> str:
     compact = " ".join(str(text).split())
     return truncate_text(compact, 120)
+
+
+def format_quality_reason_short(reason: str, max_parts: int = 3) -> str:
+    reason_labels = [
+        ("trap_risk>=8", "极高诱捕", True),
+        ("trap_risk>=6", "高诱捕", True),
+        ("long_flow_alignment<=3", "长周期弱", True),
+        ("flow_alignment<=3", "资金弱", True),
+        ("short_term<=3", "短线弱", True),
+        ("mid_term<=3", "中线弱", True),
+        ("spot/onchain weak", "现货弱", True),
+        ("breakout without long-flow support", "突破缺长周期", True),
+        ("hot/discovery long_flow<=3", "突破缺长周期", True),
+        ("bottom_reversal weak taker or 1h flow", "抄底买盘弱", True),
+        ("bottom weak taker/flow", "抄底买盘弱", True),
+        ("top signal below 40% 24h position", "低位做空风险", True),
+        ("top signal below 40% position", "低位做空风险", True),
+        ("two-way liquidation/wash risk", "洗盘风险", True),
+        ("liquidation wash", "洗盘风险", True),
+        ("flow_alignment>=7", "资金强", False),
+        ("long_flow_alignment>=6", "长周期强", False),
+        ("short_term>=7", "短线强", False),
+        ("mid_term>=7", "中线强", False),
+        ("trap_risk<=2", "低诱捕", False),
+        ("strength>=30", "强度高", False),
+        ("strength>=20", "强度中", False),
+        ("signal.score>=7", "信号分高", False),
+        ("signal.score>=5", "信号分中", False),
+        ("main_asset_score>=60", "主流强", False),
+        ("spot/onchain strong", "现货确认", False),
+    ]
+
+    penalties: list[str] = []
+    positives: list[str] = []
+    seen: set[str] = set()
+    for part in str(reason or "").split(";"):
+        text = " ".join(part.strip().lower().split())
+        if not text or text == "base 50":
+            continue
+        for key, label, is_penalty in reason_labels:
+            if key in text and label not in seen:
+                (penalties if is_penalty else positives).append(label)
+                seen.add(label)
+                break
+
+    labels = (penalties + positives)[:max_parts]
+    return "/".join(labels) if labels else "简略通过"
 
 
 def format_telegram_signal_digest(
