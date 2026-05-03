@@ -37,6 +37,12 @@ SIGNAL_PRIORITY_GROUPS = ("S", "A", "B", "C", "D")
 SPOT_ONCHAIN_GROUPS = ("弱", "中性", "强")
 CONTRACT_SPOT_DIVERGENCE_GROUPS = ("无背离", "轻微背离", "明显背离", "严重背离")
 MAJOR_FLOW_GROUPS = ("主力偏空", "主力分歧", "主力偏多", "数据不足")
+CONVICTION_GROUPS = (
+    ("0-49", "低", 0, 49),
+    ("50-64", "中低", 50, 64),
+    ("65-79", "中高", 65, 79),
+    ("80-100", "高", 80, 100),
+)
 
 
 def parse_time(value):
@@ -121,9 +127,16 @@ def eval_signal(session, row):
     out["signal_priority"] = (row.get("signal_priority") or "").strip().upper() or None
     out["signal_quality_score"] = parse_int(row.get("signal_quality_score"))
     out["signal_quality_reason"] = row.get("signal_quality_reason") or ""
+    out["conviction_score"] = parse_int(row.get("conviction_score"))
+    out["conviction_label"] = (row.get("conviction_label") or "").strip() or None
+    out["position_behavior_label"] = (row.get("position_behavior_label") or "").strip() or None
+    out["squeeze_state_label"] = (row.get("squeeze_state_label") or "").strip() or None
+    out["market_intent_label"] = (row.get("market_intent_label") or "").strip() or None
+    out["flow_trend_label"] = (row.get("flow_trend_label") or "").strip() or None
+    out["basis_state"] = (row.get("basis_state") or "").strip() or None
     out["funding_rate_percent"] = parse_float(row.get("funding_rate_percent"))
     out["suppressed_from_telegram"] = parse_bool_int(row.get("suppressed_from_telegram"))
-    for name in ("12h", "24h"):
+    for name in ("12h", "24h", "48h", "72h", "96h", "120h", "144h"):
         out[f"flow_{name}"] = parse_float(row.get(f"net_flow_{name}_usd"))
         out[f"flow_{name}_ratio"] = parse_float(row.get(f"net_flow_{name}_ratio"))
     for name, sec in HORIZONS.items():
@@ -270,7 +283,7 @@ def flow_detail(x):
         parts.append(f"div={div_label}/{div_score}")
     if major_label and major_score is not None:
         parts.append(f"major={major_label}/{major_score}")
-    for name in ("12h", "24h"):
+    for name in ("12h", "24h", "72h", "144h"):
         flow = x.get(f"flow_{name}")
         ratio = x.get(f"flow_{name}_ratio")
         if flow is not None or ratio is not None:
@@ -303,6 +316,41 @@ def trap_risk_group(score):
         if low <= score <= high:
             return label, name
     return None
+
+
+def conviction_group(score):
+    if score is None:
+        return None
+    for label, name, low, high in CONVICTION_GROUPS:
+        if low <= score <= high:
+            return label, name
+    return None
+
+
+def print_score_group_backtest(results, title, score_field, groups):
+    grouped = [(x, conviction_group(x.get(score_field))) for x in results]
+    if not any(group for _x, group in grouped):
+        print(title)
+        print(f"暂无 {score_field} 样本")
+        print("")
+        return
+
+    print(title)
+    for label, name, _low, _high in groups:
+        group_rows = [x for x, group in grouped if group == (label, name)]
+        print(f"{label} {name}: 样本={len(group_rows)}")
+        for h in REPORT_HORIZONS:
+            vals = [x[h] for x in group_rows if x[h] is not None]
+            if not vals:
+                print(f"  {h}: 样本=0")
+                continue
+            wins = sum(v > 0 for v in vals)
+            print(
+                f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))} "
+                f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
+            )
+    print("")
 
 
 def print_long_flow_backtest(results):
@@ -449,6 +497,12 @@ def print_entry_timing_backtest(results):
 
 def print_label_group_backtest(results, title, field, labels):
     print(title)
+    if labels is None:
+        labels = sorted({x.get(field) for x in results if x.get(field)})
+        if not labels:
+            print(f"暂无 {field} 样本")
+            print("")
+            return
     for label in labels:
         group_rows = [x for x in results if x.get(field) == label]
         print(f"{label}: 样本={len(group_rows)}")
@@ -493,6 +547,30 @@ def print_major_flow_backtest(results):
     )
 
 
+def print_conviction_backtest(results):
+    print_score_group_backtest(results, "[CONVICTION] 把握性评分分组回测", "conviction_score", CONVICTION_GROUPS)
+
+
+def print_position_behavior_backtest(results):
+    print_label_group_backtest(results, "[POSITION BEHAVIOR] 主力行为分组回测", "position_behavior_label", None)
+
+
+def print_squeeze_state_backtest(results):
+    print_label_group_backtest(results, "[SQUEEZE STATE] 挤压结构分组回测", "squeeze_state_label", None)
+
+
+def print_market_intent_backtest(results):
+    print_label_group_backtest(results, "[MARKET INTENT] 市场意图分组回测", "market_intent_label", None)
+
+
+def print_flow_trend_backtest(results):
+    print_label_group_backtest(results, "[FLOW TREND] 资金周期标签分组回测", "flow_trend_label", None)
+
+
+def print_basis_state_backtest(results):
+    print_label_group_backtest(results, "[BASIS STATE] 基差状态分组回测", "basis_state", None)
+
+
 def kind_average(rows, horizon):
     vals = horizon_values(rows, horizon)
     return statistics.mean(vals) if vals else None
@@ -528,6 +606,13 @@ def print_summary_report(total_signals, results):
     print("[SUMMARY] 综合总览")
     print(f"总信号数: {total_signals}")
     print(f"可评估信号数: {len(results)}")
+    conviction_values = [x["conviction_score"] for x in results if x.get("conviction_score") is not None]
+    if conviction_values:
+        high_count = sum(value >= 65 for value in conviction_values)
+        print(
+            f"把握性: 平均={statistics.mean(conviction_values):.1f} "
+            f"中高及以上={high_count}/{len(conviction_values)}"
+        )
     for horizon in REPORT_HORIZONS:
         stat = stats_for_values(horizon_values(results, horizon))
         if not stat["n"]:
@@ -559,6 +644,9 @@ def bad_signal_causes(x):
         causes.append("longFlow 弱")
     if x.get("signal_priority") in ("C", "D"):
         causes.append("quality C/D")
+    conviction = x.get("conviction_score")
+    if conviction is not None and conviction < 65:
+        causes.append("conviction低/中低")
     if x.get("entry_timing_label") in ("追高风险", "下跌中继", "不宜追"):
         causes.append("entry label 风险")
     quality_reason = str(x.get("signal_quality_reason") or "").lower()
@@ -576,6 +664,7 @@ def print_bad_signals_report(results):
         "trap 高": 0,
         "longFlow 弱": 0,
         "quality C/D": 0,
+        "conviction低/中低": 0,
         "entry label 风险": 0,
         "现货弱": 0,
         "Funding 极端": 0,
@@ -615,12 +704,17 @@ def combo_filter_keeps(x):
 
 def print_combo_filter_report(results):
     kept = [x for x in results if combo_filter_keeps(x)]
+    conviction_kept = [x for x in results if x.get("conviction_score") is not None and x["conviction_score"] >= 65]
     print("[COMBO FILTER] 组合过滤模拟")
     print("规则: quality in S/A/B; trap<=5; entry>=5; longFlow>=3")
     for label, rows in (("过滤前", results), ("过滤后", kept)):
         print(f"{label}: 样本={len(rows)}")
         for horizon in REPORT_HORIZONS:
             print_horizon_stat_line("  ", rows, horizon, include_worst=True)
+    print("规则: conviction>=65")
+    print(f"conviction>=65: 样本={len(conviction_kept)}")
+    for horizon in REPORT_HORIZONS:
+        print_horizon_stat_line("  ", conviction_kept, horizon, include_worst=True)
     print("")
 
 
@@ -703,6 +797,12 @@ def run_backtest(args):
     print_spot_onchain_backtest(results)
     print_contract_spot_divergence_backtest(results)
     print_major_flow_backtest(results)
+    print_conviction_backtest(results)
+    print_position_behavior_backtest(results)
+    print_squeeze_state_backtest(results)
+    print_market_intent_backtest(results)
+    print_flow_trend_backtest(results)
+    print_basis_state_backtest(results)
 
     print("最近20条:")
     for x in results[:20]:
@@ -710,6 +810,12 @@ def run_backtest(args):
             f"{x['symbol']} {x['kind']} {x['side']} "
             f"15m={fmt(x['15m'])} 1h={fmt(x['1h'])} 4h={fmt(x['4h'])} "
             f"12h={fmt(x['12h'])} 24h={fmt(x['24h'])}"
+            f" conv={x.get('conviction_label') or '-'}/{x.get('conviction_score') if x.get('conviction_score') is not None else '-'}"
+            f" intent={x.get('market_intent_label') or '-'}"
+            f" pos={x.get('position_behavior_label') or '-'}"
+            f" squeeze={x.get('squeeze_state_label') or '-'}"
+            f" basis={x.get('basis_state') or '-'}"
+            f" flow={x.get('flow_trend_label') or '-'}"
             f"{flow_detail(x)} MFE={fmt(x['mfe'])} MAE={fmt(x['mae'])}"
         )
 

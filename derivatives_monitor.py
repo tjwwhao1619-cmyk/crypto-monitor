@@ -36,10 +36,17 @@ COINGLASS_LIQUIDATION_AGGREGATED_HISTORY_URL = "https://open-api-v4.coinglass.co
 COINGLASS_SPOT_ORDERBOOK_ASK_BIDS_HISTORY_ENDPOINT = "/api/spot/orderbook/ask-bids-history"
 COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS = 300
 COINGLASS_BASE_URL = "https://open-api-v4.coinglass.com"
-COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS = 300
+COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS = 2700
 TELEGRAM_SNAPSHOT_CACHE_TTL_SECONDS = 600
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
-FLOW_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h"]
+FLOW_SHORT_PERIODS = ["5m", "15m", "1h"]
+FLOW_MID_PERIODS = ["4h", "12h", "24h"]
+FLOW_LONG_PERIODS = ["48h", "72h", "96h", "120h", "144h"]
+FLOW_PANEL_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h", "72h", "144h"]
+FLOW_PERIODS = FLOW_SHORT_PERIODS + FLOW_MID_PERIODS + FLOW_LONG_PERIODS
+FLOW_SHORT_CACHE_TTL_SECONDS = 120
+FLOW_MID_CACHE_TTL_SECONDS = 900
+FLOW_LONG_CACHE_TTL_SECONDS = 2700
 COINGLASS_TAKER_LONG_RANGES = ("24h", "7d")
 COINGLASS_BALANCE_LONG_RANGES = ("24h", "7d", "30d")
 COINGLASS_FUNDING_ACCUMULATED_RANGES = ("24h", "7d")
@@ -70,6 +77,8 @@ class MarketSnapshot:
     quote_volume_24h: float | None
     volume_ratio_24h: float | None
     close_price: float
+    spot_price: float | None = None
+    price_change_periods: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -148,12 +157,22 @@ SIGNAL_LOG_FIELDS = [
     "net_flow_4h_usd",
     "net_flow_12h_usd",
     "net_flow_24h_usd",
+    "net_flow_48h_usd",
+    "net_flow_72h_usd",
+    "net_flow_96h_usd",
+    "net_flow_120h_usd",
+    "net_flow_144h_usd",
     "net_flow_5m_ratio",
     "net_flow_15m_ratio",
     "net_flow_1h_ratio",
     "net_flow_4h_ratio",
     "net_flow_12h_ratio",
     "net_flow_24h_ratio",
+    "net_flow_48h_ratio",
+    "net_flow_72h_ratio",
+    "net_flow_96h_ratio",
+    "net_flow_120h_ratio",
+    "net_flow_144h_ratio",
     "price_position_24h",
     "high_24h",
     "low_24h",
@@ -187,6 +206,29 @@ SIGNAL_LOG_FIELDS = [
     "major_flow_score",
     "major_flow_label",
     "major_flow_reason",
+    "basis_pct",
+    "basis_state",
+    "basis_reason",
+    "short_flow_score",
+    "mid_flow_score",
+    "long_flow_score",
+    "flow_trend_label",
+    "flow_trend_reason",
+    "position_behavior_label",
+    "position_behavior_score",
+    "position_behavior_reason",
+    "squeeze_state_label",
+    "squeeze_state_score",
+    "squeeze_state_reason",
+    "spot_absorption_label",
+    "spot_absorption_score",
+    "spot_absorption_reason",
+    "market_intent_label",
+    "market_intent_score",
+    "market_intent_reason",
+    "conviction_score",
+    "conviction_label",
+    "conviction_reason",
     "signal_priority",
     "signal_quality_score",
     "signal_quality_reason",
@@ -243,6 +285,8 @@ class DerivativesMonitor:
         self.coinglass_api_key = os.getenv("COINGLASS_API_KEY", "").strip()
         self.coinglass_liquidation_cache: dict[str, tuple[float, dict[str, float]]] = {}
         self.coinglass_market_context_cache: dict[str, tuple[float, str]] = {}
+        self.flow_metrics_cache: dict[tuple[str, str], tuple[float, float | None, float | None]] = {}
+        self.flow_metrics_cache_lock = threading.Lock()
         self.telegram_signal_cooldowns: dict[str, tuple[float, int]] = {}
         self.pending_telegram_signal_merges: dict[str, PendingTelegramSignalMerge] = {}
         self.pending_telegram_signal_merge_lock = threading.Lock()
@@ -1138,6 +1182,7 @@ class DerivativesMonitor:
         last_close = float(klines[-1][4])
         first_oi = float(oi_rows[0]["sumOpenInterestValue"])
         last_oi = float(oi_rows[-1]["sumOpenInterestValue"])
+        price_change_periods = price_change_periods_from_klines(klines, self.period)
         net_flow_usd, net_flow_ratio = self.fetch_flow_metrics(symbol, last_close)
         high_24h = float(ticker_24h.get("highPrice", last_close) or last_close)
         low_24h = float(ticker_24h.get("lowPrice", last_close) or last_close)
@@ -1167,32 +1212,69 @@ class DerivativesMonitor:
             quote_volume_24h=quote_volume_24h,
             volume_ratio_24h=volume_ratio_24h,
             close_price=last_close,
+            spot_price=safe_float(funding.get("indexPrice")),
+            price_change_periods=price_change_periods,
         )
 
     def fetch_flow_metrics(self, symbol: str, price: float) -> tuple[dict[str, float], dict[str, float]]:
         if not self.flow_config.get("enabled", False):
             return {}, {}
 
-        net_flow_usd = {}
-        net_flow_ratio = {}
+        net_flow_usd: dict[str, float] = {}
+        net_flow_ratio: dict[str, float] = {}
         configured_periods = [str(period) for period in self.flow_config.get("periods", FLOW_PERIODS)]
         periods = list(dict.fromkeys(configured_periods + FLOW_PERIODS))
 
         for period in periods:
-            try:
-                rows = self.get_data("takerlongshortRatio", {"symbol": symbol, "period": period, "limit": 1})
-                if not rows:
-                    continue
-                row = rows[-1]
-                buy_vol = float(row.get("buyVol", 0))
-                sell_vol = float(row.get("sellVol", 0))
-                ratio = float(row.get("buySellRatio", 0))
-                net_flow_usd[str(period)] = (buy_vol - sell_vol) * price
+            metric = self.fetch_flow_metric_cached(symbol, str(period), price)
+            if metric is None:
+                continue
+            flow, ratio = metric
+            if flow is not None:
+                net_flow_usd[str(period)] = flow
+            if ratio is not None:
                 net_flow_ratio[str(period)] = ratio
-            except Exception:
-                logging.debug("Failed to fetch flow metrics for %s %s", symbol, period, exc_info=True)
 
         return net_flow_usd, net_flow_ratio
+
+    def fetch_flow_metric_cached(self, symbol: str, period: str, price: float) -> tuple[float | None, float | None] | None:
+        now = time.time()
+        key = (symbol.upper(), period)
+        ttl = flow_cache_ttl_seconds(period)
+        with self.flow_metrics_cache_lock:
+            cached = self.flow_metrics_cache.get(key)
+            if cached and now - cached[0] < ttl:
+                return cached[1], cached[2]
+
+        try:
+            metric = self.fetch_flow_metric_uncached(symbol, period, price)
+        except Exception:
+            logging.debug("Failed to fetch flow metrics for %s %s", symbol, period, exc_info=True)
+            metric = None
+
+        with self.flow_metrics_cache_lock:
+            if metric is None:
+                self.flow_metrics_cache[key] = (now, None, None)
+            else:
+                self.flow_metrics_cache[key] = (now, metric[0], metric[1])
+        return metric
+
+    def fetch_flow_metric_uncached(self, symbol: str, period: str, price: float) -> tuple[float | None, float | None] | None:
+        binance_period, limit, required_rows = flow_binance_request(period)
+        rows = self.get_data("takerlongshortRatio", {"symbol": symbol, "period": binance_period, "limit": limit})
+        if not rows or len(rows) < required_rows:
+            return None
+
+        selected_rows = rows[-required_rows:]
+        buy_vol = 0.0
+        sell_vol = 0.0
+        for row in selected_rows:
+            buy_vol += float(row.get("buyVol", 0) or 0)
+            sell_vol += float(row.get("sellVol", 0) or 0)
+        if buy_vol == 0 and sell_vol == 0:
+            return None
+        ratio = buy_vol / sell_vol if sell_vol > 0 else None
+        return (buy_vol - sell_vol) * price, ratio
 
     def evaluate_snapshot(self, snapshot: MarketSnapshot, symbol_config: dict[str, Any]) -> list[Signal]:
         mode = symbol_config.get("mode", "both")
@@ -1492,6 +1574,15 @@ class DerivativesMonitor:
         spot_score, spot_label, spot_reason = spot_onchain_score(snapshot, signal) if snapshot else ("", "", "")
         div_label, div_score, div_reason = contract_spot_divergence(snapshot, signal) if snapshot else ("", "", "")
         major_score, major_label, major_reason = major_flow_score(snapshot, signal) if snapshot else ("", "", "")
+        basis_pct, basis_label, basis_reason = basis_state(snapshot) if snapshot else ("", "", "")
+        short_flow_score, mid_flow_score, long_flow_score, flow_trend_label, flow_trend_reason = (
+            flow_horizon_scores(snapshot) if snapshot else ("", "", "", "", "")
+        )
+        position_label, position_score, position_reason = position_behavior(snapshot, signal) if snapshot else ("", "", "")
+        squeeze_label, squeeze_score, squeeze_reason = squeeze_state(snapshot) if snapshot else ("", "", "")
+        absorption_label, absorption_score, absorption_reason = spot_absorption_state(snapshot, signal) if snapshot else ("", "", "")
+        intent_label, intent_score, intent_reason = market_intent(snapshot, signal) if snapshot else ("", "", "")
+        conv_score, conv_label, conv_reason = conviction_score(snapshot, signal) if snapshot else ("", "", "")
         priority, quality_score, quality_reason = signal_priority(signal, snapshot)
         suppressed_from_telegram, _suppressed_reason = self.telegram_signal_suppression(signal, priority, quality_score)
         row = {
@@ -1515,12 +1606,22 @@ class DerivativesMonitor:
             "net_flow_4h_usd": snapshot.net_flow_usd.get("4h", "") if snapshot else "",
             "net_flow_12h_usd": snapshot.net_flow_usd.get("12h", "") if snapshot else "",
             "net_flow_24h_usd": snapshot.net_flow_usd.get("24h", "") if snapshot else "",
+            "net_flow_48h_usd": snapshot.net_flow_usd.get("48h", "") if snapshot else "",
+            "net_flow_72h_usd": snapshot.net_flow_usd.get("72h", "") if snapshot else "",
+            "net_flow_96h_usd": snapshot.net_flow_usd.get("96h", "") if snapshot else "",
+            "net_flow_120h_usd": snapshot.net_flow_usd.get("120h", "") if snapshot else "",
+            "net_flow_144h_usd": snapshot.net_flow_usd.get("144h", "") if snapshot else "",
             "net_flow_5m_ratio": snapshot.net_flow_ratio.get("5m", "") if snapshot else "",
             "net_flow_15m_ratio": snapshot.net_flow_ratio.get("15m", "") if snapshot else "",
             "net_flow_1h_ratio": snapshot.net_flow_ratio.get("1h", "") if snapshot else "",
             "net_flow_4h_ratio": snapshot.net_flow_ratio.get("4h", "") if snapshot else "",
             "net_flow_12h_ratio": snapshot.net_flow_ratio.get("12h", "") if snapshot else "",
             "net_flow_24h_ratio": snapshot.net_flow_ratio.get("24h", "") if snapshot else "",
+            "net_flow_48h_ratio": snapshot.net_flow_ratio.get("48h", "") if snapshot else "",
+            "net_flow_72h_ratio": snapshot.net_flow_ratio.get("72h", "") if snapshot else "",
+            "net_flow_96h_ratio": snapshot.net_flow_ratio.get("96h", "") if snapshot else "",
+            "net_flow_120h_ratio": snapshot.net_flow_ratio.get("120h", "") if snapshot else "",
+            "net_flow_144h_ratio": snapshot.net_flow_ratio.get("144h", "") if snapshot else "",
             "price_position_24h": snapshot.price_position_24h if snapshot else "",
             "high_24h": snapshot.high_24h if snapshot else "",
             "low_24h": snapshot.low_24h if snapshot else "",
@@ -1554,6 +1655,29 @@ class DerivativesMonitor:
             "major_flow_score": major_score,
             "major_flow_label": major_label,
             "major_flow_reason": major_reason,
+            "basis_pct": basis_pct,
+            "basis_state": basis_label,
+            "basis_reason": basis_reason,
+            "short_flow_score": short_flow_score,
+            "mid_flow_score": mid_flow_score,
+            "long_flow_score": long_flow_score,
+            "flow_trend_label": flow_trend_label,
+            "flow_trend_reason": flow_trend_reason,
+            "position_behavior_label": position_label,
+            "position_behavior_score": position_score,
+            "position_behavior_reason": position_reason,
+            "squeeze_state_label": squeeze_label,
+            "squeeze_state_score": squeeze_score,
+            "squeeze_state_reason": squeeze_reason,
+            "spot_absorption_label": absorption_label,
+            "spot_absorption_score": absorption_score,
+            "spot_absorption_reason": absorption_reason,
+            "market_intent_label": intent_label,
+            "market_intent_score": intent_score,
+            "market_intent_reason": intent_reason,
+            "conviction_score": conv_score,
+            "conviction_label": conv_label,
+            "conviction_reason": conv_reason,
             "signal_priority": priority,
             "signal_quality_score": quality_score,
             "signal_quality_reason": quality_reason,
@@ -1625,7 +1749,9 @@ class DerivativesMonitor:
                     quality_score,
                     suppressed_reason or quality_reason,
                 )
-                self.enqueue_telegram_signal_digest(signal, priority, quality_score, quality_reason)
+                delivery, _delivery_reason = self.telegram_signal_delivery(signal)
+                if delivery == "digest":
+                    self.enqueue_telegram_signal_digest(signal, priority, quality_score, quality_reason)
                 return
             self.enqueue_pending_telegram_signal(signal, priority, quality_score, quality_reason)
 
@@ -1669,9 +1795,9 @@ class DerivativesMonitor:
             response = self.session.post(url, json=payload, timeout=5)
             response.raise_for_status()
         except requests.Timeout:
-            logging.warning("Notification request timed out")
+            logging.exception("Notification request timed out")
         except Exception:
-            logging.warning("Failed to send notification", exc_info=True)
+            logging.exception("Failed to send notification")
 
     def telegram_signal_key(self, signal: Signal) -> str:
         return f"{signal.symbol}/{signal.kind}"
@@ -1723,12 +1849,27 @@ class DerivativesMonitor:
                 return self.configured_realtime_priorities(), False
             return set(override), True
 
+    def telegram_signal_delivery(self, signal: Signal) -> tuple[str, str]:
+        snapshot = signal.snapshot
+        if snapshot is None:
+            return "log", "no snapshot"
+        conviction, _conviction_label, _conviction_reason = conviction_score(snapshot, signal)
+        intent_label, _intent_score, _intent_reason = market_intent(snapshot, signal)
+        risk_intents = {"高位出货", "多杀多风险", "逃顶", "减仓优先"}
+        risk_kinds = {"top_risk", "top_exhaustion", "distribution"}
+
+        if conviction >= 80:
+            return "realtime", f"conviction {conviction}>=80"
+        if signal.kind in risk_kinds and conviction >= 70 and intent_label in risk_intents:
+            return "realtime", f"risk {signal.kind} conviction {conviction} intent {intent_label}"
+        if 65 <= conviction <= 79:
+            return "digest", f"conviction {conviction} digest only"
+        return "log", f"conviction {conviction}<65"
+
     def telegram_signal_suppression(self, signal: Signal, priority: str, quality_score: int) -> tuple[bool, str]:
-        realtime_priorities, _digest_priorities, _digest_interval_minutes, _digest_max_per_priority = (
-            self.telegram_signal_filter_settings()
-        )
-        if priority not in realtime_priorities:
-            return True, f"priority {priority} below realtime Telegram threshold"
+        delivery, delivery_reason = self.telegram_signal_delivery(signal)
+        if delivery != "realtime":
+            return True, delivery_reason
 
         key = self.telegram_signal_key(signal)
         last = self.telegram_signal_cooldowns.get(key)
@@ -2010,6 +2151,10 @@ class DerivativesMonitor:
 
         if command == "/ask":
             self.handle_ask_command(bot_token, chat_id, parts[1:])
+            return
+
+        if command == "/flow":
+            self.handle_flow_command(bot_token, chat_id, parts[1:])
             return
 
         if command == "/liq":
@@ -2335,10 +2480,34 @@ class DerivativesMonitor:
     def handle_liq_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
         symbol = None
         if args:
-            symbol = args[0].upper()
-            if not symbol.endswith("USDT"):
-                symbol = f"{symbol}USDT"
+            symbol = normalize_usdt_symbol(args[0])
         self.send_telegram_text(bot_token, chat_id, self.liquidation_health_report(symbol))
+
+    def handle_flow_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
+        if not args:
+            self.send_telegram_text(bot_token, chat_id, "用法: /flow KNC 或 /flow KNCUSDT")
+            return
+
+        symbol = normalize_usdt_symbol(args[0])
+        try:
+            snapshot, data_source_text, degradation_text = self.telegram_command_snapshot(symbol)
+        except Exception:
+            logging.exception("Failed to fetch Telegram flow snapshot")
+            self.send_telegram_text(bot_token, chat_id, "Binance接口限流或异常，请稍后再试。")
+            return
+
+        try:
+            signals = self.evaluate_snapshot(snapshot, {"mode": "both"})
+            combined_signal = self.combined_signal(snapshot, signals)
+            signal = combined_signal or (signals[0] if signals else None)
+            parts = [data_source_text]
+            if degradation_text:
+                parts.append(degradation_text)
+            parts.append(format_flow_trader_view(snapshot, signal))
+            self.send_telegram_text(bot_token, chat_id, "\n".join(parts))
+        except Exception as exc:
+            logging.exception("Failed to build flow trader view")
+            self.send_telegram_text(bot_token, chat_id, f"{symbol} /flow 查询失败: {type(exc).__name__}: {exc}")
 
     def ask_market_snapshots(self) -> list[MarketSnapshot]:
         majors = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
@@ -2883,16 +3052,16 @@ class DerivativesMonitor:
             return
 
         scored_rows = []
-        priority_order = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
         for recent_index, row in enumerate(rows):
-            quality_score = parse_float(row.get("signal_quality_score"))
-            if quality_score is None:
+            conviction_score_value = parse_float(row.get("conviction_score"))
+            if conviction_score_value is None or conviction_score_value < 65:
                 continue
             priority = str(row.get("signal_priority") or "").upper()
-            scored_rows.append((quality_score, priority_order.get(priority, -1), -recent_index, row))
+            priority_order = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+            scored_rows.append((conviction_score_value, priority_order.get(priority, -1), -recent_index, row))
 
         if not scored_rows:
-            self.send_telegram_text(bot_token, chat_id, "暂无质量评分信号，请等待新信号积累。")
+            self.send_telegram_text(bot_token, chat_id, "暂无高把握/观察候选。")
             return
 
         scored_rows.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
@@ -2907,25 +3076,34 @@ class DerivativesMonitor:
             if len(deduped_rows) >= 10:
                 break
 
-        lines = ["高质量信号TOP10"]
-        for index, (quality_score, row) in enumerate(deduped_rows, start=1):
+        lines = ["把握候选TOP10"]
+        for index, (conviction_score_value, row) in enumerate(deduped_rows, start=1):
             kind = row.get("kind", "-")
-            priority = row.get("signal_priority") or "-"
-            trap_score = format_csv_compact_number(row.get("trap_risk_score"), signed=False)
             price_change = format_csv_compact_number(row.get("price_change_percent"), signed=True)
             oi_change = format_csv_compact_number(row.get("oi_change_percent"), signed=True)
-            strength = format_csv_compact_number(row.get("strength_score"), signed=False)
-            suppressed = format_suppressed_status(row.get("suppressed_from_telegram"))
-            reason = format_quality_reason_short(row.get("signal_quality_reason", "") or "")
+            intent = row.get("market_intent_label") or "-"
+            direction = signal_direction_label(kind)
+            position_label = row.get("position_behavior_label") or ""
+            action, _action_reason = action_from_trade_context(
+                intent,
+                int(conviction_score_value or 0),
+                direction,
+                position_label,
+            )
+            short_flow = format_csv_compact_number(row.get("short_flow_score"), signed=False)
+            mid_flow = format_csv_compact_number(row.get("mid_flow_score"), signed=False)
+            long_flow = format_csv_compact_number(row.get("long_flow_score"), signed=False)
+            direction_icon_text = "🔴" if direction == "看空" else "🟢" if direction == "看多" else "⚪"
+            status = "高把握" if conviction_score_value >= 80 else "观察"
+            status_icon = "🔴" if conviction_score_value >= 80 and direction == "看空" else "🟢" if conviction_score_value >= 80 else "🟡"
+            symbol = str(row.get("symbol", "-")).replace("USDT", "")
             lines.append(
-                f"{index}. {priority_badge(priority)} {direction_badge(signal_direction_label(kind))} "
-                f"{row.get('symbol', '-')} {signal_kind_label(kind)}"
+                f"{index}. {status_icon}{status} {direction_icon_text} {symbol} {signal_kind_label(kind)} | "
+                f"把握{conviction_score_value:.0f} | {action}"
             )
             lines.append(
-                f"   质量{quality_score:.0f} | {trap_badge(trap_score)} | 强度{strength} | "
-                f"{price_change}% | OI{oi_change}% | {suppressed}"
+                f"   {price_change}% OI{oi_change}% | 短{short_flow} 中{mid_flow} 长{long_flow} | {intent}"
             )
-            lines.append(f"   {reason}")
         self.send_telegram_text(bot_token, chat_id, "\n".join(lines))
 
     def send_telegram_text(self, bot_token: str, chat_id: str, text: str) -> None:
@@ -3033,6 +3211,55 @@ def percent_change(start: float, end: float) -> float:
     if start == 0:
         return 0
     return ((end - start) / start) * 100
+
+
+def interval_seconds(value: str) -> int | None:
+    match = re.fullmatch(r"(\d+)([mhd])", str(value).strip().lower())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    return amount * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+
+
+def price_change_periods_from_klines(klines: list[Any], interval: str) -> dict[str, float]:
+    seconds = interval_seconds(interval)
+    if not seconds or not klines:
+        return {}
+    result: dict[str, float] = {}
+    last_close = float(klines[-1][4])
+    for label in ("15m", "1h", "4h"):
+        target_seconds = interval_seconds(label)
+        if not target_seconds:
+            continue
+        bars = max(1, int(target_seconds / seconds))
+        if len(klines) <= bars:
+            continue
+        start_close = float(klines[-bars - 1][4])
+        result[label] = percent_change(start_close, last_close)
+    return result
+
+
+def flow_cache_ttl_seconds(period: str) -> int:
+    if period in FLOW_SHORT_PERIODS:
+        return FLOW_SHORT_CACHE_TTL_SECONDS
+    if period in FLOW_MID_PERIODS:
+        return FLOW_MID_CACHE_TTL_SECONDS
+    return FLOW_LONG_CACHE_TTL_SECONDS
+
+
+def flow_binance_request(period: str) -> tuple[str, int, int]:
+    daily_periods = {
+        "24h": 1,
+        "48h": 2,
+        "72h": 3,
+        "96h": 4,
+        "120h": 5,
+        "144h": 6,
+    }
+    if period in daily_periods:
+        rows = daily_periods[period]
+        return "1d", rows, rows
+    return period, 1, 1
 
 
 def normalize_market_cap_symbol(base_asset: str) -> str:
@@ -4238,6 +4465,20 @@ def format_csv_compact_number(value: Any, signed: bool = False) -> str:
     return text
 
 
+def topq_action_short(action: str) -> str:
+    if action.startswith("减仓/避险"):
+        return "减仓/避险"
+    if action.startswith("强关注做多"):
+        return "强关注做多"
+    if action.startswith("观察做多"):
+        return "观察做多"
+    if action.startswith("不追"):
+        return "不追"
+    if action.startswith("不抄底"):
+        return "不抄底"
+    return "观望"
+
+
 def format_compact_percent(value: Any) -> str:
     if value is None:
         return "-%"
@@ -4868,6 +5109,616 @@ def format_percent_optional(value: float | None) -> str:
     return f"{value:+.2f}%"
 
 
+def clamp_int(value: float, low: int, high: int) -> int:
+    return max(low, min(high, int(round(value))))
+
+
+def basis_state(snapshot: MarketSnapshot) -> tuple[float | None, str, str]:
+    spot_price = getattr(snapshot, "spot_price", None)
+    if spot_price is None or spot_price <= 0:
+        return None, "数据不足", "缺现货价格"
+
+    basis_pct = (snapshot.close_price - spot_price) / spot_price * 100
+    abs_basis = abs(basis_pct)
+    tier = market_tier(snapshot.symbol)
+    if tier in ("core", "major"):
+        thresholds = (0.03, 0.08, 0.20)
+    elif tier in ("large", "alt"):
+        thresholds = (0.10, 0.30, 0.80)
+    else:
+        thresholds = (0.20, 0.50, 1.50)
+
+    if abs_basis < thresholds[0]:
+        return basis_pct, "正常", "基差正常"
+    if abs_basis < thresholds[1]:
+        level = "轻微"
+    elif abs_basis < thresholds[2]:
+        level = "明显"
+    else:
+        level = "极端"
+
+    if basis_pct > 0:
+        return basis_pct, f"{level}溢价", "合约溢价，追多偏激进"
+    return basis_pct, f"{level}贴水", "合约贴水，空头偏激进"
+
+
+def flow_horizon_scores(snapshot: MarketSnapshot) -> tuple[int, int, int, str, str]:
+    def period_score(periods: list[str]) -> int:
+        seen = False
+        raw = 0.0
+        for period in periods:
+            flow = snapshot.net_flow_usd.get(period)
+            ratio = snapshot.net_flow_ratio.get(period)
+            if flow is None and ratio is None:
+                continue
+            seen = True
+            weight = {"5m": 1.0, "15m": 1.2, "1h": 1.5, "4h": 1.2, "12h": 1.4, "24h": 1.6}.get(period, 1.0)
+            if flow is not None:
+                if flow > 0:
+                    raw += 1.4 * weight
+                elif flow < 0:
+                    raw -= 1.4 * weight
+                size_base = max(snapshot.quote_volume_24h or 1.0, 1.0)
+                size = min(abs(flow) / size_base * 100, 2.0)
+                raw += size * weight * (1 if flow > 0 else -1)
+            if ratio is not None:
+                if ratio > 1:
+                    raw += min((ratio - 1) * 2.0, 1.4) * weight
+                elif ratio < 1:
+                    raw -= min((1 - ratio) * 2.0, 1.4) * weight
+        if not seen:
+            return 5
+        return clamp_int(5 + raw, 0, 10)
+
+    short_score = period_score(["5m", "15m", "1h"])
+    mid_score = period_score(["4h", "12h", "24h"])
+
+    long_raw = 0.0
+    long_seen = False
+    for period in ("72h", "144h"):
+        flow = snapshot.net_flow_usd.get(period)
+        ratio = snapshot.net_flow_ratio.get(period)
+        if flow is None and ratio is None:
+            continue
+        long_seen = True
+        if flow is not None:
+            long_raw += 2 if flow > 0 else -2 if flow < 0 else 0
+        if ratio is not None:
+            long_raw += 1 if ratio > 1 else -1 if ratio < 1 else 0
+
+    if not long_seen:
+        coinglass_text = cached_coinglass_market_context_text(snapshot.symbol)
+        oi_24h = extract_coinglass_oi_change(coinglass_text, "24h")
+        buy_ratio, sell_ratio = extract_coinglass_taker_ratios(coinglass_text)
+        balance_1d = extract_coinglass_balance_change(coinglass_text, "1d")
+        balance_7d = extract_coinglass_balance_change(coinglass_text, "7d")
+        funding_1d = extract_coinglass_funding_accumulated(coinglass_text, "1d")
+        funding_7d = extract_coinglass_funding_accumulated(coinglass_text, "7d")
+        helpers = [oi_24h, buy_ratio, sell_ratio, balance_1d, balance_7d, funding_1d, funding_7d]
+        if any(value is not None for value in helpers):
+            long_seen = True
+            if oi_24h is not None and oi_24h > 0:
+                long_raw += 1
+            if buy_ratio is not None and buy_ratio > 51:
+                long_raw += 1
+            if sell_ratio is not None and sell_ratio > 51:
+                long_raw -= 1
+            if any(value is not None and value < 0 for value in (balance_1d, balance_7d)):
+                long_raw += 1.5
+            if any(value is not None and value > 0 for value in (balance_1d, balance_7d)):
+                long_raw -= 1.5
+            if funding_accumulated_extreme(funding_1d) or funding_accumulated_extreme(funding_7d):
+                long_raw -= 0.8
+            long_raw += (mid_score - 5) * 0.4
+
+    long_score = clamp_int(5 + long_raw, 0, 10) if long_seen else 5
+
+    if short_score >= 7 and mid_score >= 7 and long_score >= 6:
+        label = "多周期共振流入"
+    elif short_score >= 7 and mid_score <= 5:
+        label = "短强中弱"
+    elif short_score <= 4 and mid_score >= 7:
+        label = "短弱中强"
+    elif mid_score >= 7 and long_score >= 7:
+        label = "中长线吸筹"
+    elif mid_score <= 3 and long_score <= 3:
+        label = "中长线派发"
+    elif short_score <= 3 and mid_score <= 3 and long_score <= 4:
+        label = "全周期流出"
+    else:
+        label = "资金分歧"
+    reason = f"短{short_score}/中{mid_score}/长{long_score}"
+    return short_score, mid_score, long_score, label, reason
+
+
+def position_behavior(snapshot: MarketSnapshot, signal: Signal | None = None) -> tuple[str, int, str]:
+    price = snapshot.price_change_percent
+    oi = snapshot.oi_change_percent
+    taker = snapshot.taker_buy_sell_ratio
+    funding = snapshot.funding_rate_percent or 0.0
+    global_ls = snapshot.global_long_short_ratio
+    top_ls = snapshot.top_position_ratio or snapshot.top_account_ratio
+    short_flow, mid_flow, long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    high_pos = snapshot.price_position_24h is not None and snapshot.price_position_24h >= 75
+    low_pos = snapshot.price_position_24h is not None and snapshot.price_position_24h <= 25
+    long_biased = (global_ls is not None and global_ls >= 1.4) or (top_ls is not None and top_ls >= 1.3)
+    short_biased = (global_ls is not None and global_ls <= 0.8) or (top_ls is not None and top_ls <= 0.85)
+    taker_strong = taker is not None and taker >= 1.08
+    taker_weak = taker is not None and taker <= 0.95
+    funding_hot = funding >= 0.05
+    funding_extreme_negative = funding <= -0.08
+    basis_positive = basis_pct is not None and basis_pct > 0 and basis_label in ("明显溢价", "极端溢价")
+    basis_negative = basis_pct is not None and basis_pct < 0 and basis_label in ("明显贴水", "极端贴水")
+    reasons: list[str] = []
+
+    if abs(price) >= 5 and oi >= 8 and (abs(short_flow - mid_flow) >= 4 or taker is None):
+        return "双向加杠杆", 7, "大波动/OI大增/资金分歧"
+    if price > 0 and oi > 0 and taker_strong and funding <= 0.05 and mid_flow >= 5:
+        score = 8 if mid_flow >= 6 else 7
+        if long_flow >= 6:
+            score += 1
+        return "多头主动建仓", min(score, 10), "价涨/OI涨/主动买盘强/中线资金不弱"
+    if price < 0 and oi > 0 and taker_weak and funding <= 0.03 and mid_flow <= 6:
+        return "空头主动建仓", 8, "价跌/OI涨/主动买盘弱/中线资金不强"
+    if price > 0 and oi > 0 and (funding_hot or basis_positive) and long_biased and taker_weak:
+        return "高位多头拥挤", 8 if high_pos else 7, "价涨增仓/Funding或正基差偏热/多空偏多/主买转弱"
+    if price < 0 and oi > 0 and (funding_extreme_negative or basis_negative) and short_biased:
+        return "低位空头拥挤", 8 if low_pos else 7, "价跌增仓/负费率或负基差/多空偏空"
+    if price > 0 and oi < 0:
+        return "空头回补/逼空", 7, "价涨/OI下降"
+    if price < 0 and oi < 0:
+        label = "多头止损/踩踏" if price <= -4 else "仓位退出/风险释放"
+        return label, 7 if price <= -4 else 6, "价跌/OI下降"
+    if oi > 0 and price > 0:
+        reasons.append("增仓上涨")
+    if flow_label != "资金分歧":
+        reasons.append(flow_label)
+    return "资金分歧/震荡", 5, "；".join(reasons) or "方向证据不足"
+
+
+def squeeze_state(snapshot: MarketSnapshot) -> tuple[str, int, str]:
+    funding = snapshot.funding_rate_percent or 0.0
+    oi = snapshot.oi_change_percent
+    price = snapshot.price_change_percent
+    taker = snapshot.taker_buy_sell_ratio
+    basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    long_biased = snapshot.global_long_short_ratio is not None and snapshot.global_long_short_ratio >= 1.4
+    short_biased = snapshot.global_long_short_ratio is not None and snapshot.global_long_short_ratio <= 0.8
+    taker_turning_strong = taker is not None and taker >= 1.08
+    taker_weak = taker is not None and taker <= 0.95
+    liq_label = liquidation_risk_label(snapshot)
+    short_liq = "空头强平" in liq_label
+    long_liq = "多头强平" in liq_label
+    wash = "双向" in liq_label or "洗盘" in liq_label
+    negative_basis = basis_pct is not None and basis_pct < 0 and basis_label != "正常"
+    positive_basis = basis_pct is not None and basis_pct > 0 and basis_label != "正常"
+
+    if wash and (oi >= 5 or abs(price) >= 5):
+        return "双向挤压", 8, "双向强平/剧烈波动/OI扩张"
+    if funding <= 0 and oi > 0 and (short_biased or taker_turning_strong) and price >= -0.5:
+        score = 6 + int(funding <= -0.05) + int(short_liq) + int(negative_basis)
+        return "空头挤压", min(score, 10), "负费率/OI增加/空头偏拥挤或主买转强/价格抗跌"
+    if funding >= 0.03 and oi >= 0 and long_biased and (taker_weak or price < 0):
+        score = 6 + int(funding >= 0.08) + int(long_liq) + int(positive_basis)
+        return "多头挤压", min(score, 10), "正费率/OI高位/多头偏拥挤/主买弱或价格转跌"
+    return "无明显挤压", 3, "挤压条件不足"
+
+
+def spot_absorption_state(snapshot: MarketSnapshot, signal: Signal | None = None) -> tuple[str, int, str]:
+    spot_text = cached_spot_alpha_confirmation(snapshot.symbol) or spot_alpha_confirmation(snapshot.symbol)
+    if "无标准现货/高流动性DEX数据" in spot_text:
+        return "数据不足", 5, "缺标准现货/高流动性DEX数据"
+    text = str(spot_text or "")
+    spot_score, spot_label, spot_reason = spot_onchain_score_from_text(snapshot, signal, text)
+    div_label, div_score, _div_reason = contract_spot_divergence_from_text(snapshot, signal, text)
+    basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    pos_label, _pos_score, _pos_reason = position_behavior(snapshot, signal)
+    high_or_crowded = (
+        (snapshot.price_position_24h is not None and snapshot.price_position_24h >= 75)
+        or pos_label in ("高位多头拥挤", "双向加杠杆")
+        or (basis_pct is not None and basis_pct > 0 and basis_label in ("明显溢价", "极端溢价"))
+        or (snapshot.funding_rate_percent is not None and snapshot.funding_rate_percent >= 0.05)
+    )
+    dex_1h_change = dex_period_change(text, "1h")
+    dex_24h_change = dex_period_change(text, "24h")
+    dex_1h = dex_period_state(text, "1h")
+    spot_1h = spot_period_state(text, "1h")
+
+    if dex_24h_change is not None and dex_24h_change >= 15 and dex_1h_change is not None and dex_1h_change <= -1:
+        return "链上出货", 3, "DEX 24h大涨但1h转弱"
+    if spot_score >= 7:
+        label = "链上承接" if "链上DEX" in text else "现货承接"
+        return label, min(10, spot_score), spot_reason
+    if spot_score <= 3 and high_or_crowded:
+        label = "链上出货" if "链上DEX" in text else "现货出货"
+        return label, max(1, spot_score), f"高位/拥挤叠加现货弱；{spot_reason}"
+    if snapshot.price_change_percent > 0 and snapshot.oi_change_percent > 5 and spot_score <= 5 and div_score >= 3:
+        return "现货未跟", 5, f"合约强但现货确认一般；{div_label}"
+    if spot_1h == "偏弱" or dex_1h == "偏弱":
+        return "承接不明", 4, spot_reason
+    return "承接不明", 5 if spot_label == "中性" else spot_score, spot_reason
+
+
+def market_intent(snapshot: MarketSnapshot, signal: Signal | None = None) -> tuple[str, int, str]:
+    pos_label, pos_score, _pos_reason = position_behavior(snapshot, signal)
+    squeeze_label, squeeze_score, _squeeze_reason = squeeze_state(snapshot)
+    spot_label, spot_score, _spot_reason = spot_absorption_state(snapshot, signal)
+    basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    short_flow, mid_flow, long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    high_pos = snapshot.price_position_24h is not None and snapshot.price_position_24h >= 75
+    low_pos = snapshot.price_position_24h is not None and snapshot.price_position_24h <= 30
+    extreme_basis = "极端" in basis_label
+
+    if pos_label == "多头主动建仓" and mid_flow >= 5 and spot_label in ("现货承接", "链上承接"):
+        return "真启动观察", min(10, max(pos_score, spot_score, 7)), "主力建仓/资金支持/现货不弱"
+    if pos_label == "多头主动建仓" and spot_label in ("现货未跟", "数据不足", "承接不明"):
+        return "合约先行观察", min(8, pos_score), "合约主动建仓/现货确认未充分"
+    if squeeze_label == "空头挤压":
+        return "短线逼空", min(10, squeeze_score), "空头挤压结构"
+    if pos_label == "高位多头拥挤" or spot_label in ("现货出货", "链上出货"):
+        return "高位出货", 8 if high_pos or spot_score <= 3 else 7, "高位拥挤/现货转弱"
+    if squeeze_label == "多头挤压":
+        return "多杀多风险", min(10, squeeze_score), "多头拥挤挤压"
+    if pos_label == "仓位退出/风险释放":
+        return "风险释放", 6, "价跌/OI降"
+    if pos_label == "多头止损/踩踏":
+        return "洗盘回踩", 6, "下跌去杠杆"
+    if pos_label == "空头主动建仓" and mid_flow <= 5 and not low_pos:
+        return "下跌中继", 7, "空头增仓/资金偏弱"
+    if pos_label == "双向加杠杆" or squeeze_label == "双向挤压" or extreme_basis:
+        return "震荡分歧", 6, "双向杠杆或极端基差"
+    return "震荡分歧", max(4, min(6, (short_flow + mid_flow + long_flow) // 3)), flow_label
+
+
+def conviction_label(score: int) -> str:
+    if score >= 80:
+        return "高"
+    if score >= 65:
+        return "中高"
+    if score >= 50:
+        return "中低"
+    return "低"
+
+
+def conviction_score(snapshot: MarketSnapshot, signal: Signal | None = None) -> tuple[int, str, str]:
+    pos_label, pos_score, _pos_reason = position_behavior(snapshot, signal)
+    short_flow, mid_flow, long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    spot_label, spot_score, _spot_reason = spot_absorption_state(snapshot, signal)
+    squeeze_label, squeeze_score, _squeeze_reason = squeeze_state(snapshot)
+    intent_label, intent_score, _intent_reason = market_intent(snapshot, signal)
+    basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    entry_score, entry_label, _entry_reason = entry_timing_score(snapshot, signal) if signal else (5, "观察", "中性信号")
+    trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+
+    position_points = pos_score / 10 * 25
+    flow_points = (short_flow * 0.25 + mid_flow * 0.45 + long_flow * 0.30) / 10 * 20
+    if spot_label in ("现货承接", "链上承接"):
+        spot_points = spot_score / 10 * 15
+    elif spot_label in ("现货出货", "链上出货"):
+        spot_points = 3 if intent_label in ("高位出货", "多杀多风险") else 6
+    elif spot_label == "现货未跟":
+        spot_points = 7
+    else:
+        spot_points = 7.5
+    squeeze_points = squeeze_score / 10 * 15
+    if squeeze_label == "无明显挤压":
+        squeeze_points = 6
+    stage_points = entry_score / 10 * 15
+    risk_points = max(0, 10 - trap_score)
+
+    score = position_points + flow_points + spot_points + squeeze_points + stage_points + risk_points
+    reasons: list[str] = []
+
+    def adjust(points: float, reason: str) -> None:
+        nonlocal score
+        score += points
+        reasons.append(reason)
+
+    if pos_label == "多头主动建仓" and mid_flow >= 5 and snapshot.funding_rate_percent is not None and snapshot.funding_rate_percent <= 0.05:
+        adjust(6, "主力建仓")
+    if flow_label in ("多周期共振流入", "中长线吸筹"):
+        adjust(5, "中线资金支持")
+    if spot_label in ("现货承接", "链上承接"):
+        adjust(5, "现货承接")
+    if intent_label == "合约先行观察":
+        score = min(score, 78)
+        reasons.append("合约先行")
+    if snapshot.price_change_percent > 0 and snapshot.oi_change_percent < 0:
+        adjust(-12, "空头回补非启动")
+    if snapshot.price_change_percent < 0 and snapshot.oi_change_percent < 0:
+        adjust(-8, "风险释放不追空")
+    if intent_label in ("高位出货", "多杀多风险", "下跌中继") or pos_label == "双向加杠杆":
+        adjust(-10, intent_label)
+    if "极端" in basis_label:
+        adjust(-8, "极端基差")
+    if snapshot.price_position_24h is not None and snapshot.price_position_24h >= 85 and snapshot.price_change_percent > 5:
+        adjust(-8, "高位追涨")
+    if intent_label == "短线逼空" and spot_label in ("现货承接", "链上承接") and basis_pct is not None and basis_pct < 0:
+        adjust(5, "逼空反弹")
+    if pos_label == "高位多头拥挤" and spot_label in ("现货出货", "链上出货"):
+        adjust(8, "风控确认")
+
+    final_score = clamp_int(score, 0, 100)
+    if not reasons:
+        reasons = [pos_label, flow_label, intent_label]
+    reason = "/".join(dict.fromkeys(reasons[:5]))
+    return final_score, conviction_label(final_score), reason
+
+
+def format_conviction_model_lines(snapshot: MarketSnapshot, signal: Signal | None = None) -> list[str]:
+    basis_pct, basis_label, basis_reason = basis_state(snapshot)
+    short_flow, mid_flow, long_flow, flow_label, flow_reason = flow_horizon_scores(snapshot)
+    pos_label, pos_score, pos_reason = position_behavior(snapshot, signal)
+    squeeze_label, squeeze_score, squeeze_reason = squeeze_state(snapshot)
+    spot_label, spot_score, spot_reason = spot_absorption_state(snapshot, signal)
+    intent_label, intent_score, intent_reason = market_intent(snapshot, signal)
+    conv_score, conv_label, conv_reason = conviction_score(snapshot, signal)
+    basis_text = "n/a" if basis_pct is None else f"{basis_pct:+.2f}%"
+    return [
+        f"把握性: {conv_score}/100 {conv_label} - {conv_reason}",
+        f"主力行为: {pos_label} {pos_score}/10 - {pos_reason}",
+        f"资金周期: 短{short_flow}/10 中{mid_flow}/10 长{long_flow}/10 - {flow_label} ({flow_reason})",
+        f"挤压: {squeeze_label} {squeeze_score}/10 - {squeeze_reason}",
+        f"现货/链上: {spot_label} {spot_score}/10 - {spot_reason}",
+        f"基差: {basis_text} {basis_label} - {basis_reason}",
+        f"意图: {intent_label} {intent_score}/10 - {intent_reason}",
+    ]
+
+
+def format_conviction_push_lines(snapshot: MarketSnapshot, signal: Signal | None = None) -> list[str]:
+    _basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    short_flow, mid_flow, long_flow, _flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    pos_label, _pos_score, _pos_reason = position_behavior(snapshot, signal)
+    intent_label, _intent_score, _intent_reason = market_intent(snapshot, signal)
+    conv_score, conv_label, _conv_reason = conviction_score(snapshot, signal)
+    return [
+        f"把握性: {conv_score}/100 {conv_label} | 意图: {intent_label}",
+        f"主力: {pos_label} | 资金: 短{short_flow} 中{mid_flow} 长{long_flow} | 基差: {basis_label}",
+    ]
+
+
+def flow_score_icon(score: int) -> str:
+    if score >= 7:
+        return "🟢"
+    if score >= 4:
+        return "🟡"
+    return "🔴"
+
+
+def flow_value_icon(value: float | None) -> str:
+    if value is None:
+        return ""
+    if value > 0:
+        return " 🟢"
+    if value < 0:
+        return " 🔴"
+    return " ⚪"
+
+
+def flow_value_text(snapshot: MarketSnapshot, period: str) -> str:
+    value = snapshot.net_flow_usd.get(period)
+    return f"{period} {format_usd(value)}{flow_value_icon(value)}"
+
+
+def trader_action_from_intent(intent_label: str, conviction: int) -> str:
+    action, _reason = action_from_intent_conviction(intent_label, conviction)
+    return action
+
+
+def action_from_intent_conviction(intent_label: str, conviction: int) -> tuple[str, str]:
+    return action_from_trade_context(intent_label, conviction)
+
+
+def action_from_trade_context(
+    intent_label: str,
+    conviction: int,
+    direction: str | None = None,
+    position_label: str | None = None,
+) -> tuple[str, str]:
+    if conviction >= 80 and intent_label == "真启动观察":
+        return "强关注做多", "高把握真启动"
+    if conviction >= 65 and intent_label in ("真启动观察", "合约先行观察"):
+        return "观察做多，等确认", "启动观察但需确认"
+    if conviction >= 65 and direction == "看多" and position_label == "多头主动建仓":
+        return "观察做多，等确认", "多头主动建仓但需确认"
+    if intent_label == "高位出货":
+        return "减仓/避险，不追多", "高位出货风险"
+    if intent_label == "多杀多风险":
+        return "风控优先，防下杀", "多头挤压风险"
+    if intent_label == "短线逼空":
+        return "不追，等回踩", "逼空后追价风险高"
+    if intent_label == "洗盘回踩":
+        return "观察回踩承接", "等待承接确认"
+    if intent_label == "下跌中继":
+        return "不抄底", "下跌延续风险"
+    if intent_label == "风险释放":
+        return "观察，不追空", "去杠杆后不追空"
+    if conviction < 50:
+        return "观望，低把握", "把握性不足"
+    return "观望，等确认", "确认不足"
+
+
+def action_label(snapshot: MarketSnapshot, signal: Signal | None = None) -> tuple[str, str]:
+    conviction, _conv_label, _conv_reason = conviction_score(snapshot, signal)
+    intent_label, _intent_score, _intent_reason = market_intent(snapshot, signal)
+    position_label, _position_score, _position_reason = position_behavior(snapshot, signal)
+    direction = signal_direction_label(signal.kind) if signal else None
+    return action_from_trade_context(intent_label, conviction, direction, position_label)
+
+
+def flow_trend_short_label(label: str) -> str:
+    mapping = {
+        "多周期共振流入": "多周期流入",
+        "短强中弱": "短强中弱",
+        "短弱中强": "短弱中强",
+        "中长线吸筹": "中长吸筹",
+        "中长线派发": "中长派发",
+        "全周期流出": "全周期流出",
+        "资金分歧": "资金分歧",
+    }
+    return mapping.get(label, label)
+
+
+def flow_trader_key_reasons(
+    snapshot: MarketSnapshot,
+    signal: Signal | None,
+    pos_label: str,
+    squeeze_label: str,
+    spot_label: str,
+    intent_label: str,
+    flow_label: str,
+    basis_label: str,
+) -> list[str]:
+    reasons: list[str] = []
+    funding = snapshot.funding_rate_percent
+    if funding is not None and funding <= -0.08 and snapshot.oi_change_percent < 0:
+        reasons.append("Funding极端负，但 OI下降，偏风险释放")
+    elif funding is not None and funding <= -0.08:
+        reasons.append("Funding极端负，若价格抗跌需防空头挤压")
+    elif funding is not None and funding >= 0.08:
+        reasons.append("Funding极端正，追多性价比下降")
+
+    if spot_label in ("现货未跟", "数据不足", "承接不明"):
+        reasons.append("现货/链上未充分确认，合约先行不确认")
+    elif spot_label in ("现货出货", "链上出货"):
+        reasons.append("现货/链上转弱，存在出货风险")
+    elif spot_label in ("现货承接", "链上承接"):
+        reasons.append("现货/链上承接，给合约方向加分")
+
+    short_score, mid_score, long_score, _label, _reason = flow_horizon_scores(snapshot)
+    if mid_score <= 4 and long_score <= 5:
+        reasons.append("中长资金仍弱，不追多")
+    elif mid_score >= 7:
+        reasons.append("中线资金支持，回踩更值得跟踪")
+
+    if pos_label == "空头回补/逼空":
+        reasons.append("价涨但 OI下降，更像回补而非健康启动")
+    elif pos_label == "仓位退出/风险释放":
+        reasons.append("价跌且 OI下降，偏去杠杆风险释放")
+    elif pos_label in ("多头主动建仓", "空头主动建仓"):
+        reasons.append(pos_label)
+
+    if "极端" in basis_label:
+        reasons.append("基差极端，避免追价")
+    elif squeeze_label != "无明显挤压":
+        reasons.append(squeeze_label)
+    if intent_label in ("高位出货", "多杀多风险", "下跌中继"):
+        reasons.append(intent_label)
+    if not reasons:
+        reasons.append(flow_label)
+    return list(dict.fromkeys(reasons))[:4]
+
+
+def realtime_trader_reason_labels(snapshot: MarketSnapshot, signal: Signal | None = None) -> str:
+    pos_label, _pos_score, _pos_reason = position_behavior(snapshot, signal)
+    squeeze_label, _squeeze_score, _squeeze_reason = squeeze_state(snapshot)
+    spot_label, _spot_score, _spot_reason = spot_absorption_state(snapshot, signal)
+    intent_label, _intent_score, _intent_reason = market_intent(snapshot, signal)
+    _basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    short_score, mid_score, long_score, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    labels: list[str] = []
+
+    if snapshot.price_position_24h is not None and snapshot.price_position_24h >= 75 and snapshot.oi_change_percent > 0:
+        labels.append("高位增仓")
+    if snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio < 1:
+        labels.append("主买转弱")
+    if spot_label in ("现货出货", "链上出货"):
+        labels.append("现货转弱")
+    elif spot_label in ("现货未跟", "承接不明", "数据不足"):
+        labels.append("现货未确认")
+    elif spot_label in ("现货承接", "链上承接"):
+        labels.append("现货承接")
+    if pos_label in ("高位多头拥挤", "低位空头拥挤", "多头主动建仓", "空头主动建仓", "空头回补/逼空"):
+        labels.append(pos_label)
+    if squeeze_label != "无明显挤压":
+        labels.append(squeeze_label)
+    if mid_score <= 4 and long_score <= 5:
+        labels.append("中长资金弱")
+    elif flow_label != "资金分歧" or short_score >= 7:
+        labels.append(flow_trend_short_label(flow_label))
+    if "极端" in basis_label:
+        labels.append("基差极端")
+    if intent_label in ("高位出货", "多杀多风险", "下跌中继", "风险释放"):
+        labels.append(intent_label)
+    if not labels:
+        labels.append(flow_label)
+    return " / ".join(dict.fromkeys(labels[:4]))
+
+
+def compact_realtime_trade_plan(signal: Signal) -> str:
+    plan = compact_trade_plan(signal, 90)
+    if "暂无交易计划" in plan:
+        return ""
+    if "\n" in plan or "...已精简" in plan:
+        return ""
+    if not any(key in plan for key in ("入场", "止损", "TP1")):
+        return ""
+    if len(plan) > 90:
+        return ""
+    return plan
+
+
+def format_flow_trader_view(snapshot: MarketSnapshot, signal: Signal | None = None) -> str:
+    basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    short_score, mid_score, long_score, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    pos_label, pos_score, _pos_reason = position_behavior(snapshot, signal)
+    squeeze_label, squeeze_score, _squeeze_reason = squeeze_state(snapshot)
+    spot_label, spot_score, _spot_reason = spot_absorption_state(snapshot, signal)
+    intent_label, intent_score, _intent_reason = market_intent(snapshot, signal)
+    conviction, conv_label, _conv_reason = conviction_score(snapshot, signal)
+    action = trader_action_from_intent(intent_label, conviction)
+    basis_text = "n/a" if basis_pct is None else f"{basis_pct:+.2f}%"
+    reasons = flow_trader_key_reasons(
+        snapshot,
+        signal,
+        pos_label,
+        squeeze_label,
+        spot_label,
+        intent_label,
+        flow_label,
+        basis_label,
+    )
+    lines = [
+        f"🧭 {snapshot.symbol} 交易员视图",
+        f"结论: {intent_label} | 把握 {conviction}/100 {conv_label}",
+        f"动作: {action}",
+        "",
+        f"主力行为: {pos_label} {pos_score}/10",
+        f"挤压状态: {squeeze_label} {squeeze_score}/10",
+        f"市场意图: {intent_label} {intent_score}/10",
+        f"基差: {basis_text} {basis_label}",
+        f"现货/链上: {spot_label} {spot_score}/10",
+        "",
+        "资金周期:",
+        f"短线 5m/15m/1h: {flow_score_icon(short_score)} {short_score}/10",
+        f"中线 4h/12h/24h: {flow_score_icon(mid_score)} {mid_score}/10",
+        f"长线 72h/144h: {flow_score_icon(long_score)} {long_score}/10",
+        f"趋势: {flow_trend_short_label(flow_label)}",
+        "",
+        "主力净流:",
+        " | ".join(flow_value_text(snapshot, period) for period in ("5m", "15m", "1h")),
+        " | ".join(flow_value_text(snapshot, period) for period in ("4h", "12h", "24h")),
+        " | ".join(flow_value_text(snapshot, period) for period in ("72h", "144h")),
+        "",
+        "合约结构:",
+        (
+            f"价格 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}% | "
+            f"主买 {format_optional_value(snapshot.taker_buy_sell_ratio)} | "
+            f"费率 {format_optional_value(snapshot.funding_rate_percent)}%"
+        ),
+        (
+            f"多空 {format_optional_value(snapshot.global_long_short_ratio)} | "
+            f"大户持仓 {format_optional_value(snapshot.top_position_ratio)} | "
+            f"大户账户 {format_optional_value(snapshot.top_account_ratio)}"
+        ),
+        "",
+        "关键依据:",
+    ]
+    lines.extend(f"- {reason}" for reason in reasons)
+    return telegram_text("\n".join(lines))
+
+
 
 
 def signal_trade_levels(signal: Signal) -> str:
@@ -5247,6 +6098,25 @@ def capped_signal_priority(
     strict_cap = strict_quality_priority_cap(signal, snapshot, quality_score, trap_score, entry_score, entry_label)
     max_priority = min_priority_cap(max_priority, strict_cap, order, reverse)
 
+    conviction, _conviction_label, _conviction_reason = conviction_score(snapshot, signal)
+    intent_label, _intent_score, _intent_reason = market_intent(snapshot, signal)
+    if conviction >= 80:
+        conviction_cap = "S"
+    elif conviction >= 65:
+        conviction_cap = "B"
+    elif conviction >= 50:
+        conviction_cap = "C"
+    else:
+        conviction_cap = "D"
+
+    if signal.kind in ("top_exhaustion", "top_risk") and intent_label in ("高位出货", "多杀多风险") and conviction >= 65:
+        conviction_cap = "A"
+    if signal.kind in ("discovery", "hot_breakout") and intent_label not in ("真启动观察", "合约先行观察"):
+        conviction_cap = min_priority_cap(conviction_cap, "C", order, reverse)
+    if signal.kind == "bottom_reversal" and intent_label == "下跌中继":
+        conviction_cap = "D"
+    max_priority = min_priority_cap(max_priority, conviction_cap, order, reverse)
+
     return max_priority
 
 
@@ -5508,56 +6378,205 @@ def best_pending_signal_index(pending: PendingTelegramSignalMerge) -> int:
     return best_index
 
 
-def format_merged_signal_for_telegram(
+def progress_bar(score: float, max_score: int = 10, width: int = 10) -> str:
+    if max_score <= 0 or width <= 0:
+        return ""
+    filled = max(0, min(width, int(round(float(score) / max_score * width))))
+    return "█" * filled + "░" * (width - filled)
+
+
+def trader_panel_title(signal: Signal, intent_label: str, conviction: int) -> str:
+    risk_intents = {"高位出货", "多杀多风险", "逃顶", "减仓优先"}
+    if signal.kind in ("top_exhaustion", "distribution") and conviction >= 80 and intent_label in risk_intents:
+        return "🔴【紧急告警】🔴关注顶部"
+    if intent_label in risk_intents or signal.kind in ("top_risk", "top_exhaustion", "distribution"):
+        return "🔴【高把握】🔴关注风险"
+    return "🟢【高把握】🟢关注做多"
+
+
+def format_panel_percent(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    arrow = "▲" if value > 0 else "▼" if value < 0 else "·"
+    return f"{arrow}{abs(value):.1f}%"
+
+
+def panel_price_change(snapshot: MarketSnapshot, period: str) -> float | None:
+    changes = snapshot.price_change_periods or {}
+    if period in changes:
+        return changes[period]
+    return None
+
+
+def panel_oi_state(snapshot: MarketSnapshot, period: str) -> str:
+    if period in ("15m", "1h"):
+        return format_panel_percent(snapshot.oi_change_percent if period == "1h" else snapshot.confirm_oi_change_percent)
+    short_score, mid_score, _long_score, _label, _reason = flow_horizon_scores(snapshot)
+    if period == "4h":
+        if mid_score >= 7:
+            return "持续建仓"
+        if mid_score <= 3:
+            return "持续减仓"
+    return "n/a"
+
+
+def flow_panel_value(snapshot: MarketSnapshot, period: str) -> str:
+    value = snapshot.net_flow_usd.get(period)
+    if value is None:
+        return f"{period} n/a"
+    threshold = max((snapshot.quote_volume_24h or 0) * 0.00001, 1000.0)
+    if abs(value) < threshold:
+        icon = "⚪"
+    elif value > 0:
+        icon = "🟢"
+    else:
+        icon = "🔴"
+    return f"{period} {icon} {format_usd(value)}"
+
+
+def flow_strength_word(score: int) -> str:
+    if score >= 7:
+        return "强"
+    if score <= 3:
+        return "弱"
+    return "中"
+
+
+def trader_panel_flow_trend(snapshot: MarketSnapshot) -> str:
+    short_score, mid_score, long_score, _label, _reason = flow_horizon_scores(snapshot)
+    return f"短{flow_strength_word(short_score)} / 中{flow_strength_word(mid_score)} / 长{flow_strength_word(long_score)}"
+
+
+def normalize_trigger_phrase(text: str) -> str:
+    phrase = str(text or "").strip()
+    phrase = re.sub(r"^[+\-]?\d+\s*", "", phrase)
+    phrase = phrase.replace("Funding", "费率").replace("funding", "费率").replace("OI", "持仓")
+    replacements = {
+        "主力建仓": "主力建仓",
+        "中线资金支持": "中线资金支持",
+        "现货承接": "现货承接",
+        "合约先行": "合约先行",
+        "空头回补非启动": "回补非启动",
+        "风险释放不追空": "风险释放",
+        "高位出货": "高位出货",
+        "多杀多风险": "多杀多风险",
+        "下跌中继": "下跌中继",
+        "极端基差": "基差极端",
+        "高位追涨": "高位追涨",
+        "风控确认": "风控确认",
+        "价涨/OI涨": "价涨持仓涨",
+        "价涨/OI下降": "价涨减仓",
+        "价跌/OI下降": "价跌减仓",
+        "主买转弱": "主买转弱",
+        "费率偏热": "费率偏热",
+    }
+    for key, value in replacements.items():
+        if key in phrase:
+            return value
+    phrase = re.split(r"[；,/，|]", phrase)[0].strip()
+    phrase = re.sub(r"[A-Za-z_]+", "", phrase).strip()
+    return truncate_text(phrase, 14) if phrase else ""
+
+
+def trader_panel_triggers(snapshot: MarketSnapshot, signal: Signal, merged_kinds: list[str]) -> list[str]:
+    conv_score, _conv_label, conv_reason = conviction_score(snapshot, signal)
+    intent_label, _intent_score, intent_reason = market_intent(snapshot, signal)
+    pos_label, _pos_score, pos_reason = position_behavior(snapshot, signal)
+    squeeze_label, _squeeze_score, squeeze_reason = squeeze_state(snapshot)
+    _basis_pct, _basis_label, _basis_reason = basis_state(snapshot)
+    triggers: list[str] = []
+    if len(merged_kinds) > 1:
+        triggers.append(f"信号: {' + '.join(merged_kinds)}")
+    if snapshot.price_position_24h is not None and snapshot.price_position_24h >= 75 and snapshot.oi_change_percent > 0:
+        triggers.append("高位增仓")
+    if snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio < 1:
+        triggers.append("主买转弱")
+    if snapshot.funding_rate_percent is not None and snapshot.funding_rate_percent >= 0.03:
+        triggers.append("费率偏热")
+    for source in (conv_reason, intent_reason, pos_reason, squeeze_reason, intent_label, pos_label, squeeze_label):
+        for part in re.split(r"[；,/，|]", str(source or "")):
+            phrase = normalize_trigger_phrase(part)
+            if phrase:
+                triggers.append(phrase)
+    return list(dict.fromkeys(triggers))[:5]
+
+
+def format_trader_panel(
     pending: PendingTelegramSignalMerge,
     liquidation_text: str | None = None,
     coinglass_text: str | None = None,
 ) -> str:
     best_index = best_pending_signal_index(pending)
     signal = pending.signals[best_index]
-    priority = best_priority_label(pending.priorities)
-    quality_score = max(pending.quality_scores) if pending.quality_scores else 0
-    quality_reason = ";".join(pending.quality_reasons)
-    icon = direction_icon(pending.direction)
+    if signal.snapshot is None:
+        return telegram_text(f"{pending.symbol} n/a", 1600)
 
+    snapshot = signal.snapshot
     kinds: list[str] = []
     for item in pending.signals:
         label = signal_kind_label(item.kind)
         if label not in kinds:
             kinds.append(label)
-
-    if signal.snapshot is None:
-        return telegram_text(
-            "\n".join(
-                [
-                    f"{icon} {priority_grade_label(priority)} {pending.direction} {pending.symbol}",
-                    f"信号: {' + '.join(kinds) or signal_kind_label(signal.kind)}",
-                    f"质量 q{quality_score} | 信号分 {signal.score}",
-                    f"原因: {format_quality_reason_short(quality_reason or signal.message)}",
-                ]
-            )
-        )
-
-    snapshot = signal.snapshot
-    strength_score = max(signal_strength_score(item) for item in pending.signals)
-    trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
-    _entry_score, entry_label, _entry_reason = entry_timing_score(snapshot, signal)
-    flow_score = flow_alignment_score(snapshot)
-    long_flow_score = long_flow_alignment_score(snapshot)
-    reason = format_quality_reason_short(quality_reason or signal.message)
+    basis_pct, _basis_label, _basis_reason = basis_state(snapshot)
+    intent_label, _intent_score, _intent_reason = market_intent(snapshot, signal)
+    conviction, _conv_label, _conv_reason = conviction_score(snapshot, signal)
+    short_score, mid_score, long_score, _flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    action, _action_reason = action_label(snapshot, signal)
+    score_10 = max(0, min(10, int(round(conviction / 10))))
+    title = trader_panel_title(signal, intent_label, conviction)
+    symbol_text = snapshot.symbol.replace("USDT", "/USDT")
+    account_text = format_optional_value(snapshot.top_account_ratio)
+    position_text = format_optional_value(snapshot.top_position_ratio)
+    basis_text = "n/a" if basis_pct is None else f"{basis_pct:+.2f}%"
+    triggers = trader_panel_triggers(snapshot, signal, kinds)
 
     lines = [
-        f"{icon} {priority_badge(priority)} {pending.direction} {pending.symbol}",
-        f"信号: {' + '.join(kinds)}",
-        f"质量 q{quality_score} | 信号分 {max(item.score for item in pending.signals)} | 强度 {strength_score:.1f} | {trap_badge(trap_score)}",
-        f"价格 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}% | 费率 {format_realtime_funding(snapshot.funding_rate_percent)}",
-        f"阶段: {entry_label}",
-        f"资金: 短 {flow_score}/10 | 长 {long_flow_score}/9",
-        f"确认: {compact_confirmation_label(liquidation_text, coinglass_text, pending.symbol, snapshot, signal)}",
-        f"计划: {compact_trade_plan(signal, 220)}",
-        f"原因: {reason}",
+        title,
+        "━━━━━━━━━━━━",
+        f"◆ {symbol_text}",
+        f"评分 {progress_bar(score_10)} {score_10}/10 | 把握 {conviction}/100",
+        "━━━━━━━━━━━━",
+        f"💰 价格 ${snapshot.close_price:.8g}",
+        (
+            f"15m {format_panel_percent(panel_price_change(snapshot, '15m'))} | "
+            f"1h {format_panel_percent(panel_price_change(snapshot, '1h'))} | "
+            f"4h {format_panel_percent(panel_price_change(snapshot, '4h'))}"
+        ),
+        (
+            f"📦 OI 15m {panel_oi_state(snapshot, '15m')} | "
+            f"1h {panel_oi_state(snapshot, '1h')} | "
+            f"4h {panel_oi_state(snapshot, '4h')}"
+        ),
+        f"💸 费率 {format_realtime_funding(snapshot.funding_rate_percent)} | 基差 {basis_text}",
+        "━━━━━━━━━━━━",
+        "👥 多空",
+        f"账户 空{account_text} | 持仓 多{position_text}",
+        "━━━━━━━━━━━━",
+        "✅ 主力净流",
+        " | ".join(flow_panel_value(snapshot, period) for period in ("5m", "15m", "1h")),
+        " | ".join(flow_panel_value(snapshot, period) for period in ("4h", "12h", "24h")),
+        " | ".join(flow_panel_value(snapshot, period) for period in ("72h", "144h")),
+        f"趋势: {trader_panel_flow_trend(snapshot)}",
+        "━━━━━━━━━━━━",
+        "🎯 触发",
     ]
-    return telegram_text("\n".join(lines))
+    lines.extend(f"- {trigger}" for trigger in triggers)
+    lines.extend(
+        [
+            "━━━━━━━━━━━━",
+            f"💡 建议: {action}",
+            f"⏰ {dt.datetime.now().strftime('%H:%M:%S')}",
+        ]
+    )
+    return telegram_text("\n".join(lines), 1600)
+
+
+def format_merged_signal_for_telegram(
+    pending: PendingTelegramSignalMerge,
+    liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
+) -> str:
+    return format_trader_panel(pending, liquidation_text, coinglass_text)
 
 
 def why_symbol_conclusion(rows: list[dict[str, str]]) -> str:
@@ -6782,6 +7801,7 @@ def telegram_help_text() -> str:
     return (
         "单币:\n"
         " /check SYMBOL - 单币诊断\n"
+        " /flow SYMBOL - 交易员主力资金视图\n"
         " /ask SYMBOL - AI简洁复核\n"
         " /ask SYMBOL full - AI完整上下文\n"
         " /liq [SYMBOL] - 强平流状态/单币强平\n\n"
@@ -6987,6 +8007,7 @@ def format_symbol_diagnosis(
     main_score_part = f"{main_score_text}\n" if main_score_text else ""
     signal = signals[0] if signals else None
     spot_text = spot_alpha_confirmation(snapshot.symbol)
+    conviction_part = "\n".join(format_conviction_model_lines(snapshot, signal))
     rule_lines = "\n".join(format_rule_optimization_lines(snapshot, signal, spot_text, coinglass_text))
     return (
         f"{snapshot.symbol}\n"
@@ -7001,6 +8022,7 @@ def format_symbol_diagnosis(
         f"资金流: {format_flow_summary(snapshot)}\n"
         f"资金流共振: {flow_alignment_score(snapshot)}/10 ({flow_alignment_note(flow_alignment_score(snapshot))})\n"
         f"长周期资金共振: {long_flow_alignment_score(snapshot)}/9 ({long_flow_alignment_note(long_flow_alignment_score(snapshot))})\n"
+        f"{conviction_part}\n"
         f"现货/链上确认: {spot_text}\n"
         f"{rule_lines}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
@@ -7032,6 +8054,7 @@ def format_ask_context(
     flow_score = flow_alignment_score(snapshot)
     long_flow_score = long_flow_alignment_score(snapshot)
     spot_text = spot_alpha_confirmation(snapshot.symbol)
+    conviction_part = "\n".join(format_conviction_model_lines(snapshot, signals[0] if signals else None))
     trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signals[0] if signals else None)
     entry_score, entry_label, entry_reason = entry_timing_score(snapshot, signals[0]) if signals else (5, "观察", "中性信号")
     rule_lines = "\n".join(format_rule_optimization_lines(snapshot, signals[0] if signals else None, spot_text, coinglass_text))
@@ -7060,6 +8083,7 @@ def format_ask_context(
         f"信号触发状态: {triggered_signal_state}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
+        f"{conviction_part}\n"
         f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
         f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"{rule_lines}\n"
@@ -7086,6 +8110,7 @@ def format_ask_context(
         f"24h: {format_usd(snapshot.net_flow_usd.get('24h'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('24h'))}\n"
         f"资金流共振: {flow_score}/10 ({flow_alignment_note(flow_score)})\n"
         f"长周期资金共振: {long_flow_score}/9 ({long_flow_alignment_note(long_flow_score)})\n\n"
+        f"{conviction_part}\n\n"
         f"现货/链上确认: {spot_text}\n"
         f"{rule_lines}\n"
         f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
@@ -7292,6 +8317,7 @@ def format_ask_core_data(
     main_score_part = f"{main_score_text}\n" if main_score_text else ""
     spot_text = spot_alpha_confirmation(snapshot.symbol)
     signal = signals[0] if signals else None
+    conviction_part = "\n".join(format_conviction_model_lines(snapshot, signal))
     trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
     entry_score, entry_label, entry_reason = entry_timing_score(snapshot, signal) if signal else (5, "观察", "中性信号")
     rule_lines = "\n".join(format_rule_optimization_lines(snapshot, signal, spot_text, coinglass_text))
@@ -7304,6 +8330,7 @@ def format_ask_core_data(
         f"OI {snapshot.oi_change_percent:+.2f}%; Funding {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})\n"
         f"评分: 短线 {short_term_score(snapshot)}/10; 中线 {mid_term_score(snapshot)}/10; "
         f"资金流共振 {flow_alignment_score(snapshot)}/10; 长周期资金共振 {long_flow_alignment_score(snapshot)}/9\n"
+        f"{conviction_part}\n"
         f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
         f"诱多/诱空风险: {trap_score}/10 {trap_label} - {trap_reason}\n"
         f"{rule_lines}\n"
@@ -7600,6 +8627,8 @@ def print_symbol_diagnosis(
     spot_text = spot_alpha_confirmation(snapshot.symbol)
     print(f"现货/链上确认: {spot_text}")
     signal = signals[0] if signals else None
+    for line in format_conviction_model_lines(snapshot, signal):
+        print(line)
     for line in format_rule_optimization_lines(snapshot, signal, spot_text, coinglass_text):
         print(line)
     print(f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})")
