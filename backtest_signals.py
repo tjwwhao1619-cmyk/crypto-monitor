@@ -34,6 +34,9 @@ TRAP_RISK_GROUPS = (
     ("8-10", "极高", 8, 10),
 )
 SIGNAL_PRIORITY_GROUPS = ("S", "A", "B", "C", "D")
+SPOT_ONCHAIN_GROUPS = ("弱", "中性", "强")
+CONTRACT_SPOT_DIVERGENCE_GROUPS = ("无背离", "轻微背离", "明显背离", "严重背离")
+MAJOR_FLOW_GROUPS = ("主力偏空", "主力分歧", "主力偏多", "数据不足")
 
 
 def parse_time(value):
@@ -109,6 +112,12 @@ def eval_signal(session, row):
     out["trap_risk_score"] = parse_int(row.get("trap_risk_score"))
     out["entry_timing_score"] = parse_int(row.get("entry_timing_score"))
     out["entry_timing_label"] = (row.get("entry_timing_label") or "").strip() or None
+    out["spot_onchain_score"] = parse_int(row.get("spot_onchain_score"))
+    out["spot_onchain_label"] = (row.get("spot_onchain_label") or "").strip() or None
+    out["contract_spot_divergence_score"] = parse_int(row.get("contract_spot_divergence_score"))
+    out["contract_spot_divergence_label"] = (row.get("contract_spot_divergence_label") or "").strip() or None
+    out["major_flow_score"] = parse_int(row.get("major_flow_score"))
+    out["major_flow_label"] = (row.get("major_flow_label") or "").strip() or None
     out["signal_priority"] = (row.get("signal_priority") or "").strip().upper() or None
     out["signal_quality_score"] = parse_int(row.get("signal_quality_score"))
     out["signal_quality_reason"] = row.get("signal_quality_reason") or ""
@@ -249,6 +258,18 @@ def flow_detail(x):
     trap_score = x.get("trap_risk_score")
     if trap_score is not None:
         parts.append(f"trap={trap_score}/10")
+    spot_label = x.get("spot_onchain_label")
+    spot_score = x.get("spot_onchain_score")
+    div_label = x.get("contract_spot_divergence_label")
+    div_score = x.get("contract_spot_divergence_score")
+    major_label = x.get("major_flow_label")
+    major_score = x.get("major_flow_score")
+    if spot_label and spot_score is not None:
+        parts.append(f"spot={spot_label}/{spot_score}")
+    if div_label and div_score is not None:
+        parts.append(f"div={div_label}/{div_score}")
+    if major_label and major_score is not None:
+        parts.append(f"major={major_label}/{major_score}")
     for name in ("12h", "24h"):
         flow = x.get(f"flow_{name}")
         ratio = x.get(f"flow_{name}_ratio")
@@ -424,6 +445,52 @@ def print_entry_timing_backtest(results):
                 f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
             )
     print("")
+
+
+def print_label_group_backtest(results, title, field, labels):
+    print(title)
+    for label in labels:
+        group_rows = [x for x in results if x.get(field) == label]
+        print(f"{label}: 样本={len(group_rows)}")
+        for h in ["15m", "1h", "4h", "12h", "24h"]:
+            vals = [x[h] for x in group_rows if x[h] is not None]
+            if not vals:
+                print(f"  {h}: 样本=0")
+                continue
+            wins = sum(v > 0 for v in vals)
+            print(
+                f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))} "
+                f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
+            )
+    print("")
+
+
+def print_spot_onchain_backtest(results):
+    print_label_group_backtest(
+        results,
+        "[SPOT ONCHAIN] 现货/链上确认分组回测",
+        "spot_onchain_label",
+        SPOT_ONCHAIN_GROUPS,
+    )
+
+
+def print_contract_spot_divergence_backtest(results):
+    print_label_group_backtest(
+        results,
+        "[CONTRACT SPOT DIVERGENCE] 合约现货背离分组回测",
+        "contract_spot_divergence_label",
+        CONTRACT_SPOT_DIVERGENCE_GROUPS,
+    )
+
+
+def print_major_flow_backtest(results):
+    print_label_group_backtest(
+        results,
+        "[MAJOR FLOW] 主力长周期趋势分组回测",
+        "major_flow_label",
+        MAJOR_FLOW_GROUPS,
+    )
 
 
 def kind_average(rows, horizon):
@@ -633,6 +700,9 @@ def run_backtest(args):
     print_main_asset_score_backtest(results)
     print_trap_risk_backtest(results)
     print_entry_timing_backtest(results)
+    print_spot_onchain_backtest(results)
+    print_contract_spot_divergence_backtest(results)
+    print_major_flow_backtest(results)
 
     print("最近20条:")
     for x in results[:20]:
