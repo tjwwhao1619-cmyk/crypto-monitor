@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -22,24 +23,19 @@ API_KEY_ENV = "COINGLASS_API_KEY"
 TIMEOUT_SECONDS = 15
 BASE_URL = "https://open-api-v4.coinglass.com"
 
-AGGREGATED_HEATMAP_ENDPOINT = (
-    "/api/futures/liquidation/aggregated-heatmap/model1"
-)
-PAIR_HEATMAP_ENDPOINT = "/api/futures/liquidation/heatmap/model1"
-
-COINS = ["BTC", "ETH", "KNC", "LAB", "TAC"]
-PAIRS = ["BTCUSDT", "ETHUSDT", "KNCUSDT", "LABUSDT", "TACUSDT"]
-RANGES = ["12h", "24h"]
 EXCHANGE = "Binance"
+COIN = "BTC"
+PAIR = "BTCUSDT"
 INTERVAL = "1h"
 LIMIT = "5"
+RANGE = "24h"
 
 
 @dataclass(frozen=True)
 class Probe:
     name: str
     endpoint: str
-    params: dict[str, str]
+    params: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -133,8 +129,7 @@ def probe_request(
         msg = None
         data = None
 
-    print(f"code: {code}")
-    print(f"msg: {msg}")
+    print(f"code/msg: {code}/{msg}")
     print(f"data type: {type_name(data)}")
     print(f"data sample: {render_sample(data)}")
 
@@ -153,132 +148,209 @@ def build_session(api_key: str) -> requests.Session:
     return session
 
 
+def last_24h_window_ms() -> dict[str, int]:
+    end_time = int(time.time() * 1000)
+    start_time = end_time - 24 * 60 * 60 * 1000
+    return {"start_time": start_time, "end_time": end_time}
+
+
+def pair_history_params(**extra: Any) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "exchange": EXCHANGE,
+        "symbol": PAIR,
+        "interval": INTERVAL,
+        "limit": LIMIT,
+    }
+    params.update(extra)
+    return params
+
+
+def coin_history_params(**extra: Any) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "symbol": COIN,
+        "interval": INTERVAL,
+        "limit": LIMIT,
+    }
+    params.update(extra)
+    return params
+
+
 def build_probes() -> list[Probe]:
-    probes: list[Probe] = []
+    time_window = last_24h_window_ms()
 
-    for range_value in RANGES:
-        for coin in COINS:
-            probes.append(
-                Probe(
-                    name=(
-                        "aggregated liquidation heatmap model1 "
-                        f"{coin} {range_value}"
-                    ),
-                    endpoint=AGGREGATED_HEATMAP_ENDPOINT,
-                    params={"symbol": coin, "range": range_value},
-                )
-            )
+    return [
+        # Existing Startup-usable probes to keep tracking.
+        Probe(
+            name="liquidation history",
+            endpoint="/api/futures/liquidation/history",
+            params=pair_history_params(),
+        ),
+        Probe(
+            name="aggregated liquidation history",
+            endpoint="/api/futures/liquidation/aggregated-history",
+            params=coin_history_params(exchange_list=EXCHANGE),
+        ),
+        Probe(
+            name="global long-short account ratio history",
+            endpoint="/api/futures/global-long-short-account-ratio/history",
+            params=pair_history_params(),
+        ),
 
-    for range_value in RANGES:
-        for pair in PAIRS:
-            probes.append(
-                Probe(
-                    name=(
-                        "pair liquidation heatmap model1 "
-                        f"{EXCHANGE} {pair} {range_value}"
-                    ),
-                    endpoint=PAIR_HEATMAP_ENDPOINT,
-                    params={
-                        "exchange": EXCHANGE,
-                        "symbol": pair,
-                        "range": range_value,
-                    },
-                )
-            )
+        # Open interest candidates.
+        Probe(
+            name="open interest OHLC history",
+            endpoint="/api/futures/open-interest/history",
+            params=pair_history_params(unit="usd"),
+        ),
+        Probe(
+            name="aggregated open interest history",
+            endpoint="/api/futures/open-interest/aggregated-history",
+            params=coin_history_params(unit="usd"),
+        ),
+        Probe(
+            name="open interest exchange list",
+            endpoint="/api/futures/open-interest/exchange-list",
+            params={"symbol": COIN},
+        ),
+        Probe(
+            name="aggregated stablecoin margin open interest history",
+            endpoint="/api/futures/open-interest/aggregated-stablecoin-history",
+            params=coin_history_params(exchange_list=EXCHANGE),
+        ),
+        Probe(
+            name="aggregated coin margin open interest history",
+            endpoint="/api/futures/open-interest/aggregated-coin-margin-history",
+            params=coin_history_params(exchange_list=EXCHANGE),
+        ),
 
-    probes.extend(
-        [
-            Probe(
-                name="open interest OHLC history",
-                endpoint="/api/futures/openInterest/ohlc-history",
-                params={
-                    "exchange": EXCHANGE,
-                    "symbol": "BTCUSDT",
-                    "interval": INTERVAL,
-                    "limit": LIMIT,
-                },
-            ),
-            Probe(
-                name="aggregated open interest history",
-                endpoint="/api/futures/openInterest/aggregated-history",
-                params={
-                    "symbol": "BTC",
-                    "interval": INTERVAL,
-                    "limit": LIMIT,
-                },
-            ),
-            Probe(
-                name="open interest exchange list",
-                endpoint="/api/futures/openInterest/exchange-list",
-                params={"symbol": "BTC"},
-            ),
-            Probe(
-                name="funding rate OHLC history",
-                endpoint="/api/futures/fundingRate/ohlc-history",
-                params={
-                    "exchange": EXCHANGE,
-                    "symbol": "BTCUSDT",
-                    "interval": INTERVAL,
-                    "limit": LIMIT,
-                },
-            ),
-            Probe(
-                name="OI-weighted funding rate OHLC history",
-                endpoint="/api/futures/fundingRate/oi-weight-ohlc-history",
-                params={
-                    "symbol": "BTC",
-                    "interval": INTERVAL,
-                    "limit": LIMIT,
-                },
-            ),
-            Probe(
-                name="funding rate exchange list",
-                endpoint="/api/futures/fundingRate/exchange-list",
-                params={"symbol": "BTC"},
-            ),
-            Probe(
-                name="pair liquidation history",
-                endpoint="/api/futures/liquidation/history",
-                params={
-                    "exchange": EXCHANGE,
-                    "symbol": "BTCUSDT",
-                    "interval": INTERVAL,
-                    "limit": LIMIT,
-                },
-            ),
-            Probe(
-                name="aggregated liquidation history",
-                endpoint="/api/futures/liquidation/aggregated-history",
-                params={
-                    "exchange_list": EXCHANGE,
-                    "symbol": "BTC",
-                    "interval": INTERVAL,
-                    "limit": LIMIT,
-                },
-            ),
-            Probe(
-                name="global long-short account ratio history",
-                endpoint="/api/futures/global-long-short-account-ratio/history",
-                params={
-                    "exchange": EXCHANGE,
-                    "symbol": "BTCUSDT",
-                    "interval": INTERVAL,
-                    "limit": LIMIT,
-                },
-            ),
-            Probe(
-                name="bitcoin ETF flow history",
-                endpoint="/api/bitcoin/etf/flow-history",
-                params={
-                    "symbol": "BTC",
-                    "interval": INTERVAL,
-                    "limit": LIMIT,
-                },
-            ),
-        ]
-    )
+        # Funding rate candidates.
+        Probe(
+            name="funding rate OHLC history",
+            endpoint="/api/futures/funding-rate/history",
+            params=pair_history_params(),
+        ),
+        Probe(
+            name="OI-weighted funding rate history",
+            endpoint="/api/futures/funding-rate/oi-weight-history",
+            params=coin_history_params(),
+        ),
+        Probe(
+            name="volume-weighted funding rate history",
+            endpoint="/api/futures/funding-rate/vol-weight-history",
+            params=coin_history_params(),
+        ),
+        Probe(
+            name="funding rate exchange list",
+            endpoint="/api/futures/funding-rate/exchange-list",
+            params={"symbol": COIN},
+        ),
+        Probe(
+            name="cumulative funding rate exchange list",
+            endpoint="/api/futures/funding-rate/accumulated-exchange-list",
+            params={"range": "1d"},
+        ),
 
-    return probes
+        # Taker buy/sell volume candidates.
+        Probe(
+            name="futures taker buy/sell volume history",
+            endpoint="/api/futures/v2/taker-buy-sell-volume/history",
+            params=pair_history_params(),
+        ),
+        Probe(
+            name="futures taker buy/sell volume exchange list",
+            endpoint="/api/futures/taker-buy-sell-volume/exchange-list",
+            params={"symbol": COIN, "range": RANGE},
+        ),
+        Probe(
+            name="spot aggregated taker buy/sell volume history",
+            endpoint="/api/spot/aggregated-taker-buy-sell-volume/history",
+            params=coin_history_params(exchange_list=EXCHANGE, unit="usd"),
+        ),
+
+        # Market snapshot / ticker-style candidates.
+        Probe(
+            name="futures pairs markets",
+            endpoint="/api/futures/pairs-markets",
+            params={"symbol": COIN},
+        ),
+        Probe(
+            name="spot pairs markets",
+            endpoint="/api/spot/pairs-markets",
+            params={"symbol": COIN},
+        ),
+        Probe(
+            name="spot coins markets",
+            endpoint="/api/spot/coins-markets",
+            params={"page": "1", "per_page": LIMIT},
+        ),
+
+        # ETF flow candidates.
+        Probe(
+            name="BTC ETF list",
+            endpoint="/api/bitcoin/etf/list",
+            params={},
+        ),
+        Probe(
+            name="BTC ETF flow history",
+            endpoint="/api/bitcoin/etf/flow-history",
+            params={"interval": "1d", "limit": LIMIT},
+        ),
+
+        # Orderbook / depth candidates.
+        Probe(
+            name="spot orderbook heatmap history",
+            endpoint="/api/spot/orderbook/history",
+            params=pair_history_params(**time_window),
+        ),
+        Probe(
+            name="spot orderbook bid ask range history",
+            endpoint="/api/spot/orderbook/ask-bids-history",
+            params=pair_history_params(range="1", **time_window),
+        ),
+        Probe(
+            name="spot large limit orders",
+            endpoint="/api/spot/orderbook/large-limit-order",
+            params={"exchange": EXCHANGE, "symbol": PAIR},
+        ),
+        Probe(
+            name="spot large limit order history",
+            endpoint="/api/spot/orderbook/large-limit-order-history",
+            params={
+                "exchange": EXCHANGE,
+                "symbol": PAIR,
+                "state": "2",
+                **time_window,
+            },
+        ),
+
+        # Exchange balance / on-chain candidates.
+        Probe(
+            name="exchange balance list",
+            endpoint="/api/exchange/balance/list",
+            params={"symbol": COIN},
+        ),
+        Probe(
+            name="exchange balance chart",
+            endpoint="/api/exchange/balance/chart",
+            params={"symbol": COIN},
+        ),
+        Probe(
+            name="exchange assets",
+            endpoint="/api/exchange/assets",
+            params={"exchange": EXCHANGE, "page": "1", "per_page": LIMIT},
+        ),
+        Probe(
+            name="exchange on-chain transfers ERC20",
+            endpoint="/api/exchange/chain/tx/list",
+            params={
+                "symbol": "ETH",
+                "page": "1",
+                "per_page": LIMIT,
+                "min_usd": "1000000",
+                "start_time": time_window["start_time"],
+            },
+        ),
+    ]
 
 
 def print_summary(results: list[ProbeResult]) -> None:

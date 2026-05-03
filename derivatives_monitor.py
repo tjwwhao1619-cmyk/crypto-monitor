@@ -34,6 +34,8 @@ BINANCE_FORCE_ORDER_WS_PATH = "/ws/!forceOrder@arr"
 COINGLASS_LIQUIDATION_HISTORY_URL = "https://open-api-v4.coinglass.com/api/futures/liquidation/history"
 COINGLASS_LIQUIDATION_AGGREGATED_HISTORY_URL = "https://open-api-v4.coinglass.com/api/futures/liquidation/aggregated-history"
 COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS = 300
+COINGLASS_BASE_URL = "https://open-api-v4.coinglass.com"
+COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS = 300
 TELEGRAM_SNAPSHOT_CACHE_TTL_SECONDS = 600
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 FLOW_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h"]
@@ -169,6 +171,7 @@ class DerivativesMonitor:
         self.liquidation_last_error = ""
         self.coinglass_api_key = os.getenv("COINGLASS_API_KEY", "").strip()
         self.coinglass_liquidation_cache: dict[str, tuple[float, dict[str, float]]] = {}
+        self.coinglass_market_context_cache: dict[str, tuple[float, str]] = {}
 
     def run_forever(self) -> None:
         self.start_liquidation_stream_worker()
@@ -382,6 +385,102 @@ class DerivativesMonitor:
             return None
         stats = coinglass_liquidation_stats_from_response(data)
         return stats
+
+    def fetch_coinglass_market_context(self, symbol: str) -> dict[str, Any] | None:
+        if not self.coinglass_api_key:
+            return None
+
+        symbol = symbol.upper()
+        base_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
+        headers = {"CG-API-KEY": self.coinglass_api_key, "accept": "application/json"}
+        context: dict[str, Any] = {"symbol": symbol, "base": base_symbol}
+
+        oi_data = self.fetch_coinglass_json(
+            "/api/futures/open-interest/exchange-list",
+            {"symbol": base_symbol},
+            headers,
+        )
+        oi_row = coinglass_find_exchange_row(oi_data, "All")
+        if oi_row:
+            context["open_interest"] = {
+                "open_interest_usd": parse_float(oi_row.get("open_interest_usd")),
+                "change_5m": parse_float(oi_row.get("open_interest_change_percent_5m")),
+                "change_15m": parse_float(oi_row.get("open_interest_change_percent_15m")),
+                "change_1h": parse_float(oi_row.get("open_interest_change_percent_1h")),
+                "change_4h": parse_float(oi_row.get("open_interest_change_percent_4h")),
+                "change_24h": parse_float(oi_row.get("open_interest_change_percent_24h")),
+            }
+
+        funding_history_data = self.fetch_coinglass_json(
+            "/api/futures/funding-rate/oi-weight-history",
+            {"symbol": base_symbol, "interval": "1h", "limit": 5},
+            headers,
+        )
+        funding_rows = coinglass_rows(funding_history_data)
+        if funding_rows:
+            context["funding_oi_weight"] = parse_float(funding_rows[-1].get("close"))
+
+        funding_distribution_data = self.fetch_coinglass_json(
+            "/api/futures/funding-rate/exchange-list",
+            {"symbol": base_symbol},
+            headers,
+        )
+        funding_rows = coinglass_stablecoin_margin_rows_for_base(funding_distribution_data, base_symbol)
+        if funding_rows:
+            distribution = coinglass_funding_distribution(funding_rows)
+            if distribution:
+                context["funding_distribution"] = distribution
+        else:
+            logging.debug("CoinGlass funding exchange-list has no matching stablecoin rows for %s", base_symbol)
+
+        taker_data = self.fetch_coinglass_json(
+            "/api/futures/taker-buy-sell-volume/exchange-list",
+            {"symbol": base_symbol, "range": "24h"},
+            headers,
+        )
+        taker_row = coinglass_find_exchange_row(taker_data, "All") or coinglass_first_metric_row(
+            taker_data,
+            ["buy_ratio", "sell_ratio", "buy_vol_usd", "sell_vol_usd"],
+        )
+        if taker_row:
+            context["taker_flow"] = {
+                "buy_ratio": parse_float(taker_row.get("buy_ratio")),
+                "sell_ratio": parse_float(taker_row.get("sell_ratio")),
+                "buy_vol_usd": parse_float(taker_row.get("buy_vol_usd")),
+                "sell_vol_usd": parse_float(taker_row.get("sell_vol_usd")),
+            }
+
+        useful_keys = {"open_interest", "funding_oi_weight", "funding_distribution", "taker_flow"}
+        return context if useful_keys.intersection(context) else None
+
+    def fetch_coinglass_json(self, endpoint: str, params: dict[str, Any], headers: dict[str, str]) -> Any:
+        try:
+            response = self.session.get(f"{COINGLASS_BASE_URL}{endpoint}", headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            logging.debug("CoinGlass fetch failed: %s params=%s", endpoint, params, exc_info=True)
+            return None
+        if not coinglass_response_ok(data):
+            return None
+        return data.get("data") if isinstance(data, dict) else None
+
+    def format_coinglass_market_context(self, symbol: str) -> str:
+        symbol = symbol.upper()
+        now = time.time()
+        base_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
+        cache_key = f"{base_symbol}:{symbol}"
+        cached = self.coinglass_market_context_cache.get(cache_key)
+        if cached and now - cached[0] < COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        context = self.fetch_coinglass_market_context(symbol)
+        if not context:
+            text = "CoinGlass聚合: n/a"
+        else:
+            text = format_coinglass_market_context_text(context)
+        self.coinglass_market_context_cache[cache_key] = (now, text)
+        return text
 
     def liquidation_health_report(self, symbol: str | None = None) -> str:
         now = time.time()
@@ -1405,10 +1504,11 @@ class DerivativesMonitor:
             if combined_signal:
                 signals.append(combined_signal)
             liquidation_text = self.format_liquidation_stats(symbol)
+            coinglass_text = self.format_coinglass_market_context(symbol)
             response_parts = [data_source_text]
             if degradation_text:
                 response_parts.append(degradation_text)
-            response_parts.append(format_symbol_diagnosis(snapshot, signals, liquidation_text))
+            response_parts.append(format_symbol_diagnosis(snapshot, signals, liquidation_text, coinglass_text))
             self.send_telegram_text(bot_token, chat_id, "\n".join(response_parts))
         except Exception as exc:
             logging.exception("Failed to diagnose symbol from Telegram command")
@@ -1438,8 +1538,16 @@ class DerivativesMonitor:
             market_snapshots = self.ask_market_snapshots()
             recent_rows = self.load_recent_symbol_signal_rows(symbol, 3)
             liquidation_text = self.format_liquidation_stats(symbol)
+            coinglass_text = self.format_coinglass_market_context(symbol)
             ask_data_source_text = format_ask_data_source_text(data_source_text, full=full_mode)
-            context_text = format_ask_context(snapshot, display_signals, market_snapshots, recent_rows, liquidation_text)
+            context_text = format_ask_context(
+                snapshot,
+                display_signals,
+                market_snapshots,
+                recent_rows,
+                liquidation_text,
+                coinglass_text,
+            )
             context_text = "\n".join([ask_data_source_text, context_text])
             if degradation_text:
                 context_text = "\n".join([degradation_text, context_text])
@@ -1458,6 +1566,7 @@ class DerivativesMonitor:
                     display_signals,
                     market_snapshots,
                     liquidation_text,
+                    coinglass_text,
                     full=full_mode,
                 )
             )
@@ -2316,6 +2425,296 @@ def coinglass_liquidation_rows(data: Any) -> list[dict[str, Any]]:
             for value in data.values():
                 rows.extend(coinglass_liquidation_rows(value))
     return rows
+
+
+def coinglass_rows(data: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        for item in data:
+            rows.extend(coinglass_rows(item))
+    elif isinstance(data, dict):
+        if any(not isinstance(value, (dict, list)) for value in data.values()):
+            rows.append(data)
+        for value in data.values():
+            if isinstance(value, (dict, list)):
+                rows.extend(coinglass_rows(value))
+    return rows
+
+
+def coinglass_find_exchange_row(data: Any, exchange: str) -> dict[str, Any] | None:
+    target = exchange.lower()
+    for row in coinglass_rows(data):
+        names = [
+            row.get("exchange"),
+            row.get("exchange_name"),
+            row.get("name"),
+            row.get("symbol"),
+        ]
+        if any(str(name).lower() == target for name in names if name is not None):
+            return row
+    return None
+
+
+def coinglass_first_metric_row(data: Any, keys: list[str]) -> dict[str, Any] | None:
+    for row in coinglass_rows(data):
+        if any(key in row for key in keys):
+            return row
+    return None
+
+
+def coinglass_stablecoin_margin_rows(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, dict):
+        stablecoin_rows = data.get("stablecoin_margin_list")
+        if isinstance(stablecoin_rows, list):
+            return [row for row in stablecoin_rows if isinstance(row, dict)]
+        for value in data.values():
+            rows = coinglass_stablecoin_margin_rows(value)
+            if rows:
+                return rows
+    if isinstance(data, list):
+        for item in data:
+            rows = coinglass_stablecoin_margin_rows(item)
+            if rows:
+                return rows
+    return []
+
+
+def coinglass_stablecoin_margin_rows_for_base(data: Any, base_symbol: str) -> list[dict[str, Any]]:
+    base_symbol = base_symbol.upper()
+    if not base_symbol:
+        return []
+    rows, mismatch_seen = _coinglass_stablecoin_margin_rows_for_base(data, base_symbol)
+    if mismatch_seen and not rows:
+        logging.debug("CoinGlass stablecoin_margin_list symbol mismatch for %s", base_symbol)
+    return rows
+
+
+def _coinglass_stablecoin_margin_rows_for_base(data: Any, base_symbol: str) -> tuple[list[dict[str, Any]], bool]:
+    if isinstance(data, dict):
+        stablecoin_rows = data.get("stablecoin_margin_list")
+        if isinstance(stablecoin_rows, list):
+            if coinglass_node_symbol_mismatches(data, base_symbol):
+                return [], True
+            rows = [
+                row
+                for row in stablecoin_rows
+                if isinstance(row, dict) and not coinglass_node_symbol_mismatches(row, base_symbol)
+            ]
+            mismatch_seen = len(rows) < len([row for row in stablecoin_rows if isinstance(row, dict)])
+            return rows, mismatch_seen
+        mismatch_seen = False
+        for value in data.values():
+            child_rows, child_mismatch_seen = _coinglass_stablecoin_margin_rows_for_base(value, base_symbol)
+            mismatch_seen = mismatch_seen or child_mismatch_seen
+            if child_rows:
+                return child_rows, mismatch_seen
+        return [], mismatch_seen
+    if isinstance(data, list):
+        mismatch_seen = False
+        for item in data:
+            rows, child_mismatch_seen = _coinglass_stablecoin_margin_rows_for_base(item, base_symbol)
+            mismatch_seen = mismatch_seen or child_mismatch_seen
+            if rows:
+                return rows, mismatch_seen
+        return [], mismatch_seen
+    return [], False
+
+
+def coinglass_node_symbol_mismatches(row: dict[str, Any], base_symbol: str) -> bool:
+    symbols = coinglass_node_symbols(row)
+    if not symbols:
+        return False
+    return not any(coinglass_symbol_matches_base(symbol, base_symbol) for symbol in symbols)
+
+
+def coinglass_node_symbols(row: dict[str, Any]) -> list[str]:
+    symbols: list[str] = []
+    for key in ("symbol", "base", "base_symbol", "coin", "currency"):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            symbols.append(str(value).strip())
+    return symbols
+
+
+def coinglass_symbol_matches_base(value: str, base_symbol: str) -> bool:
+    normalized = value.upper().replace("-", "").replace("_", "").replace("/", "")
+    base_symbol = base_symbol.upper()
+    if normalized == base_symbol:
+        return True
+    if not normalized.startswith(base_symbol):
+        return False
+    suffix = normalized[len(base_symbol):]
+    return suffix.startswith(("USD", "USDT", "USDC", "PERP", "SWAP"))
+
+
+def coinglass_row_exchange_name(row: dict[str, Any]) -> str:
+    for key in ("exchange", "exchange_name", "name"):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def coinglass_row_funding(row: dict[str, Any]) -> float | None:
+    for key in ("funding_rate", "current_funding_rate", "rate", "funding_rate_percent", "next_funding_rate"):
+        value = parse_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def coinglass_funding_distribution(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    total = 0
+    negative = 0
+    positive = 0
+    extreme = 0
+    extreme_negative = 0
+    extreme_positive = 0
+    exchange_rates: dict[str, float] = {}
+    for row in rows:
+        funding = coinglass_row_funding(row)
+        if funding is None:
+            continue
+        total += 1
+        if funding < 0:
+            negative += 1
+        elif funding > 0:
+            positive += 1
+        if abs(funding) >= 0.01:
+            extreme += 1
+        if funding <= -0.01:
+            extreme_negative += 1
+        elif funding >= 0.01:
+            extreme_positive += 1
+
+        exchange_name = coinglass_row_exchange_name(row).lower()
+        for target in ("binance", "okx", "bybit"):
+            if target in exchange_name and target.title() not in exchange_rates:
+                exchange_rates[target.title()] = funding
+
+    if total <= 0:
+        return None
+    return {
+        "total": total,
+        "negative": negative,
+        "positive": positive,
+        "extreme": extreme,
+        "extreme_negative": extreme_negative,
+        "extreme_positive": extreme_positive,
+        "exchange_rates": exchange_rates,
+    }
+
+
+def format_coinglass_market_context_text(context: dict[str, Any]) -> str:
+    oi = context.get("open_interest") if isinstance(context.get("open_interest"), dict) else {}
+    distribution = context.get("funding_distribution") if isinstance(context.get("funding_distribution"), dict) else {}
+    taker = context.get("taker_flow") if isinstance(context.get("taker_flow"), dict) else {}
+    funding_oi_weight = context.get("funding_oi_weight")
+
+    oi_1h = oi.get("change_1h")
+    oi_4h = oi.get("change_4h")
+    oi_24h = oi.get("change_24h")
+    has_distribution = bool(distribution and distribution.get("total"))
+    negative = int(distribution.get("negative") or 0) if has_distribution else 0
+    positive = int(distribution.get("positive") or 0) if has_distribution else 0
+    total = int(distribution.get("total") or 0) if has_distribution else 0
+    extreme = int(distribution.get("extreme") or 0) if has_distribution else 0
+    extreme_negative = int(distribution.get("extreme_negative") or 0) if has_distribution else 0
+    extreme_positive = int(distribution.get("extreme_positive") or 0) if has_distribution else 0
+    buy_ratio = taker.get("buy_ratio")
+    sell_ratio = taker.get("sell_ratio")
+
+    judgement = coinglass_market_context_judgement(
+        oi_1h,
+        oi_4h,
+        funding_oi_weight,
+        negative,
+        positive,
+        total,
+        extreme_negative,
+        extreme_positive,
+        sell_ratio,
+    )
+    exchange_text = format_coinglass_exchange_funding(distribution.get("exchange_rates"))
+    funding_distribution_text = (
+        f"Funding交易所分布 负费率交易所 {negative}/{total}，正费率 {positive}/{total}，极端 {extreme}"
+        if has_distribution
+        else "Funding交易所分布 n/a"
+    )
+    return (
+        "CoinGlass聚合: "
+        f"OI 1h {format_percent_optional(oi_1h)} / 4h {format_percent_optional(oi_4h)} / 24h {format_percent_optional(oi_24h)}；"
+        f"Funding OI加权 {format_percent_optional(funding_oi_weight)}{exchange_text}，"
+        f"{funding_distribution_text}；"
+        f"主动买卖 24h 买{format_ratio_percent(buy_ratio)} / 卖{format_ratio_percent(sell_ratio)}"
+        f"；判断: {judgement}"
+    )
+
+
+def format_coinglass_exchange_funding(exchange_rates: Any) -> str:
+    items = []
+    for exchange in ("Binance", "OKX", "Bybit"):
+        value = None
+        if isinstance(exchange_rates, dict):
+            for key, rate in exchange_rates.items():
+                if str(key).lower() == exchange.lower():
+                    value = rate
+                    break
+        items.append(f"{exchange} {format_percent_optional(value) if value is not None else 'n/a'}")
+    return f" ({' / '.join(items)})" if items else ""
+
+
+def format_ratio_percent(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if abs(value) <= 1:
+        return f"{value * 100:.1f}%"
+    return f"{value:.1f}%"
+
+
+def coinglass_market_context_judgement(
+    oi_1h: float | None,
+    oi_4h: float | None,
+    funding_oi_weight: float | None,
+    negative: int,
+    positive: int,
+    total: int,
+    extreme_negative: int,
+    extreme_positive: int,
+    sell_ratio: float | None,
+) -> str:
+    negative_crowded = (
+        total > 0
+        and negative / total >= 0.7
+        and (extreme_negative >= 2 or (funding_oi_weight is not None and funding_oi_weight <= -0.01))
+    )
+    positive_crowded = (
+        total > 0
+        and positive / total >= 0.7
+        and (extreme_positive >= 2 or (funding_oi_weight is not None and funding_oi_weight >= 0.01))
+    )
+    oi_rising = oi_1h is not None and oi_4h is not None and oi_1h > 0 and oi_4h > 0
+    oi_falling = oi_1h is not None and oi_4h is not None and oi_1h < 0 and oi_4h < 0
+    sell_pressure = False
+    if sell_ratio is not None:
+        sell_pressure_threshold = 0.53 if abs(sell_ratio) <= 1 else 53
+        sell_pressure = sell_ratio >= sell_pressure_threshold
+
+    judgement_parts: list[str] = []
+    if oi_falling:
+        judgement_parts.append("仓位退出/风险释放")
+    elif oi_rising and positive_crowded:
+        judgement_parts.append("全市场杠杆升温/多头拥挤")
+    elif negative_crowded:
+        judgement_parts.append("全市场空头拥挤")
+    elif positive_crowded:
+        judgement_parts.append("全市场多头拥挤")
+
+    if sell_pressure:
+        judgement_parts.append("全市场主动卖压偏强")
+    if not judgement_parts:
+        judgement_parts.append("全市场衍生品中性/分歧")
+    return "；".join(judgement_parts)
 
 
 def format_coinglass_liquidation_stats(stats: dict[str, float]) -> str:
@@ -3919,7 +4318,8 @@ def main() -> int:
         if combined_signal:
             signals.append(combined_signal)
         liquidation_text = monitor.format_liquidation_stats(args.symbol.upper())
-        print_symbol_diagnosis(snapshot, signals, liquidation_text)
+        coinglass_text = monitor.format_coinglass_market_context(args.symbol.upper())
+        print_symbol_diagnosis(snapshot, signals, liquidation_text, coinglass_text)
         return 0
     if args.once:
         results = monitor.run_once(refresh_symbols=not args.no_refresh)
@@ -3952,6 +4352,7 @@ def format_symbol_diagnosis(
     snapshot: MarketSnapshot,
     signals: list[Signal],
     liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
 ) -> str:
     signal_names = ", ".join(signal.kind for signal in signals) or "-"
     return (
@@ -3974,6 +4375,7 @@ def format_symbol_diagnosis(
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
         f"{liquidation_text or '真实强平: n/a'}\n"
+        f"{coinglass_text or 'CoinGlass聚合: n/a'}\n"
         f"判断: {diagnose_snapshot(snapshot, signals)}"
     )
 
@@ -3984,6 +4386,7 @@ def format_ask_context(
     market_snapshots: list[MarketSnapshot],
     recent_signal_rows: list[dict[str, str]],
     liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
 ) -> str:
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     signal_text = format_ask_signal_list(signals)
@@ -4001,7 +4404,8 @@ def format_ask_context(
         f"交易计划 {trade_plan}；"
         f"结构判断 {market_structure_label(snapshot)}；"
         f"清算风险 {liquidation_risk_label(snapshot)}；"
-        f"{liquidation_text or '真实强平: n/a'}"
+        f"{liquidation_text or '真实强平: n/a'}；"
+        f"{coinglass_text or 'CoinGlass聚合: n/a'}"
     )
 
     text = (
@@ -4038,6 +4442,7 @@ def format_ask_context(
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
         f"{liquidation_text or '真实强平: n/a'}\n"
+        f"{coinglass_text or 'CoinGlass聚合: n/a'}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
         f"综合判断: {system_direction}\n\n"
@@ -4147,6 +4552,7 @@ def format_ask_response(
     signals: list[Signal],
     market_snapshots: list[MarketSnapshot],
     liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
     full: bool = False,
 ) -> str:
     review_text = (ai_review or fallback_ask_ai_review(context_text, snapshot, signals, market_snapshots, liquidation_text)).strip()
@@ -4154,7 +4560,10 @@ def format_ask_response(
     review_text = normalize_ai_review_text(review_text)
     if not full:
         entry_advice = format_ask_entry_advice(snapshot, signals)
-        return truncate_text(f"{review_text}\n开仓建议: {entry_advice}\n\n{format_ask_core_data(snapshot, liquidation_text)}", 1500)
+        return truncate_text(
+            f"{review_text}\n开仓建议: {entry_advice}\n\n{format_ask_core_data(snapshot, liquidation_text, coinglass_text)}",
+            1500,
+        )
 
     prefix = f"{review_text}\n\n[系统上下文]\n" if review_text.startswith("[AI复核]") else f"[AI复核]\n{review_text}\n\n[系统上下文]\n"
     remaining = max(0, 3500 - len(prefix))
@@ -4211,7 +4620,11 @@ def fallback_ask_ai_review(
     )
 
 
-def format_ask_core_data(snapshot: MarketSnapshot, liquidation_text: str | None = None) -> str:
+def format_ask_core_data(
+    snapshot: MarketSnapshot,
+    liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
+) -> str:
     flow_items = []
     for period in ["5m", "15m", "1h", "4h", "12h"]:
         flow_items.append(
@@ -4228,7 +4641,8 @@ def format_ask_core_data(snapshot: MarketSnapshot, liquidation_text: str | None 
         f"长周期: {long_flow_alignment_note(long_flow_alignment_score(snapshot))}\n"
         f"现货/链上: {spot_alpha_confirmation(snapshot.symbol)}\n"
         f"清算推断: {liquidation_risk_label(snapshot)}\n"
-        f"真实强平: {liq_text}"
+        f"真实强平: {liq_text}\n"
+        f"CoinGlass: {compact_coinglass_market_context(coinglass_text or 'CoinGlass聚合: n/a')}"
     )
 
 
@@ -4292,6 +4706,10 @@ def post_process_ask_ai_review(review_text: str, context_text: str) -> str:
         if required not in text:
             text = append_to_ask_field(text, "操作倾向:", required)
     return text
+
+
+def compact_coinglass_market_context(text: str) -> str:
+    return text.removeprefix("CoinGlass聚合: ").strip()
 
 
 def normalize_ai_review_text(text: str) -> str:
@@ -4413,6 +4831,7 @@ def print_symbol_diagnosis(
     snapshot: MarketSnapshot,
     signals: list[Signal],
     liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
 ) -> None:
     signal_names = ", ".join(signal.kind for signal in signals) or "-"
     print(snapshot.symbol)
@@ -4436,6 +4855,7 @@ def print_symbol_diagnosis(
     print(f"结构判断: {market_structure_label(snapshot)}")
     print(f"清算风险: {liquidation_risk_label(snapshot)}")
     print(liquidation_text or "真实强平: n/a")
+    print(coinglass_text or "CoinGlass聚合: n/a")
     print(f"判断: {diagnose_snapshot(snapshot, signals)}")
 
 
