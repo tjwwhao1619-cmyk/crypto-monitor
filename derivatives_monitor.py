@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -33,6 +34,7 @@ BINANCE_FORCE_ORDER_WS_PATH = "/ws/!forceOrder@arr"
 COINGLASS_LIQUIDATION_HISTORY_URL = "https://open-api-v4.coinglass.com/api/futures/liquidation/history"
 COINGLASS_LIQUIDATION_AGGREGATED_HISTORY_URL = "https://open-api-v4.coinglass.com/api/futures/liquidation/aggregated-history"
 COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS = 300
+TELEGRAM_SNAPSHOT_CACHE_TTL_SECONDS = 600
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 FLOW_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h"]
 
@@ -1334,7 +1336,7 @@ class DerivativesMonitor:
             self.send_telegram_text(
                 bot_token,
                 chat_id,
-                "可用命令:\n/check SYMBOL - 单币诊断\n/ask SYMBOL - AI复核单币\n/liq [SYMBOL] - 强平流状态/单币强平\n/summary - 市场温度摘要\n/regime - 市场大方向\n/sectors - 热点/冷门板块\n/hot - 强势过热候选\n/signals - 最近信号\n/top - 强度最高信号\n/review - 最近10条信号\n/perf - 最近信号表现\n/dev help - 运维命令入口",
+                "可用命令:\n/check SYMBOL - 单币诊断\n/ask SYMBOL - AI简洁复核\n/ask SYMBOL full - AI完整上下文\n/liq [SYMBOL] - 强平流状态/单币强平\n/summary - 市场温度摘要\n/regime - 市场大方向\n/sectors - 热点/冷门板块\n/hot - 强势过热候选\n/signals - 最近信号\n/top - 强度最高信号\n/review - 最近10条信号\n/perf - 最近信号表现\n/dev help - 运维命令入口",
             )
             return
 
@@ -1390,37 +1392,75 @@ class DerivativesMonitor:
             symbol = f"{symbol}USDT"
 
         try:
-            snapshot = self.fetch_snapshot(symbol)
+            snapshot, data_source_text, degradation_text = self.telegram_command_snapshot(symbol)
+        except Exception:
+            logging.exception("Failed to fetch Telegram command snapshot")
+            self.send_telegram_text(bot_token, chat_id, "Binance接口限流或异常，请稍后再试。")
+            return
+
+        try:
             signals = self.evaluate_snapshot(snapshot, {"mode": "both"})
             combined_signal = self.combined_signal(snapshot, signals)
             if combined_signal:
                 signals.append(combined_signal)
             liquidation_text = self.format_liquidation_stats(symbol)
-            self.send_telegram_text(bot_token, chat_id, format_symbol_diagnosis(snapshot, signals, liquidation_text))
+            response_parts = [data_source_text]
+            if degradation_text:
+                response_parts.append(degradation_text)
+            response_parts.append(format_symbol_diagnosis(snapshot, signals, liquidation_text))
+            self.send_telegram_text(bot_token, chat_id, "\n".join(response_parts))
         except Exception as exc:
             logging.exception("Failed to diagnose symbol from Telegram command")
             self.send_telegram_text(bot_token, chat_id, f"{symbol} 查询失败: {type(exc).__name__}: {exc}")
 
     def handle_ask_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
         if not args:
-            self.send_telegram_text(bot_token, chat_id, "用法: /ask KNC 或 /ask KNCUSDT")
+            self.send_telegram_text(bot_token, chat_id, "用法: /ask KNC 或 /ask KNCUSDT full")
             return
 
+        full_mode = any(arg.lower() in ("full", "--full") for arg in args[1:])
         symbol = args[0].upper()
         if not symbol.endswith("USDT"):
             symbol = f"{symbol}USDT"
 
         try:
-            snapshot = self.fetch_snapshot(symbol)
+            snapshot, data_source_text, degradation_text = self.telegram_command_snapshot(symbol)
+        except Exception:
+            logging.exception("Failed to fetch Telegram ask snapshot")
+            self.send_telegram_text(bot_token, chat_id, "Binance接口限流或异常，请稍后再试。")
+            return
+
+        try:
             signals = self.evaluate_snapshot(snapshot, {"mode": "both"})
             combined_signal = self.combined_signal(snapshot, signals)
             display_signals = ([combined_signal] if combined_signal else []) + signals
             market_snapshots = self.ask_market_snapshots()
             recent_rows = self.load_recent_symbol_signal_rows(symbol, 3)
             liquidation_text = self.format_liquidation_stats(symbol)
+            ask_data_source_text = format_ask_data_source_text(data_source_text, full=full_mode)
             context_text = format_ask_context(snapshot, display_signals, market_snapshots, recent_rows, liquidation_text)
+            context_text = "\n".join([ask_data_source_text, context_text])
+            if degradation_text:
+                context_text = "\n".join([degradation_text, context_text])
             ai_review = ask_ai_review(context_text)
-            self.send_telegram_text(bot_token, chat_id, format_ask_response(context_text, ai_review))
+            response_parts = [ask_data_source_text]
+            stale_cache_note = ask_stale_cache_note(data_source_text)
+            if stale_cache_note:
+                response_parts.append(stale_cache_note)
+            if degradation_text:
+                response_parts.append(degradation_text)
+            response_parts.append(
+                format_ask_response(
+                    context_text,
+                    ai_review,
+                    snapshot,
+                    display_signals,
+                    market_snapshots,
+                    liquidation_text,
+                    full=full_mode,
+                )
+            )
+            self.send_telegram_text(bot_token, chat_id, "\n".join(response_parts))
         except Exception as exc:
             logging.exception("Failed to build ask context from Telegram command")
             self.send_telegram_text(bot_token, chat_id, f"{symbol} /ask 查询失败: {type(exc).__name__}: {exc}")
@@ -1448,6 +1488,32 @@ class DerivativesMonitor:
             except Exception:
                 logging.debug("Failed to fetch ask market snapshot: %s", symbol, exc_info=True)
         return [by_symbol[symbol] for symbol in majors if symbol in by_symbol]
+
+    def telegram_command_snapshot(self, symbol: str) -> tuple[MarketSnapshot, str, str | None]:
+        now = time.time()
+        cached_snapshot = self.latest_snapshots.get(symbol)
+        cache_age_seconds = self.snapshot_cache_age_seconds(now)
+        if cached_snapshot and cache_age_seconds <= TELEGRAM_SNAPSHOT_CACHE_TTL_SECONDS:
+            return cached_snapshot, f"数据来源: 缓存 {cache_age_seconds}秒前", None
+
+        try:
+            return self.fetch_snapshot(symbol), "数据来源: 实时", None
+        except Exception:
+            if not cached_snapshot:
+                raise
+            logging.warning("Live snapshot fetch failed for %s; using cached Telegram command snapshot", symbol, exc_info=True)
+            return (
+                cached_snapshot,
+                f"数据来源: 缓存 {cache_age_seconds}秒前",
+                f"数据缓存: {cache_age_seconds}秒前，实时接口失败，已降级使用缓存。",
+            )
+
+    def snapshot_cache_age_seconds(self, now: float | None = None) -> int:
+        if now is None:
+            now = time.time()
+        if self.latest_snapshots_updated_at <= 0:
+            return 0
+        return max(0, int(now - self.latest_snapshots_updated_at))
 
     def load_recent_symbol_signal_rows(self, symbol: str, limit: int = 3) -> list[dict[str, str]]:
         rows = self.load_recent_signal_rows(1000)
@@ -3954,11 +4020,20 @@ def ask_ai_review(context_text: str) -> str | None:
         "你只基于用户提供的结构化上下文复核，不读取、不要求、不推断任何 API key、token 或系统环境变量。"
         "这不是投资建议，只是交易复盘和风险检查。"
         "最高优先级: 必须优先服从系统上下文里的综合判断、信号列表、交易计划、结构判断、清算风险、短线评分、中线评分、大盘风向。"
-        "如果信号列表为'暂无触发信号'或信号触发状态为'无触发信号'，不得强行给看多/看空，只能写观望、偏观望或等待确认；除非上下文数据明显单边，并且必须说明只是低置信度例外。"
+        "如果系统上下文包含'信号触发状态: 无触发信号'，置信度最高只能是'中'，不得写'高'。"
+        "如果系统上下文包含'交易计划: 暂无交易计划'或'交易计划: 暂无交易计划参考'，置信度最高只能是'中'，不得写'高'。"
+        "如果'长周期资金共振'小于等于3/9，置信度最高只能是'中'，不得写'高'。"
+        "如果短线评分大于等于7但长周期资金共振小于等于3/9，必须明确写: '短线强但长周期不支持，可能是假反弹/诱多观察，不属于启动确认。'"
+        "如果大盘风向偏弱且单币短线偏强，必须写成风险: '大盘偏弱会压制单币反弹持续性。'"
+        "如果真实强平为'多头强平主导'，必须解释: '多头被清较多，说明短线下跌压力/止损释放更明显；除非资金回流和结构止跌，否则不能直接当作抄底依据。'"
+        "如果真实强平为'空头强平主导'，必须解释: '空头被清较多，说明短线逼空/上冲压力释放；除非资金继续承接，否则不能直接追多。'"
+        "如果真实强平为'双向强平/剧烈洗盘'，必须解释: '上下波动都剧烈，适合观望等待结构确认。'"
+        "如果真实强平为'强平分散'、'强平活跃但方向分散'或'近1h暂无明显强平数据'，不得把清算作为方向确认依据。"
+        "如果信号列表为'暂无触发信号'或信号触发状态为'无触发信号'，不得强行给看多/看空，只能写观望、偏观望或等待确认。"
         "解释规则: OI下降+价格下跌，多为仓位退出/风险释放，不等于新空进场；OI上升+价格上涨，多为空头/多头博弈加剧，需结合主动买卖比和资金流；极端负Funding表示空头拥挤或异常，不等于直接做多，只能提示可能反抽/插针风险；极端正Funding表示多头成本高，不等于直接做空，只能提示追多风险；资金流多周期分歧时，必须降置信度；现货/链上与合约背离时，必须写成风险。"
-        "禁止编造不存在的支撑、阻力、清算位。确认条件和失效条件里的价格位只能来自当前价格、24h高低、交易计划、结构判断、清算风险；没有可用价位就写'上下文无明确价位'。"
+        "禁止编造系统上下文没有的支撑、阻力、清算带、目标价。确认条件和失效条件里的价格位只能来自当前价格、24h高低、交易计划、结构判断、清算风险；没有可用价位就写'上下文无明确价位'。"
         "如果交易计划为'暂无交易计划'或'暂无交易计划参考'，操作倾向必须包含'暂无交易计划，不建议按 AI 文本直接开仓'。"
-        "固定输出格式，且只输出这些字段: [AI复核]\n系统方向:\nAI复核结论:\n置信度:\n关键依据:\n反向风险:\n确认条件:\n失效条件:\n操作倾向:"
+        "固定输出格式，且只输出这些字段: [AI复核]\n系统方向:\nAI复核结论:\n置信度:\n核心理由:\n- 最多3条\n主要风险:\n- 最多3条\n操作倾向:"
         "置信度只能用低/中/高。全文控制在1200字以内，中文直接，偏交易复盘风格。"
     )
     payload = {
@@ -3997,7 +4072,7 @@ def ask_ai_review(context_text: str) -> str | None:
     if not text:
         logging.warning("OpenAI ask review returned no text; falling back to structured context")
         return None
-    return truncate_text(text.strip(), 1200)
+    return truncate_text(post_process_ask_ai_review(text.strip(), context_text), 1200)
 
 
 def extract_openai_response_text(data: dict[str, Any]) -> str:
@@ -4021,14 +4096,244 @@ def extract_openai_response_text(data: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def format_ask_response(context_text: str, ai_review: str | None) -> str:
-    if not ai_review:
-        return context_text
+def format_ask_response(
+    context_text: str,
+    ai_review: str | None,
+    snapshot: MarketSnapshot,
+    signals: list[Signal],
+    market_snapshots: list[MarketSnapshot],
+    liquidation_text: str | None = None,
+    full: bool = False,
+) -> str:
+    review_text = (ai_review or fallback_ask_ai_review(context_text, snapshot, signals, market_snapshots, liquidation_text)).strip()
+    review_text = post_process_ask_ai_review(review_text, context_text)
+    if not full:
+        review_text = normalize_short_ai_review(review_text)
+        entry_advice = format_ask_entry_advice(snapshot, signals)
+        return truncate_text(f"{review_text}\n开仓建议: {entry_advice}\n\n{format_ask_core_data(snapshot, liquidation_text)}", 1500)
 
-    review_text = ai_review.strip()
     prefix = f"{review_text}\n\n[系统上下文]\n" if review_text.startswith("[AI复核]") else f"[AI复核]\n{review_text}\n\n[系统上下文]\n"
     remaining = max(0, 3500 - len(prefix))
     return prefix + truncate_text(context_text, remaining)
+
+
+def fallback_ask_ai_review(
+    context_text: str,
+    snapshot: MarketSnapshot,
+    signals: list[Signal],
+    market_snapshots: list[MarketSnapshot],
+    liquidation_text: str | None = None,
+) -> str:
+    system_direction = diagnose_snapshot(snapshot, signals)
+    trade_plan = signal_trade_plan(signals[0]) if signals else "暂无交易计划"
+    short_score = short_term_score(snapshot)
+    long_flow_score = long_flow_alignment_score(snapshot)
+    market_text = market_方向_summary(market_snapshots) if market_snapshots else ""
+    confidence = "中" if ask_confidence_capped_at_medium(context_text) else "高"
+    if not signals or long_flow_score <= 3 or "暂无交易计划" in trade_plan:
+        confidence = "中"
+
+    reasons = [
+        f"短线评分 {short_score}/10，中线评分 {mid_term_score(snapshot)}/10。",
+        f"资金流共振 {flow_alignment_score(snapshot)}/10，长周期资金共振 {long_flow_score}/9。",
+        f"系统信号触发状态: {'有触发信号' if signals else '无触发信号'}。",
+    ]
+    risks = []
+    if short_score >= 7 and long_flow_score <= 3:
+        risks.append("短线强但长周期不支持，可能是假反弹/诱多观察，不属于启动确认。")
+    if "大盘风向: 偏弱" in market_text and short_score >= 7:
+        risks.append("大盘偏弱会压制单币反弹持续性。")
+    liquidation_explanation = ask_liquidation_explanation(liquidation_text or "")
+    if liquidation_explanation:
+        risks.append(liquidation_explanation)
+    if not risks:
+        risks.append("资金、结构或清算未形成足够一致的启动确认。")
+
+    conclusion = "偏观望，等待系统信号和交易计划确认。" if not signals else "按系统方向复核，通过前仍需控制仓位。"
+    operation = trade_plan
+    if "暂无交易计划" in trade_plan:
+        operation = "暂无交易计划，不建议按 AI 文本直接开仓。"
+
+    return (
+        "[AI复核]\n"
+        f"系统方向: {system_direction}\n"
+        f"AI复核结论: {conclusion}\n"
+        f"置信度: {confidence}\n"
+        "核心理由:\n"
+        + "\n".join(f"- {item}" for item in reasons[:3])
+        + "\n主要风险:\n"
+        + "\n".join(f"- {item}" for item in risks[:3])
+        + f"\n操作倾向: {operation}"
+    )
+
+
+def format_ask_core_data(snapshot: MarketSnapshot, liquidation_text: str | None = None) -> str:
+    flow_items = []
+    for period in ["5m", "15m", "1h", "4h", "12h"]:
+        flow_items.append(
+            f"{period} {format_usd(snapshot.net_flow_usd.get(period))}/r{format_optional_value(snapshot.net_flow_ratio.get(period))}"
+        )
+    liq_text = compact_liquidation_text(liquidation_text or "真实强平: n/a")
+    return (
+        "[核心数据]\n"
+        f"价格/OI/Funding: {snapshot.close_price:.8g}; 价格 {snapshot.price_change_percent:+.2f}%; "
+        f"OI {snapshot.oi_change_percent:+.2f}%; Funding {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})\n"
+        f"评分: 短线 {short_term_score(snapshot)}/10; 中线 {mid_term_score(snapshot)}/10; "
+        f"资金流共振 {flow_alignment_score(snapshot)}/10; 长周期资金共振 {long_flow_alignment_score(snapshot)}/9\n"
+        f"资金: {'; '.join(flow_items)}\n"
+        f"长周期: {long_flow_alignment_note(long_flow_alignment_score(snapshot))}\n"
+        f"现货/链上: {spot_alpha_confirmation(snapshot.symbol)}\n"
+        f"清算推断: {liquidation_risk_label(snapshot)}\n"
+        f"真实强平: {liq_text}"
+    )
+
+
+def compact_liquidation_text(text: str) -> str:
+    compact = " ".join(str(text).split())
+    compact = compact.replace("真实强平: ", "")
+    return truncate_text(compact, 260)
+
+
+def format_ask_entry_advice(snapshot: MarketSnapshot, signals: list[Signal]) -> str:
+    trade_plan = signal_trade_plan(signals[0]) if signals else "暂无交易计划"
+    if signals and "暂无交易计划" not in trade_plan:
+        advice = "按交易计划观察"
+    else:
+        advice = "不开仓，只观察"
+    if long_flow_alignment_score(snapshot) <= 3 and "长周期不支持" not in advice:
+        advice = f"{advice}，长周期不支持"
+    return advice
+
+
+def format_ask_data_source_text(data_source_text: str, full: bool = False) -> str:
+    mode_text = "完整" if full else "简洁"
+    return f"{data_source_text} | 模式: {mode_text}"
+
+
+def ask_stale_cache_note(data_source_text: str) -> str | None:
+    match = re.search(r"数据来源:\s*缓存\s*(\d+)秒前", data_source_text)
+    if match and int(match.group(1)) > TELEGRAM_SNAPSHOT_CACHE_TTL_SECONDS:
+        return "注意: 缓存偏旧"
+    return None
+
+
+def ask_confidence_capped_at_medium(context_text: str) -> bool:
+    if "信号触发状态: 无触发信号" in context_text:
+        return True
+    if "交易计划:\n暂无交易计划" in context_text or "交易计划: 暂无交易计划" in context_text:
+        return True
+    match = re.search(r"长周期资金共振:\s*(\d+)/9", context_text)
+    return bool(match and int(match.group(1)) <= 3)
+
+
+def post_process_ask_ai_review(review_text: str, context_text: str) -> str:
+    text = review_text.strip()
+    if ask_confidence_capped_at_medium(context_text):
+        text = re.sub(r"(置信度:\s*)高", r"\1中", text)
+    short_score = ask_context_score(context_text, "短线评分")
+    long_flow_score = ask_context_score(context_text, "长周期资金共振")
+    if short_score is not None and short_score >= 7 and long_flow_score is not None and long_flow_score <= 3:
+        text = append_ask_bullet(
+            text,
+            "主要风险:",
+            "短线强但长周期不支持，可能是假反弹/诱多观察，不属于启动确认。",
+        )
+    if "大盘风向: 偏弱" in context_text and short_score is not None and short_score >= 7:
+        text = append_ask_bullet(text, "主要风险:", "大盘偏弱会压制单币反弹持续性。")
+    liquidation_explanation = ask_liquidation_explanation(context_text)
+    if liquidation_explanation:
+        text = append_ask_bullet(text, "主要风险:", liquidation_explanation)
+    if "交易计划:\n暂无交易计划" in context_text or "交易计划: 暂无交易计划" in context_text:
+        required = "暂无交易计划，不建议按 AI 文本直接开仓。"
+        if required not in text:
+            text = append_to_ask_field(text, "操作倾向:", required)
+    return text
+
+
+def normalize_short_ai_review(text: str) -> str:
+    text = limit_short_ai_review_bullets(text, "核心理由:", 3)
+    text = limit_short_ai_review_bullets(text, "主要风险:", 3)
+    return keep_first_short_ai_review_warning(text)
+
+
+def limit_short_ai_review_bullets(text: str, field: str, max_items: int) -> str:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith(field):
+            continue
+        end = len(lines)
+        for next_index in range(index + 1, len(lines)):
+            if short_ai_review_field_header(lines[next_index]):
+                end = next_index
+                break
+        kept = []
+        bullet_count = 0
+        for section_line in lines[index + 1 : end]:
+            if section_line.startswith("- "):
+                bullet_count += 1
+                if bullet_count > max_items:
+                    continue
+            kept.append(section_line)
+        return "\n".join(lines[: index + 1] + kept + lines[end:])
+    return text
+
+
+def short_ai_review_field_header(line: str) -> bool:
+    return bool(re.match(r"^[^\s\-][^:：]{0,20}[:：]", line))
+
+
+def keep_first_short_ai_review_warning(text: str) -> str:
+    warning = "暂无交易计划，不建议按 AI 文本直接开仓"
+    matches = list(re.finditer(re.escape(warning) + "。?", text))
+    if len(matches) <= 1:
+        return text
+    parts = []
+    cursor = 0
+    for index, match in enumerate(matches):
+        if index == 0:
+            continue
+        parts.append(text[cursor : match.start()])
+        cursor = match.end()
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def ask_context_score(context_text: str, label: str) -> int | None:
+    match = re.search(rf"{re.escape(label)}:\s*(\d+)/", context_text)
+    return int(match.group(1)) if match else None
+
+
+def append_to_ask_field(text: str, field: str, addition: str) -> str:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(field):
+            if addition not in line:
+                lines[index] = f"{line} {addition}"
+            return "\n".join(lines)
+    return f"{text}\n{field} {addition}"
+
+
+def append_ask_bullet(text: str, field: str, addition: str) -> str:
+    if addition in text:
+        return text
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(field):
+            lines.insert(index + 1, f"- {addition}")
+            return "\n".join(lines)
+    return f"{text}\n{field}\n- {addition}"
+
+
+def ask_liquidation_explanation(liquidation_text: str) -> str | None:
+    if "多头强平主导" in liquidation_text:
+        return "多头被清较多，说明短线下跌压力/止损释放更明显；除非资金回流和结构止跌，否则不能直接当作抄底依据。"
+    if "空头强平主导" in liquidation_text:
+        return "空头被清较多，说明短线逼空/上冲压力释放；除非资金继续承接，否则不能直接追多。"
+    if "双向强平/剧烈洗盘" in liquidation_text:
+        return "上下波动都剧烈，适合观望等待结构确认。"
+    if "强平分散" in liquidation_text or "近1h暂无明显强平数据" in liquidation_text:
+        return "清算不能作为方向确认依据。"
+    return None
 
 
 def format_ask_signal_list(signals: list[Signal]) -> str:
