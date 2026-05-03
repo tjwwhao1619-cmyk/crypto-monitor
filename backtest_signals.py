@@ -11,7 +11,7 @@ import yaml
 BASE = "https://fapi.binance.com"
 BULL = {"discovery", "hot_breakout", "bottom_reversal"}
 BEAR = {"top_risk", "distribution", "top_exhaustion"}
-HORIZONS = {"15m": 900, "1h": 3600, "4h": 14400, "24h": 86400}
+HORIZONS = {"15m": 900, "1h": 3600, "4h": 14400, "12h": 43200, "24h": 86400}
 
 
 def parse_time(value):
@@ -82,6 +82,9 @@ def eval_signal(session, row):
 
     side = direction(kind)
     out = {"symbol": symbol, "kind": kind, "side": side}
+    for name in ("12h", "24h"):
+        out[f"flow_{name}"] = parse_float(row.get(f"net_flow_{name}_usd"))
+        out[f"flow_{name}_ratio"] = parse_float(row.get(f"net_flow_{name}_ratio"))
     for name, sec in HORIZONS.items():
         if now_ts < start + sec:
             out[name] = None
@@ -102,6 +105,41 @@ def eval_signal(session, row):
 
 def fmt(v):
     return "-" if v is None else f"{v:+.2f}%"
+
+
+def parse_float(value):
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def fmt_usd(v):
+    if v is None:
+        return "-"
+    abs_value = abs(v)
+    sign = "+" if v >= 0 else "-"
+    if abs_value >= 1_000_000:
+        return f"{sign}{abs_value / 1_000_000:.2f}M"
+    if abs_value >= 1_000:
+        return f"{sign}{abs_value / 1_000:.1f}K"
+    return f"{sign}{abs_value:.0f}"
+
+
+def fmt_ratio(v):
+    return "-" if v is None else f"{v:.4g}"
+
+
+def flow_detail(x):
+    parts = []
+    for name in ("12h", "24h"):
+        flow = x.get(f"flow_{name}")
+        ratio = x.get(f"flow_{name}_ratio")
+        if flow is not None or ratio is not None:
+            parts.append(f"flow{name}={fmt_usd(flow)}/r={fmt_ratio(ratio)}")
+    return " " + " ".join(parts) if parts else ""
 
 
 def main():
@@ -137,7 +175,7 @@ def main():
     for kind in sorted(set(x["kind"] for x in results)):
         group = [x for x in results if x["kind"] == kind]
         print(f"{kind} 样本={len(group)}")
-        for h in ["15m", "1h", "4h", "24h"]:
+        for h in ["15m", "1h", "4h", "12h", "24h"]:
             vals = [x[h] for x in group if x[h] is not None]
             if not vals:
                 continue
@@ -153,8 +191,9 @@ def main():
     for x in results[:20]:
         print(
             f"{x['symbol']} {x['kind']} {x['side']} "
-            f"15m={fmt(x['15m'])} 1h={fmt(x['1h'])} 4h={fmt(x['4h'])} 24h={fmt(x['24h'])} "
-            f"MFE={fmt(x['mfe'])} MAE={fmt(x['mae'])}"
+            f"15m={fmt(x['15m'])} 1h={fmt(x['1h'])} 4h={fmt(x['4h'])} "
+            f"12h={fmt(x['12h'])} 24h={fmt(x['24h'])}"
+            f"{flow_detail(x)} MFE={fmt(x['mfe'])} MAE={fmt(x['mae'])}"
         )
 
 

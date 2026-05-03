@@ -23,6 +23,7 @@ import yaml
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 BINANCE_FUTURES_DATA_BASE = "https://fapi.binance.com/futures/data"
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+FLOW_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h"]
 
 
 @dataclass(frozen=True)
@@ -77,10 +78,14 @@ SIGNAL_LOG_FIELDS = [
     "net_flow_15m_usd",
     "net_flow_1h_usd",
     "net_flow_4h_usd",
+    "net_flow_12h_usd",
+    "net_flow_24h_usd",
     "net_flow_5m_ratio",
     "net_flow_15m_ratio",
     "net_flow_1h_ratio",
     "net_flow_4h_ratio",
+    "net_flow_12h_ratio",
+    "net_flow_24h_ratio",
     "price_position_24h",
     "high_24h",
     "low_24h",
@@ -492,7 +497,8 @@ class DerivativesMonitor:
 
         net_flow_usd = {}
         net_flow_ratio = {}
-        periods = self.flow_config.get("periods", ["5m", "15m", "1h", "4h"])
+        configured_periods = [str(period) for period in self.flow_config.get("periods", FLOW_PERIODS)]
+        periods = list(dict.fromkeys(configured_periods + FLOW_PERIODS))
 
         for period in periods:
             try:
@@ -732,7 +738,9 @@ class DerivativesMonitor:
             f"5m资金流={format_usd(snapshot.net_flow_usd.get('5m'))}, "
             f"15m资金流={format_usd(snapshot.net_flow_usd.get('15m'))}, "
             f"1h资金流={format_usd(snapshot.net_flow_usd.get('1h'))}, "
-            f"4h资金流={format_usd(snapshot.net_flow_usd.get('4h'))}."
+            f"4h资金流={format_usd(snapshot.net_flow_usd.get('4h'))}, "
+            f"12h资金流={format_usd(snapshot.net_flow_usd.get('12h'))}, "
+            f"24h资金流={format_usd(snapshot.net_flow_usd.get('24h'))}."
         )
 
     def cooldown_seconds_for(self, signal: Signal) -> int:
@@ -821,10 +829,14 @@ class DerivativesMonitor:
             "net_flow_15m_usd": snapshot.net_flow_usd.get("15m", "") if snapshot else "",
             "net_flow_1h_usd": snapshot.net_flow_usd.get("1h", "") if snapshot else "",
             "net_flow_4h_usd": snapshot.net_flow_usd.get("4h", "") if snapshot else "",
+            "net_flow_12h_usd": snapshot.net_flow_usd.get("12h", "") if snapshot else "",
+            "net_flow_24h_usd": snapshot.net_flow_usd.get("24h", "") if snapshot else "",
             "net_flow_5m_ratio": snapshot.net_flow_ratio.get("5m", "") if snapshot else "",
             "net_flow_15m_ratio": snapshot.net_flow_ratio.get("15m", "") if snapshot else "",
             "net_flow_1h_ratio": snapshot.net_flow_ratio.get("1h", "") if snapshot else "",
             "net_flow_4h_ratio": snapshot.net_flow_ratio.get("4h", "") if snapshot else "",
+            "net_flow_12h_ratio": snapshot.net_flow_ratio.get("12h", "") if snapshot else "",
+            "net_flow_24h_ratio": snapshot.net_flow_ratio.get("24h", "") if snapshot else "",
             "price_position_24h": snapshot.price_position_24h if snapshot else "",
             "high_24h": snapshot.high_24h if snapshot else "",
             "low_24h": snapshot.low_24h if snapshot else "",
@@ -2465,8 +2477,9 @@ def format_signal_for_telegram(signal: Signal) -> str:
         f"主动买卖比: {format_optional_value(snapshot.taker_buy_sell_ratio)}\n"
         f"Funding: {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})\n"
         f"24h位置: {format_optional_value(snapshot.price_position_24h)}% ({price_position_label(snapshot)}) / 高 {format_optional_value(snapshot.high_24h)} / 低 {format_optional_value(snapshot.low_24h)}\n"
-        f"资金流: 5m {format_usd(snapshot.net_flow_usd.get('5m'))} / 15m {format_usd(snapshot.net_flow_usd.get('15m'))} / 1h {format_usd(snapshot.net_flow_usd.get('1h'))} / 4h {format_usd(snapshot.net_flow_usd.get('4h'))}\n"
+        f"资金流: {format_flow_summary(snapshot)}\n"
         f"资金流共振: {flow_alignment_score(snapshot)}/10 ({flow_alignment_note(flow_alignment_score(snapshot))})\n"
+        f"长周期资金共振: {long_flow_alignment_score(snapshot)}/9 ({long_flow_alignment_note(long_flow_alignment_score(snapshot))})\n"
         f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_label(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_label(mid_term_score(snapshot))})\n"
@@ -2531,6 +2544,30 @@ def flow_alignment_score(snapshot: MarketSnapshot | None) -> int:
         return 0
     weights = {"5m": 1, "15m": 2, "1h": 3, "4h": 4}
     return sum(weight for period, weight in weights.items() if snapshot.net_flow_usd.get(period, 0) > 0)
+
+
+def long_flow_alignment_score(snapshot: MarketSnapshot | None) -> int:
+    if snapshot is None:
+        return 0
+    weights = {"4h": 2, "12h": 3, "24h": 4}
+    return sum(weight for period, weight in weights.items() if snapshot.net_flow_usd.get(period, 0) > 0)
+
+
+def long_flow_alignment_note(score: int) -> str:
+    if score >= 7:
+        return "强共振: 长周期资金方向一致"
+    if score >= 4:
+        return "中性偏强: 长周期资金有支持"
+    if score >= 2:
+        return "偏弱: 长周期资金分歧"
+    return "弱: 长周期资金不支持"
+
+
+def format_flow_summary(snapshot: MarketSnapshot) -> str:
+    return " / ".join(
+        f"{period} {format_usd(snapshot.net_flow_usd.get(period))}"
+        for period in FLOW_PERIODS
+    )
 
 
 
@@ -3241,8 +3278,9 @@ def format_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> 
         f"大户账户多空比: {format_optional_value(snapshot.top_account_ratio)}\n"
         f"主动买卖比: {format_optional_value(snapshot.taker_buy_sell_ratio)}\n"
         f"Funding: {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})\n"
-        f"资金流: 5m {format_usd(snapshot.net_flow_usd.get('5m'))} / 15m {format_usd(snapshot.net_flow_usd.get('15m'))} / 1h {format_usd(snapshot.net_flow_usd.get('1h'))} / 4h {format_usd(snapshot.net_flow_usd.get('4h'))}\n"
+        f"资金流: {format_flow_summary(snapshot)}\n"
         f"资金流共振: {flow_alignment_score(snapshot)}/10 ({flow_alignment_note(flow_alignment_score(snapshot))})\n"
+        f"长周期资金共振: {long_flow_alignment_score(snapshot)}/9 ({long_flow_alignment_note(long_flow_alignment_score(snapshot))})\n"
         f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
@@ -3265,6 +3303,7 @@ def format_ask_context(
     recent_text = format_recent_symbol_signals(recent_signal_rows)
     market_text = market_方向_summary(market_snapshots) if market_snapshots else "大盘风向: 暂无 BTC/ETH/SOL 快照"
     flow_score = flow_alignment_score(snapshot)
+    long_flow_score = long_flow_alignment_score(snapshot)
     system_direction = diagnose_snapshot(snapshot, signals)
     triggered_signal_state = "有触发信号" if signals else "无触发信号"
     available_levels = (
@@ -3302,7 +3341,10 @@ def format_ask_context(
         f"15m: {format_usd(snapshot.net_flow_usd.get('15m'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('15m'))}\n"
         f"1h: {format_usd(snapshot.net_flow_usd.get('1h'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('1h'))}\n"
         f"4h: {format_usd(snapshot.net_flow_usd.get('4h'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('4h'))}\n"
-        f"资金流共振: {flow_score}/10 ({flow_alignment_note(flow_score)})\n\n"
+        f"12h: {format_usd(snapshot.net_flow_usd.get('12h'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('12h'))}\n"
+        f"24h: {format_usd(snapshot.net_flow_usd.get('24h'))} / ratio {format_optional_value(snapshot.net_flow_ratio.get('24h'))}\n"
+        f"资金流共振: {flow_score}/10 ({flow_alignment_note(flow_score)})\n"
+        f"长周期资金共振: {long_flow_score}/9 ({long_flow_alignment_note(long_flow_score)})\n\n"
         f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
@@ -3451,8 +3493,9 @@ def print_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> N
     print(f"Funding: {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})")
     print(f"24h位置: {format_optional_value(snapshot.price_position_24h)}% ({position_note(snapshot)}) / 高 {format_optional_value(snapshot.high_24h)} / 低 {format_optional_value(snapshot.low_24h)}")
     print(f"24h成交额: {format_usd(snapshot.quote_volume_24h or 0)} / 成交额OI比: {format_optional_value(snapshot.volume_ratio_24h)} ({volume_note(snapshot)})")
-    print(f"资金流: 5m {format_usd(snapshot.net_flow_usd.get('5m'))} / 15m {format_usd(snapshot.net_flow_usd.get('15m'))} / 1h {format_usd(snapshot.net_flow_usd.get('1h'))} / 4h {format_usd(snapshot.net_flow_usd.get('4h'))}")
+    print(f"资金流: {format_flow_summary(snapshot)}")
     print(f"资金流共振: {flow_alignment_score(snapshot)}/10 ({flow_alignment_note(flow_alignment_score(snapshot))})")
+    print(f"长周期资金共振: {long_flow_alignment_score(snapshot)}/9 ({long_flow_alignment_note(long_flow_alignment_score(snapshot))})")
     print(f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}")
     print(f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})")
     print(f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})")
