@@ -79,6 +79,14 @@ class Signal:
 
 
 @dataclass(frozen=True)
+class MainAssetScore:
+    total_score: int
+    label: str
+    components: dict[str, int]
+    note: str
+
+
+@dataclass(frozen=True)
 class LiquidationEvent:
     symbol: str
     side: str
@@ -2357,7 +2365,7 @@ def market_tier(symbol: str) -> str:
 
 
 def is_major_asset_tier(symbol: str) -> bool:
-    return market_tier(symbol) in ("core", "large")
+    return market_tier(symbol) in ("core", "major", "large")
 
 
 def tier_threshold(symbol: str, rule: dict[str, Any], name: str, default: float) -> float:
@@ -3974,6 +3982,245 @@ def long_flow_alignment_note(score: int) -> str:
     return "弱: 长周期资金不支持"
 
 
+def main_asset_score(
+    snapshot: MarketSnapshot,
+    liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
+    market_text: str | None = None,
+) -> MainAssetScore | None:
+    if not is_major_asset_tier(snapshot.symbol):
+        return None
+
+    long_flow_score = long_flow_alignment_score(snapshot)
+    trend = 20 if long_flow_score >= 7 else (10 if long_flow_score >= 4 else 0)
+    flow_1h = snapshot.net_flow_usd.get("1h", 0)
+    flow_4h = snapshot.net_flow_usd.get("4h", 0)
+    if flow_1h > 0 and flow_4h > 0:
+        trend += 10
+    elif flow_1h < 0 and flow_4h < 0:
+        trend += 0
+    else:
+        trend += 5
+    if snapshot.price_position_24h is not None and 20 <= snapshot.price_position_24h <= 80:
+        trend += 5
+    trend = min(35, trend)
+
+    oi_score = coinglass_oi_score(coinglass_text)
+    taker_score = coinglass_taker_score(coinglass_text, snapshot)
+    funds = min(25, oi_score + taker_score)
+
+    derivatives = 0
+    funding_extreme = is_extreme_funding(snapshot)
+    if not funding_extreme:
+        derivatives += 8
+    derivatives += liquidation_score(liquidation_text)
+    derivatives += crowding_score(snapshot)
+    derivatives = min(20, derivatives)
+
+    spot_orderbook = min(
+        10,
+        spot_confirmation_score(spot_alpha_confirmation(snapshot.symbol))
+        + orderbook_confirmation_score(coinglass_text),
+    )
+
+    risk_deduction = 0
+    risk_label = liquidation_risk_label(snapshot)
+    if "双向高波动" in risk_label:
+        risk_deduction -= 8
+    if funding_extreme:
+        risk_deduction -= 5
+    if snapshot.oi_change_percent >= 3 and (long_flow_score <= 3 or (flow_1h <= 0 and flow_4h <= 0)):
+        risk_deduction -= 5
+    if market_text and "大盘风向: 偏弱" in market_text:
+        risk_deduction -= 2
+    risk_deduction = max(-20, risk_deduction)
+
+    total = max(0, min(100, trend + funds + derivatives + spot_orderbook + risk_deduction))
+    label = main_asset_score_label(total, risk_deduction, risk_label)
+    components = {
+        "趋势": trend,
+        "资金": funds,
+        "衍生品": derivatives,
+        "现货订单簿": spot_orderbook,
+        "风险扣分": risk_deduction,
+    }
+    return MainAssetScore(
+        total_score=total,
+        label=label,
+        components=components,
+        note=main_asset_score_note(label, components),
+    )
+
+
+def main_asset_score_label(total: int, risk_deduction: int, risk_label: str) -> str:
+    if risk_deduction <= -13 or (total < 25 and "双向高波动" in risk_label):
+        return "高风险"
+    if total >= 75:
+        return "偏强"
+    if total >= 60:
+        return "中性偏强"
+    if total >= 45:
+        return "中性"
+    if total >= 35:
+        return "中性偏弱"
+    if total >= 25:
+        return "偏弱"
+    return "高风险"
+
+
+def main_asset_score_note(label: str, components: dict[str, int]) -> str:
+    if label == "偏强":
+        return "趋势、资金与衍生品确认度较高，但仍需控制追高风险。"
+    if label == "中性偏强":
+        return "主流资金结构略偏多，适合等待回踩或信号确认。"
+    if label == "中性":
+        return "多空证据暂未充分一致，继续观察确认。"
+    if label == "中性偏弱":
+        return "资金或订单簿支持不足，反弹持续性需要验证。"
+    if label == "偏弱":
+        return "趋势与资金确认偏弱，优先防守观察。"
+    return "风险项压过正向确认，短线不适合激进开仓。"
+
+
+def coinglass_oi_score(coinglass_text: str | None) -> int:
+    if not coinglass_text:
+        return 0
+    weights = {"1h": 5, "4h": 6, "24h": 6}
+    score = 0
+    for period, weight in weights.items():
+        value = extract_coinglass_oi_change(coinglass_text, period)
+        if value is None:
+            continue
+        if 0 < value <= 8:
+            score += weight
+        elif value > 8:
+            score += max(1, weight - 2)
+        elif value >= -1:
+            score += 2
+    return min(17, score)
+
+
+def extract_coinglass_oi_change(text: str, period: str) -> float | None:
+    match = re.search(rf"{re.escape(period)}\s*([+\-]?\d+(?:\.\d+)?)%", text)
+    if not match:
+        return None
+    return parse_float(match.group(1))
+
+
+def coinglass_taker_score(coinglass_text: str | None, snapshot: MarketSnapshot) -> int:
+    buy_ratio, sell_ratio = extract_coinglass_taker_ratios(coinglass_text)
+    if buy_ratio is not None and sell_ratio is not None:
+        if buy_ratio > 52:
+            return 8
+        if sell_ratio > 52:
+            return 0
+        return 4
+    taker = snapshot.taker_buy_sell_ratio
+    if taker is None:
+        return 4
+    if taker >= 1.08:
+        return 8
+    if taker <= 0.92:
+        return 0
+    return 4
+
+
+def extract_coinglass_taker_ratios(text: str | None) -> tuple[float | None, float | None]:
+    if not text:
+        return None, None
+    match = re.search(
+        r"主动买卖\s*24h\s*买\s*([+\-]?\d+(?:\.\d+)?)%\s*/\s*卖\s*([+\-]?\d+(?:\.\d+)?)%",
+        text,
+    )
+    if not match:
+        return None, None
+    return parse_float(match.group(1)), parse_float(match.group(2))
+
+
+def is_extreme_funding(snapshot: MarketSnapshot) -> bool:
+    return snapshot.funding_rate_percent is not None and abs(snapshot.funding_rate_percent) >= 0.08
+
+
+def liquidation_score(liquidation_text: str | None) -> int:
+    text = liquidation_text or ""
+    if any(item in text for item in ("强平分散", "近1h暂无明显强平数据", "暂无明显强平")):
+        return 6
+    if "双向强平" in text or "剧烈洗盘" in text:
+        return 2
+    if "多头强平主导" in text or "空头强平主导" in text:
+        return 4
+    return 6
+
+
+def crowding_score(snapshot: MarketSnapshot) -> int:
+    ratios = [
+        snapshot.global_long_short_ratio,
+        snapshot.top_position_ratio,
+        snapshot.top_account_ratio,
+    ]
+    usable = [ratio for ratio in ratios if ratio is not None]
+    if not usable:
+        return 3
+    if all(0.75 <= ratio <= 2.0 for ratio in usable):
+        return 6
+    return 3
+
+
+def spot_confirmation_score(spot_text: str) -> int:
+    if "偏强" in spot_text and "偏弱" not in spot_text:
+        return 4
+    if "偏弱" in spot_text and "偏强" not in spot_text:
+        return 0
+    if "偏强" in spot_text:
+        return 2
+    if "中性" in spot_text:
+        return 2
+    return 0
+
+
+def orderbook_confirmation_score(coinglass_text: str | None) -> int:
+    if not coinglass_text:
+        return 0
+    if "下方承接偏强" in coinglass_text:
+        return 6
+    if "上方卖压偏强" in coinglass_text:
+        return 0
+    if "均衡" in coinglass_text or "相对均衡" in coinglass_text:
+        return 3
+    return 0
+
+
+def format_main_asset_score_line(
+    snapshot: MarketSnapshot,
+    liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
+    market_text: str | None = None,
+) -> str:
+    score = main_asset_score(snapshot, liquidation_text, coinglass_text, market_text)
+    if score is None:
+        return ""
+    return f"主流评分: {score.total_score}/100 ({score.label}) - {score.note}"
+
+
+def format_main_asset_score_detail(
+    snapshot: MarketSnapshot,
+    liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
+    market_text: str | None = None,
+) -> str:
+    score = main_asset_score(snapshot, liquidation_text, coinglass_text, market_text)
+    if score is None:
+        return ""
+    components = score.components
+    return (
+        f"主流评分: {score.total_score}/100 ({score.label})\n"
+        f"趋势 {components['趋势']}/35 | 资金 {components['资金']}/25 | "
+        f"衍生品 {components['衍生品']}/20 | 现货订单簿 {components['现货订单簿']}/10 | "
+        f"风险扣分 {components['风险扣分']}\n"
+        f"结论: {score.note}"
+    )
+
+
 def format_flow_summary(snapshot: MarketSnapshot) -> str:
     return " / ".join(
         f"{period} {format_usd(snapshot.net_flow_usd.get(period))}"
@@ -4821,6 +5068,8 @@ def format_symbol_diagnosis(
     signal_names = ", ".join(signal.kind for signal in signals) or "-"
     major_long_text = format_major_long_cycle_context(snapshot, coinglass_text)
     major_long_part = f"{major_long_text}\n" if major_long_text else ""
+    main_score_text = format_main_asset_score_detail(snapshot, liquidation_text, coinglass_text)
+    main_score_part = f"{main_score_text}\n" if main_score_text else ""
     return (
         f"{snapshot.symbol}\n"
         f"价格: {snapshot.close_price:.8g}\n"
@@ -4837,6 +5086,7 @@ def format_symbol_diagnosis(
         f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
+        f"{main_score_part}"
         f"信号: {signal_names}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
@@ -4876,6 +5126,8 @@ def format_ask_context(
     )
     major_long_text = format_major_long_cycle_context(snapshot, coinglass_text)
     major_long_part = f"{major_long_text}\n" if major_long_text else ""
+    main_score_text = format_main_asset_score_detail(snapshot, liquidation_text, coinglass_text, market_text)
+    main_score_part = f"{main_score_text}\n" if main_score_text else ""
 
     text = (
         f"[ASK] {snapshot.symbol} 结构化上下文\n"
@@ -4885,6 +5137,7 @@ def format_ask_context(
         f"信号触发状态: {triggered_signal_state}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
+        f"{main_score_part}"
         f"大盘风向: {market_text}\n\n"
         "基础数据:\n"
         f"当前价格: {snapshot.close_price:.8g}\n"
@@ -5105,6 +5358,8 @@ def format_ask_core_data(
     major_long_part = f"{major_long_text}\n" if major_long_text else ""
     orderbook_text = compact_coinglass_orderbook_context(snapshot, coinglass_text)
     orderbook_part = f"订单簿: {orderbook_text}\n" if orderbook_text else ""
+    main_score_text = format_main_asset_score_line(snapshot, liquidation_text, coinglass_text)
+    main_score_part = f"{main_score_text}\n" if main_score_text else ""
     coinglass_part = ""
     if not is_major_asset_tier(snapshot.symbol):
         coinglass_part = f"CoinGlass: {compact_coinglass_market_context(coinglass_text or 'CoinGlass聚合: n/a')}"
@@ -5114,6 +5369,7 @@ def format_ask_core_data(
         f"OI {snapshot.oi_change_percent:+.2f}%; Funding {format_optional_value(snapshot.funding_rate_percent)}% ({funding_note(snapshot.funding_rate_percent)})\n"
         f"评分: 短线 {short_term_score(snapshot)}/10; 中线 {mid_term_score(snapshot)}/10; "
         f"资金流共振 {flow_alignment_score(snapshot)}/10; 长周期资金共振 {long_flow_alignment_score(snapshot)}/9\n"
+        f"{main_score_part}"
         f"资金: {'; '.join(flow_items)}\n"
         f"长周期: {long_flow_alignment_note(long_flow_alignment_score(snapshot))}\n"
         f"现货/链上: {spot_alpha_confirmation(snapshot.symbol)}\n"
@@ -5368,6 +5624,9 @@ def print_symbol_diagnosis(
     print(f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}")
     print(f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})")
     print(f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})")
+    main_score_text = format_main_asset_score_detail(snapshot, liquidation_text, coinglass_text)
+    if main_score_text:
+        print(main_score_text)
     print(f"信号: {signal_names}")
     print(f"结构判断: {market_structure_label(snapshot)}")
     print(f"清算风险: {liquidation_risk_label(snapshot)}")
