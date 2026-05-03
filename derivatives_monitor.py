@@ -5197,7 +5197,7 @@ def ask_ai_review(context_text: str) -> str | None:
         "如果'长周期资金共振'小于等于3/9，置信度最高只能是'中'，不得写'高'。"
         "如果短线评分大于等于7但长周期资金共振小于等于3/9，必须明确写: '短线强但长周期不支持，可能是假反弹/诱多观察，不属于启动确认。'"
         "如果大盘风向偏弱且单币短线偏强，必须写成风险: '大盘偏弱会压制单币反弹持续性。'"
-        "如果真实强平为'多头强平主导'，必须解释: '多头被清较多，说明短线下跌压力/止损释放更明显；除非资金回流和结构止跌，否则不能直接当作抄底依据。'"
+        "如果真实强平为'多头强平主导'，必须解释: '多头被清较多，说明短线下跌压力/止损释放；除非资金回流和结构止跌，否则不能直接抄底。'"
         "如果真实强平为'空头强平主导'，必须解释: '空头被清较多，说明短线逼空/上冲压力释放；除非资金继续承接，否则不能直接追多。'"
         "如果真实强平为'双向强平/剧烈洗盘'，必须解释: '上下波动都剧烈，适合观望等待结构确认。'"
         "如果真实强平为'强平分散'、'强平活跃但方向分散'或'近1h暂无明显强平数据'，不得把清算作为方向确认依据。"
@@ -5283,10 +5283,10 @@ def format_ask_response(
     review_text = normalize_ai_review_text(review_text)
     if not full:
         entry_advice = format_ask_entry_advice(snapshot, signals)
-        return truncate_text(
+        return fix_ask_orderbook_parenthesis(truncate_text(
             f"{review_text}\n开仓建议: {entry_advice}\n\n{format_ask_core_data(snapshot, liquidation_text, coinglass_text)}",
             1500,
-        )
+        ))
 
     prefix = f"{review_text}\n\n[系统上下文]\n" if review_text.startswith("[AI复核]") else f"[AI复核]\n{review_text}\n\n[系统上下文]\n"
     remaining = max(0, 3500 - len(prefix))
@@ -5422,6 +5422,7 @@ def ask_confidence_capped_at_medium(context_text: str) -> bool:
 def post_process_ask_ai_review(review_text: str, context_text: str) -> str:
     text = review_text.strip()
     text = fix_negative_funding_cost_explanation(text)
+    text = fix_liquidation_dominance_explanation(text, context_text)
     if ask_confidence_capped_at_medium(context_text):
         text = re.sub(r"(置信度:\s*)高", r"\1中", text)
     short_score = ask_context_score(context_text, "短线评分")
@@ -5451,6 +5452,29 @@ def fix_negative_funding_cost_explanation(text: str) -> str:
         r"[^。；\n]*"
     )
     return re.sub(pattern, "极端负Funding显示空头成本高/空头拥挤", text, flags=re.IGNORECASE)
+
+
+def fix_liquidation_dominance_explanation(text: str, context_text: str) -> str:
+    if "空头强平主导" not in context_text:
+        return text
+    correct = "空头被清较多，说明短线逼空/上冲压力释放；除非资金继续承接，否则不能直接追多。"
+    bad_keywords = ("回踩压力", "下跌压力", "卖压", "抛压")
+    fixed_lines = []
+    for line in text.splitlines():
+        if "空头强平主导" in line and any(keyword in line for keyword in bad_keywords):
+            prefix = "- " if line.startswith("- ") else ""
+            fixed_lines.append(f"{prefix}{correct}")
+        else:
+            fixed_lines.append(line)
+    return "\n".join(fixed_lines)
+
+
+def fix_ask_orderbook_parenthesis(text: str) -> str:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("订单簿:") and line.count("（") > line.count("）"):
+            lines[index] = f"{line}）"
+    return "\n".join(lines)
 
 
 def compact_coinglass_market_context(text: str) -> str:
@@ -5561,7 +5585,7 @@ def append_ask_bullet(text: str, field: str, addition: str) -> str:
 
 def ask_liquidation_explanation(liquidation_text: str) -> str | None:
     if "多头强平主导" in liquidation_text:
-        return "多头被清较多，说明短线下跌压力/止损释放更明显；除非资金回流和结构止跌，否则不能直接当作抄底依据。"
+        return "多头被清较多，说明短线下跌压力/止损释放；除非资金回流和结构止跌，否则不能直接抄底。"
     if "空头强平主导" in liquidation_text:
         return "空头被清较多，说明短线逼空/上冲压力释放；除非资金继续承接，否则不能直接追多。"
     if "双向强平/剧烈洗盘" in liquidation_text:
