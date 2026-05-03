@@ -94,6 +94,7 @@ SIGNAL_LOG_FIELDS = [
     "short_term_score",
     "mid_term_score",
     "flow_alignment_score",
+    "long_flow_alignment_score",
     "structure_label",
     "trade_plan",
 ]
@@ -845,6 +846,7 @@ class DerivativesMonitor:
             "short_term_score": short_term_score(snapshot) if snapshot else "",
             "mid_term_score": mid_term_score(snapshot) if snapshot else "",
             "flow_alignment_score": flow_alignment_score(snapshot) if snapshot else "",
+            "long_flow_alignment_score": long_flow_alignment_score(snapshot) if snapshot else "",
             "structure_label": market_structure_label(snapshot) if snapshot else "",
             "trade_plan": signal_trade_plan(signal) if snapshot else "",
         }

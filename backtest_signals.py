@@ -12,6 +12,11 @@ BASE = "https://fapi.binance.com"
 BULL = {"discovery", "hot_breakout", "bottom_reversal"}
 BEAR = {"top_risk", "distribution", "top_exhaustion"}
 HORIZONS = {"15m": 900, "1h": 3600, "4h": 14400, "12h": 43200, "24h": 86400}
+LONG_FLOW_GROUPS = (
+    ("0-3", "长周期弱", 0, 3),
+    ("4-6", "长周期分歧", 4, 6),
+    ("7-9", "长周期支持", 7, 9),
+)
 
 
 def parse_time(value):
@@ -82,6 +87,7 @@ def eval_signal(session, row):
 
     side = direction(kind)
     out = {"symbol": symbol, "kind": kind, "side": side}
+    out["long_flow_alignment_score"] = parse_int(row.get("long_flow_alignment_score"))
     for name in ("12h", "24h"):
         out[f"flow_{name}"] = parse_float(row.get(f"net_flow_{name}_usd"))
         out[f"flow_{name}_ratio"] = parse_float(row.get(f"net_flow_{name}_ratio"))
@@ -116,6 +122,15 @@ def parse_float(value):
         return None
 
 
+def parse_int(value):
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except Exception:
+        return None
+
+
 def fmt_usd(v):
     if v is None:
         return "-"
@@ -134,12 +149,59 @@ def fmt_ratio(v):
 
 def flow_detail(x):
     parts = []
+    long_flow = x.get("long_flow_alignment_score")
+    if long_flow is not None:
+        parts.append(f"longFlow={long_flow}/9")
     for name in ("12h", "24h"):
         flow = x.get(f"flow_{name}")
         ratio = x.get(f"flow_{name}_ratio")
         if flow is not None or ratio is not None:
             parts.append(f"flow{name}={fmt_usd(flow)}/r={fmt_ratio(ratio)}")
     return " " + " ".join(parts) if parts else ""
+
+
+def long_flow_group(score):
+    if score is None:
+        return None
+    for label, name, low, high in LONG_FLOW_GROUPS:
+        if low <= score <= high:
+            return label, name
+    return None
+
+
+def print_long_flow_backtest(results):
+    grouped = [
+        (x, long_flow_group(x.get("long_flow_alignment_score")))
+        for x in results
+    ]
+    if not any(group for _x, group in grouped):
+        return
+
+    print("[LONG FLOW] 长周期资金共振分组回测")
+    for kind in sorted(set(x["kind"] for x, group in grouped if group)):
+        kind_rows = [(x, group) for x, group in grouped if x["kind"] == kind and group]
+
+        print(f"{kind}:")
+        for label, name, _low, _high in LONG_FLOW_GROUPS:
+            group_rows = [
+                x
+                for x, group in kind_rows
+                if group == (label, name)
+            ]
+
+            parts = [f"  {label} {name}: 样本={len(group_rows)}"]
+            for h in ["15m", "1h", "4h", "24h"]:
+                vals = [x[h] for x in group_rows if x[h] is not None]
+                if not vals:
+                    continue
+                wins = sum(v > 0 for v in vals)
+                parts.append(
+                    f"{h}胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                    f"平均={fmt(statistics.mean(vals))} "
+                    f"中位={fmt(statistics.median(vals))}"
+                )
+            print(" ".join(parts))
+        print("")
 
 
 def main():
@@ -186,6 +248,8 @@ def main():
                 f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
             )
         print("")
+
+    print_long_flow_backtest(results)
 
     print("最近20条:")
     for x in results[:20]:
