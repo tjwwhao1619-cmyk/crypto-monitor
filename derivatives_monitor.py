@@ -416,6 +416,7 @@ class DerivativesMonitor:
 
         lines = [
             "强平流状态:",
+            "数据说明: Binance实时=服务启动后缓存；CoinGlass历史=最近1h历史兜底",
             f"连接: {'已连接' if connected else '未连接'}",
             f"运行: {format_liquidation_age(now - started_at) if started_at > 0 else '暂无'}",
             f"最近事件: {format_liquidation_age(now - last_event_at) + '前' if last_event_at > 0 else '暂无'}",
@@ -1336,7 +1337,7 @@ class DerivativesMonitor:
             self.send_telegram_text(
                 bot_token,
                 chat_id,
-                "可用命令:\n/check SYMBOL - 单币诊断\n/ask SYMBOL - AI简洁复核\n/ask SYMBOL full - AI完整上下文\n/liq [SYMBOL] - 强平流状态/单币强平\n/summary - 市场温度摘要\n/regime - 市场大方向\n/sectors - 热点/冷门板块\n/hot - 强势过热候选\n/signals - 最近信号\n/top - 强度最高信号\n/review - 最近10条信号\n/perf - 最近信号表现\n/dev help - 运维命令入口",
+                telegram_help_text(),
             )
             return
 
@@ -1570,6 +1571,8 @@ class DerivativesMonitor:
                 if not ok:
                     self.send_telegram_text(bot_token, chat_id, f"回测失败: {output}")
                     return
+                if backtest_long_flow_sample_warning(output):
+                    output = f"{output}\n提醒: 长周期资金分组样本仍少，暂不建议据此改推送规则。"
                 self.send_telegram_text(bot_token, chat_id, truncate_text(f"回测摘要:\n{output}", 3500))
                 return
 
@@ -3501,15 +3504,26 @@ def market_方向_summary(snapshots: list[MarketSnapshot]) -> str:
         )
 
     if strength >= 9:
-        env = "强势"
+        env = "strong"
     elif strength >= 6:
-        env = "偏强"
+        env = "bullish"
     elif strength >= 3:
         env = "neutral"
     else:
-        env = "偏弱"
+        env = "weak"
 
-    return "大盘风向: " + env + "\n" + "\n".join(lines)
+    return "大盘风向: " + market_regime_display_label(env) + "\n" + "\n".join(lines)
+
+
+def market_regime_display_label(value: str) -> str:
+    labels = {
+        "neutral": "中性",
+        "bullish": "偏强",
+        "strong": "偏强",
+        "bearish": "偏弱",
+        "weak": "偏弱",
+    }
+    return labels.get(value, value)
 
 
 def market_temperature_score(snapshots: list[MarketSnapshot]) -> float:
@@ -3742,6 +3756,36 @@ def dev_help_text() -> str:
         "/dev confirm deploy <code> - 确认部署最新 main 并重启服务\n"
         "/dev help - 查看帮助"
     )
+
+
+def telegram_help_text() -> str:
+    return (
+        "单币:\n"
+        " /check SYMBOL - 单币诊断\n"
+        " /ask SYMBOL - AI简洁复核\n"
+        " /ask SYMBOL full - AI完整上下文\n"
+        " /liq [SYMBOL] - 强平流状态/单币强平\n\n"
+        "市场:\n"
+        " /summary - 市场温度摘要\n"
+        " /regime - 市场大方向\n"
+        " /sectors - 热点/冷门板块\n\n"
+        "信号:\n"
+        " /hot - 强势过热候选\n"
+        " /signals - 最近信号\n"
+        " /top - 强度最高信号\n"
+        " /review - 最近10条信号\n"
+        " /perf - 最近信号表现\n\n"
+        "运维:\n"
+        " /dev help - 运维命令入口"
+    )
+
+
+def backtest_long_flow_sample_warning(output: str) -> bool:
+    if "[LONG FLOW]" not in output:
+        return False
+    if "样本=0" in output:
+        return True
+    return bool(re.search(r"longFlow[^\n]*(?:样本|samples?)\D{0,8}[0-5]\b", output, re.IGNORECASE))
 
 
 def open_binance_force_order_socket() -> ssl.SSLSocket:
@@ -4107,8 +4151,8 @@ def format_ask_response(
 ) -> str:
     review_text = (ai_review or fallback_ask_ai_review(context_text, snapshot, signals, market_snapshots, liquidation_text)).strip()
     review_text = post_process_ask_ai_review(review_text, context_text)
+    review_text = normalize_ai_review_text(review_text)
     if not full:
-        review_text = normalize_short_ai_review(review_text)
         entry_advice = format_ask_entry_advice(snapshot, signals)
         return truncate_text(f"{review_text}\n开仓建议: {entry_advice}\n\n{format_ask_core_data(snapshot, liquidation_text)}", 1500)
 
@@ -4250,7 +4294,7 @@ def post_process_ask_ai_review(review_text: str, context_text: str) -> str:
     return text
 
 
-def normalize_short_ai_review(text: str) -> str:
+def normalize_ai_review_text(text: str) -> str:
     text = limit_short_ai_review_bullets(text, "核心理由:", 3)
     text = limit_short_ai_review_bullets(text, "主要风险:", 3)
     return keep_first_short_ai_review_warning(text)
