@@ -30,6 +30,9 @@ BINANCE_FAPI_BASE = "https://fapi.binance.com"
 BINANCE_FUTURES_DATA_BASE = "https://fapi.binance.com/futures/data"
 BINANCE_FORCE_ORDER_WS_HOST = "fstream.binance.com"
 BINANCE_FORCE_ORDER_WS_PATH = "/ws/!forceOrder@arr"
+COINGLASS_LIQUIDATION_HISTORY_URL = "https://open-api-v4.coinglass.com/api/futures/liquidation/history"
+COINGLASS_LIQUIDATION_AGGREGATED_HISTORY_URL = "https://open-api-v4.coinglass.com/api/futures/liquidation/aggregated-history"
+COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS = 300
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 FLOW_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h"]
 
@@ -158,6 +161,12 @@ class DerivativesMonitor:
         self.liquidation_lock = threading.Lock()
         self.liquidation_thread_started = False
         self.liquidation_stop_event = threading.Event()
+        self.liquidation_stream_connected = False
+        self.liquidation_stream_started_at = 0.0
+        self.liquidation_last_event_at = 0.0
+        self.liquidation_last_error = ""
+        self.coinglass_api_key = os.getenv("COINGLASS_API_KEY", "").strip()
+        self.coinglass_liquidation_cache: dict[str, tuple[float, dict[str, float]]] = {}
 
     def run_forever(self) -> None:
         self.start_liquidation_stream_worker()
@@ -201,6 +210,9 @@ class DerivativesMonitor:
             sock: ssl.SSLSocket | None = None
             try:
                 sock = open_binance_force_order_socket()
+                with self.liquidation_lock:
+                    self.liquidation_stream_connected = True
+                    self.liquidation_stream_started_at = time.time()
                 logging.info("Subscribed Binance force order stream !forceOrder@arr")
                 backoff_seconds = 5
                 while not self.liquidation_stop_event.is_set():
@@ -214,9 +226,14 @@ class DerivativesMonitor:
                         break
                     elif opcode == 0x9:
                         websocket_send_frame(sock, 0xA, payload)
-            except Exception:
+            except Exception as exc:
+                with self.liquidation_lock:
+                    self.liquidation_stream_connected = False
+                    self.liquidation_last_error = f"{type(exc).__name__}: {exc}"
                 logging.warning("Binance force order stream disconnected", exc_info=True)
             finally:
+                with self.liquidation_lock:
+                    self.liquidation_stream_connected = False
                 if sock is not None:
                     try:
                         sock.close()
@@ -229,7 +246,9 @@ class DerivativesMonitor:
     def record_liquidation_payload(self, payload_text: str) -> None:
         try:
             payload = json.loads(payload_text)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            with self.liquidation_lock:
+                self.liquidation_last_error = f"{type(exc).__name__}: {exc}"
             logging.debug("Invalid force order payload: %s", payload_text)
             return
 
@@ -243,6 +262,7 @@ class DerivativesMonitor:
         cutoff = time.time() - 3600
         with self.liquidation_lock:
             self.liquidation_events.append(event)
+            self.liquidation_last_event_at = time.time()
             self.prune_liquidation_events_locked(cutoff)
 
     def prune_liquidation_events_locked(self, cutoff: float) -> None:
@@ -277,16 +297,183 @@ class DerivativesMonitor:
         stats = self.liquidation_stats(symbol)
         stats_15m = stats["15m"]
         stats_1h = stats["1h"]
+        coinglass_stats = self.fetch_coinglass_liquidation_history(symbol)
+        coinglass_text = format_coinglass_liquidation_stats(coinglass_stats) if coinglass_stats else None
+        judgement_stats = stats_1h if stats_1h["count"] > 0 else coinglass_stats
         if stats_1h["count"] <= 0:
+            if coinglass_text:
+                return f"真实强平: Binance实时暂无缓存；{coinglass_text}；判断: {liquidation_judgement(judgement_stats)}"
             return "真实强平: 近1h暂无明显强平数据"
+        if not coinglass_text:
+            return (
+                "真实强平: "
+                f"15m 多单强平 {format_usd(stats_15m['long_liq_usd'])} / "
+                f"空单强平 {format_usd(stats_15m['short_liq_usd'])}；"
+                f"1h 多单强平 {format_usd(stats_1h['long_liq_usd'])} / "
+                f"空单强平 {format_usd(stats_1h['short_liq_usd'])}；"
+                f"样本 {int(stats_1h['count'])}；"
+                f"判断: {liquidation_judgement(judgement_stats)}"
+            )
         return (
             "真实强平: "
-            f"15m 多单强平 {format_usd(stats_15m['long_liq_usd'])} / "
+            f"Binance实时 15m 多单强平 {format_usd(stats_15m['long_liq_usd'])} / "
             f"空单强平 {format_usd(stats_15m['short_liq_usd'])}；"
-            f"1h 多单强平 {format_usd(stats_1h['long_liq_usd'])} / "
+            f"Binance实时 1h 多单强平 {format_usd(stats_1h['long_liq_usd'])} / "
             f"空单强平 {format_usd(stats_1h['short_liq_usd'])}；"
             f"样本 {int(stats_1h['count'])}"
+            f"；{coinglass_text}；"
+            f"判断: {liquidation_judgement(judgement_stats)}"
         )
+
+    def fetch_coinglass_liquidation_history(self, symbol: str) -> dict[str, float] | None:
+        if not self.coinglass_api_key:
+            return None
+
+        symbol = symbol.upper()
+        now = time.time()
+        cached = self.coinglass_liquidation_cache.get(symbol)
+        if cached and now - cached[0] < COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        headers = {"CG-API-KEY": self.coinglass_api_key, "accept": "application/json"}
+        try:
+            stats = None
+            try:
+                stats = self.fetch_coinglass_liquidation_history_pair(symbol, headers)
+            except Exception:
+                logging.debug("CoinGlass pair liquidation history fetch failed: %s", symbol, exc_info=True)
+            if stats is None:
+                try:
+                    stats = self.fetch_coinglass_liquidation_history_aggregated(symbol, headers)
+                except Exception:
+                    logging.debug("CoinGlass aggregated liquidation history fetch failed: %s", symbol, exc_info=True)
+            if stats is None:
+                return None
+            self.coinglass_liquidation_cache[symbol] = (now, stats)
+            return stats
+        except Exception:
+            logging.debug("CoinGlass liquidation history fetch failed: %s", symbol, exc_info=True)
+            return None
+
+    def fetch_coinglass_liquidation_history_pair(self, symbol: str, headers: dict[str, str]) -> dict[str, float] | None:
+        params = {"exchange": "Binance", "symbol": symbol, "interval": "1h", "limit": 5}
+        response = self.session.get(COINGLASS_LIQUIDATION_HISTORY_URL, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if not coinglass_response_ok(data):
+            return None
+        stats = coinglass_liquidation_stats_from_response(data)
+        return stats
+
+    def fetch_coinglass_liquidation_history_aggregated(self, symbol: str, headers: dict[str, str]) -> dict[str, float] | None:
+        base_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
+        params = {"exchange_list": "Binance", "symbol": base_symbol, "interval": "1h", "limit": 5}
+        response = self.session.get(
+            COINGLASS_LIQUIDATION_AGGREGATED_HISTORY_URL,
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not coinglass_response_ok(data):
+            return None
+        stats = coinglass_liquidation_stats_from_response(data)
+        return stats
+
+    def liquidation_health_report(self, symbol: str | None = None) -> str:
+        now = time.time()
+        cutoff_1h = now - 3600
+        cutoff_15m = now - 900
+        all_15m = {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "count": 0.0}
+        all_1h = {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "count": 0.0}
+        by_symbol: dict[str, dict[str, dict[str, float]]] = {}
+
+        with self.liquidation_lock:
+            self.prune_liquidation_events_locked(cutoff_1h)
+            connected = self.liquidation_stream_connected
+            started_at = self.liquidation_stream_started_at
+            last_event_at = self.liquidation_last_event_at
+            last_error = self.liquidation_last_error
+            events = list(self.liquidation_events)
+
+        for event in events:
+            symbol_stats = by_symbol.setdefault(
+                event.symbol,
+                {
+                    "15m": {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "count": 0.0},
+                    "1h": {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "count": 0.0},
+                },
+            )
+            if event.event_time >= cutoff_1h:
+                update_liquidation_stats_bucket(all_1h, event)
+                update_liquidation_stats_bucket(symbol_stats["1h"], event)
+            if event.event_time >= cutoff_15m:
+                update_liquidation_stats_bucket(all_15m, event)
+                update_liquidation_stats_bucket(symbol_stats["15m"], event)
+
+        lines = [
+            "强平流状态:",
+            f"连接: {'已连接' if connected else '未连接'}",
+            f"运行: {format_liquidation_age(now - started_at) if started_at > 0 else '暂无'}",
+            f"最近事件: {format_liquidation_age(now - last_event_at) + '前' if last_event_at > 0 else '暂无'}",
+            f"内存事件数: {len(events)}",
+            f"最近错误: {last_error or '无'}",
+            f"全市场近15m强平: 多单 {format_usd(all_15m['long_liq_usd'])} / 空单 {format_usd(all_15m['short_liq_usd'])} / 总计 {format_usd(all_15m['long_liq_usd'] + all_15m['short_liq_usd'])}",
+            f"全市场近1h强平: 多单 {format_usd(all_1h['long_liq_usd'])} / 空单 {format_usd(all_1h['short_liq_usd'])} / 总计 {format_usd(all_1h['long_liq_usd'] + all_1h['short_liq_usd'])}",
+            "近1h强平最多TOP10:",
+        ]
+
+        top_symbols = sorted(
+            by_symbol.items(),
+            key=lambda item: item[1]["1h"]["long_liq_usd"] + item[1]["1h"]["short_liq_usd"],
+            reverse=True,
+        )[:10]
+        if top_symbols:
+            for top_symbol, stats in top_symbols:
+                stats_1h = stats["1h"]
+                lines.append(
+                    f"{top_symbol} 多单 {format_usd(stats_1h['long_liq_usd'])} "
+                    f"空单 {format_usd(stats_1h['short_liq_usd'])} "
+                    f"总 {format_usd(stats_1h['long_liq_usd'] + stats_1h['short_liq_usd'])}"
+                )
+        else:
+            lines.append("暂无")
+
+        if symbol:
+            symbol = symbol.upper()
+            stats = by_symbol.get(
+                symbol,
+                {
+                    "15m": {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "count": 0.0},
+                    "1h": {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "count": 0.0},
+                },
+            )
+            symbol_15m = stats["15m"]
+            symbol_1h = stats["1h"]
+            lines.extend(
+                [
+                    "",
+                    f"{symbol} 强平:",
+                    f"近15m 多单强平 {format_usd(symbol_15m['long_liq_usd'])} / 空单强平 {format_usd(symbol_15m['short_liq_usd'])}",
+                    f"近1h 多单强平 {format_usd(symbol_1h['long_liq_usd'])} / 空单强平 {format_usd(symbol_1h['short_liq_usd'])}",
+                ]
+            )
+            coinglass_stats = self.fetch_coinglass_liquidation_history(symbol)
+            coinglass_text = format_coinglass_liquidation_stats(coinglass_stats) if coinglass_stats else None
+            if coinglass_text:
+                lines.append(coinglass_text)
+            lines.append(f"判断: {liquidation_judgement(symbol_1h if symbol_1h['count'] > 0 else coinglass_stats)}")
+
+        if not events:
+            lines.extend(
+                [
+                    "",
+                    "暂无缓存事件。注意：强平流只记录服务启动后事件，重启后需要重新积累。",
+                ]
+            )
+
+        return "\n".join(lines)
 
     def refresh_symbols_if_due(self, force: bool = False) -> None:
         if not self.screener_config.get("enabled", False):
@@ -1147,12 +1334,16 @@ class DerivativesMonitor:
             self.send_telegram_text(
                 bot_token,
                 chat_id,
-                "可用命令:\n/check SYMBOL - 单币诊断\n/ask SYMBOL - AI复核单币\n/summary - 市场温度摘要\n/regime - 市场大方向\n/sectors - 热点/冷门板块\n/hot - 强势过热候选\n/signals - 最近信号\n/top - 强度最高信号\n/review - 最近10条信号\n/perf - 最近信号表现\n/dev help - 运维命令入口",
+                "可用命令:\n/check SYMBOL - 单币诊断\n/ask SYMBOL - AI复核单币\n/liq [SYMBOL] - 强平流状态/单币强平\n/summary - 市场温度摘要\n/regime - 市场大方向\n/sectors - 热点/冷门板块\n/hot - 强势过热候选\n/signals - 最近信号\n/top - 强度最高信号\n/review - 最近10条信号\n/perf - 最近信号表现\n/dev help - 运维命令入口",
             )
             return
 
         if command == "/ask":
             self.handle_ask_command(bot_token, chat_id, parts[1:])
+            return
+
+        if command == "/liq":
+            self.handle_liq_command(bot_token, chat_id, parts[1:])
             return
 
         if command == "/summary":
@@ -1233,6 +1424,14 @@ class DerivativesMonitor:
         except Exception as exc:
             logging.exception("Failed to build ask context from Telegram command")
             self.send_telegram_text(bot_token, chat_id, f"{symbol} /ask 查询失败: {type(exc).__name__}: {exc}")
+
+    def handle_liq_command(self, bot_token: str, chat_id: str, args: list[str]) -> None:
+        symbol = None
+        if args:
+            symbol = args[0].upper()
+            if not symbol.endswith("USDT"):
+                symbol = f"{symbol}USDT"
+        self.send_telegram_text(bot_token, chat_id, self.liquidation_health_report(symbol))
 
     def ask_market_snapshots(self) -> list[MarketSnapshot]:
         majors = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
@@ -1972,6 +2171,90 @@ def format_usd(value: float | None) -> str:
     if abs_value >= 1_000:
         return f"{sign}{abs_value / 1_000:.1f}K"
     return f"{sign}{abs_value:.0f}"
+
+
+def format_liquidation_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}秒"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}分钟"
+    hours = minutes // 60
+    remaining_minutes = minutes % 60
+    if remaining_minutes:
+        return f"{hours}小时{remaining_minutes}分钟"
+    return f"{hours}小时"
+
+
+def liquidation_judgement(stats_1h: dict[str, float] | None) -> str:
+    if not stats_1h:
+        return "近1h暂无明显强平数据"
+    long_liq = stats_1h["long_liq_usd"]
+    short_liq = stats_1h["short_liq_usd"]
+    total = long_liq + short_liq
+    if total < 50000:
+        return "近1h暂无明显强平数据"
+    if long_liq >= 100000 and short_liq >= 100000 and max(long_liq, short_liq) / min(long_liq, short_liq) < 2:
+        return "双向强平/剧烈洗盘"
+    if long_liq >= short_liq * 2 and long_liq >= 100000:
+        return "多头强平主导"
+    if short_liq >= long_liq * 2 and short_liq >= 100000:
+        return "空头强平主导"
+    if total >= 500000:
+        return "强平活跃但方向分散"
+    return "强平分散"
+
+
+def coinglass_response_ok(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    code = data.get("code")
+    return str(code) == "0"
+
+
+def coinglass_liquidation_stats_from_response(data: Any) -> dict[str, float] | None:
+    rows = coinglass_liquidation_rows(data.get("data") if isinstance(data, dict) else data)
+    if not rows:
+        return None
+
+    long_liq = 0.0
+    short_liq = 0.0
+    count = 0.0
+    for row in rows:
+        row_long = parse_float(row.get("long_liquidation_usd"))
+        row_short = parse_float(row.get("short_liquidation_usd"))
+        if row_long is None and row_short is None:
+            continue
+        long_liq += row_long or 0.0
+        short_liq += row_short or 0.0
+        count += 1
+
+    if count <= 0:
+        return None
+    return {"long_liq_usd": long_liq, "short_liq_usd": short_liq, "count": count}
+
+
+def coinglass_liquidation_rows(data: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        for item in data:
+            rows.extend(coinglass_liquidation_rows(item))
+    elif isinstance(data, dict):
+        if "long_liquidation_usd" in data or "short_liquidation_usd" in data:
+            rows.append(data)
+        else:
+            for value in data.values():
+                rows.extend(coinglass_liquidation_rows(value))
+    return rows
+
+
+def format_coinglass_liquidation_stats(stats: dict[str, float]) -> str:
+    return (
+        "CoinGlass历史 1h "
+        f"多单强平 {format_usd(stats['long_liq_usd'])} / "
+        f"空单强平 {format_usd(stats['short_liq_usd'])}"
+    )
 
 
 def force_order_items(payload: Any) -> list[dict[str, Any]]:
