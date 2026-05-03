@@ -20,7 +20,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -47,6 +47,7 @@ DEFAULT_TELEGRAM_REALTIME_PRIORITIES = ("S", "A", "B")
 DEFAULT_TELEGRAM_DIGEST_PRIORITIES = ("C", "D")
 DEFAULT_TELEGRAM_DIGEST_INTERVAL_MINUTES = 30
 DEFAULT_TELEGRAM_DIGEST_MAX_PER_PRIORITY = 8
+DEFAULT_TELEGRAM_MERGE_WINDOW_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -93,7 +94,21 @@ class TelegramSignalDigestItem:
     main_asset_score: int | None
     signal_score: int
     strength_score: float
+    price_change_percent: float | None
+    oi_change_percent: float | None
     reason: str
+
+
+@dataclass
+class PendingTelegramSignalMerge:
+    created_at: float
+    updated_at: float
+    symbol: str
+    direction: str
+    signals: list[Signal]
+    priorities: list[str]
+    quality_scores: list[int]
+    quality_reasons: list[str]
 
 
 @dataclass(frozen=True)
@@ -220,6 +235,8 @@ class DerivativesMonitor:
         self.coinglass_liquidation_cache: dict[str, tuple[float, dict[str, float]]] = {}
         self.coinglass_market_context_cache: dict[str, tuple[float, str]] = {}
         self.telegram_signal_cooldowns: dict[str, tuple[float, int]] = {}
+        self.pending_telegram_signal_merges: dict[str, PendingTelegramSignalMerge] = {}
+        self.pending_telegram_signal_merge_lock = threading.Lock()
         self.telegram_signal_digest_queue: list[TelegramSignalDigestItem] = []
         self.telegram_signal_digest_lock = threading.Lock()
         self.last_telegram_signal_digest_at = time.time()
@@ -247,13 +264,23 @@ class DerivativesMonitor:
             try:
                 self.refresh_symbols_if_due()
                 self.run_cycle()
+                self.flush_pending_telegram_signals()
                 self.send_summary_if_due()
                 self.flush_telegram_signal_digest_if_due()
             except Exception:
                 logging.exception("Derivatives monitor cycle failed")
 
             elapsed = time.monotonic() - started
-            time.sleep(max(5, self.poll_interval - elapsed))
+            sleep_until = time.monotonic() + max(5, self.poll_interval - elapsed)
+            while True:
+                remaining = sleep_until - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(5, remaining))
+                try:
+                    self.flush_pending_telegram_signals()
+                except Exception:
+                    logging.exception("Failed to flush pending Telegram signals")
 
     def run_once(self, refresh_symbols: bool = True) -> list[tuple[MarketSnapshot, list[Signal]]]:
         if refresh_symbols:
@@ -1576,11 +1603,9 @@ class DerivativesMonitor:
                     quality_score,
                     suppressed_reason or quality_reason,
                 )
-                self.enqueue_telegram_signal_digest(signal, priority, quality_score)
+                self.enqueue_telegram_signal_digest(signal, priority, quality_score, quality_reason)
                 return
-            for chat_id in split_chat_ids(chat_ids):
-                self.send_telegram(bot_token, chat_id, signal, priority, quality_score, quality_reason)
-            self.telegram_signal_cooldowns[self.telegram_signal_key(signal)] = (time.time(), quality_score)
+            self.enqueue_pending_telegram_signal(signal, priority, quality_score, quality_reason)
 
     def update_signal_quality_stats(self, signal: Signal, priority: str, suppressed: bool) -> None:
         with self.signal_quality_stats_lock:
@@ -1603,6 +1628,10 @@ class DerivativesMonitor:
                 suppressed_by_priority = self.signal_quality_stats["suppressed_by_priority"]
                 suppressed_by_priority[priority] = suppressed_by_priority.get(priority, 0) + 1
 
+    def pending_telegram_merge_count(self) -> int:
+        with self.pending_telegram_signal_merge_lock:
+            return len(self.pending_telegram_signal_merges)
+
     def get(self, path: str, params: dict[str, Any]) -> Any:
         response = self.session.get(f"{BINANCE_FAPI_BASE}{path}", params=params, timeout=10)
         response.raise_for_status()
@@ -1624,6 +1653,9 @@ class DerivativesMonitor:
 
     def telegram_signal_key(self, signal: Signal) -> str:
         return f"{signal.symbol}/{signal.kind}"
+
+    def telegram_signal_merge_key(self, signal: Signal) -> str:
+        return f"{signal.symbol}/{signal_direction_label(signal.kind)}"
 
     def telegram_signal_filter_settings(self) -> tuple[set[str], list[str], int, int]:
         config = self.config.get("telegram_signal_filter", {})
@@ -1649,6 +1681,12 @@ class DerivativesMonitor:
             if self.runtime_realtime_priorities_override is not None:
                 realtime_priorities = list(self.runtime_realtime_priorities_override)
         return set(realtime_priorities), digest_priorities, digest_interval_minutes, digest_max_per_priority
+
+    def telegram_signal_merge_window_seconds(self) -> int:
+        config = self.config.get("telegram_signal_filter", {})
+        if not isinstance(config, dict):
+            config = {}
+        return parse_positive_int(config.get("merge_window_seconds"), DEFAULT_TELEGRAM_MERGE_WINDOW_SECONDS)
 
     def configured_realtime_priorities(self) -> set[str]:
         config = self.config.get("telegram_signal_filter", {})
@@ -1697,11 +1735,90 @@ class DerivativesMonitor:
             priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
         payload = {
             "chat_id": chat_id,
-            "text": format_signal_for_telegram(signal, liquidation_text, priority, quality_score, quality_reason),
+            "text": telegram_text(format_signal_for_telegram(signal, liquidation_text, priority, quality_score, quality_reason)),
         }
         self.post_json(url, payload)
 
-    def enqueue_telegram_signal_digest(self, signal: Signal, priority: str, quality_score: int) -> None:
+    def enqueue_pending_telegram_signal(
+        self,
+        signal: Signal,
+        priority: str,
+        quality_score: int,
+        quality_reason: str,
+    ) -> None:
+        now = time.time()
+        key = self.telegram_signal_merge_key(signal)
+        direction = signal_direction_label(signal.kind)
+        with self.pending_telegram_signal_merge_lock:
+            pending = self.pending_telegram_signal_merges.get(key)
+            if pending is None:
+                self.pending_telegram_signal_merges[key] = PendingTelegramSignalMerge(
+                    created_at=now,
+                    updated_at=now,
+                    symbol=signal.symbol,
+                    direction=direction,
+                    signals=[signal],
+                    priorities=[priority],
+                    quality_scores=[quality_score],
+                    quality_reasons=[quality_reason],
+                )
+                return
+            pending.updated_at = now
+            pending.signals.append(signal)
+            pending.priorities.append(priority)
+            pending.quality_scores.append(quality_score)
+            pending.quality_reasons.append(quality_reason)
+
+    def flush_pending_telegram_signals(self, now: float | None = None) -> None:
+        current_time = time.time() if now is None else now
+        merge_window_seconds = self.telegram_signal_merge_window_seconds()
+        with self.pending_telegram_signal_merge_lock:
+            due_keys = [
+                key
+                for key, pending in self.pending_telegram_signal_merges.items()
+                if current_time - pending.created_at >= merge_window_seconds
+            ]
+            due_items = [self.pending_telegram_signal_merges.pop(key) for key in due_keys]
+
+        if not due_items:
+            return
+
+        notifications = self.config.get("notifications", {})
+        telegram = notifications.get("telegram", {})
+        bot_token, chat_ids = resolve_telegram_credentials(telegram)
+        if not bot_token or not chat_ids:
+            return
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        chat_id_list = split_chat_ids(chat_ids)
+        sent_at = time.time()
+        for pending in due_items:
+            liquidation_text = self.format_liquidation_stats(pending.symbol)
+            coinglass_text = self.format_coinglass_market_context(pending.symbol)
+            message = telegram_text(format_merged_signal_for_telegram(pending, liquidation_text, coinglass_text))
+            for chat_id in chat_id_list:
+                self.post_json(url, {"chat_id": chat_id, "text": message})
+
+            best_quality = max(pending.quality_scores) if pending.quality_scores else 0
+            best_priority = best_priority_label(pending.priorities)
+            for signal, quality_score in zip(pending.signals, pending.quality_scores):
+                self.telegram_signal_cooldowns[self.telegram_signal_key(signal)] = (sent_at, quality_score)
+            logging.info(
+                "Telegram merge send: %s %s count=%s priority=%s quality=%s",
+                pending.symbol,
+                pending.direction,
+                len(pending.signals),
+                best_priority,
+                best_quality,
+            )
+
+    def enqueue_telegram_signal_digest(
+        self,
+        signal: Signal,
+        priority: str,
+        quality_score: int,
+        quality_reason: str = "",
+    ) -> None:
         _realtime_priorities, digest_priorities, _digest_interval_minutes, _digest_max_per_priority = (
             self.telegram_signal_filter_settings()
         )
@@ -1726,7 +1843,9 @@ class DerivativesMonitor:
             main_asset_score=main_score_value,
             signal_score=signal.score,
             strength_score=signal_strength_score(signal),
-            reason=compact_digest_reason(signal.message),
+            price_change_percent=snapshot.price_change_percent if snapshot else None,
+            oi_change_percent=snapshot.oi_change_percent if snapshot else None,
+            reason=format_quality_reason_short(quality_reason or signal.message),
         )
         with self.telegram_signal_digest_lock:
             self.telegram_signal_digest_queue.append(item)
@@ -1763,7 +1882,7 @@ class DerivativesMonitor:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         for chat_id in split_chat_ids(chat_ids):
             try:
-                response = self.session.post(url, json={"chat_id": chat_id, "text": message}, timeout=5)
+                response = self.session.post(url, json={"chat_id": chat_id, "text": telegram_text(message)}, timeout=5)
                 response.raise_for_status()
             except Exception:
                 logging.exception("Failed to send Telegram signal digest to chat_id=%s", chat_id)
@@ -1784,7 +1903,8 @@ class DerivativesMonitor:
         if bot_token and chat_ids:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             for chat_id in split_chat_ids(chat_ids):
-                self.post_json(url, {"chat_id": chat_id, "text": f"{title}\n{message}"})
+                text = message if message.startswith(title) else f"{title}\n{message}"
+                self.post_json(url, {"chat_id": chat_id, "text": telegram_text(text)})
 
     def send_summary_if_due(self) -> None:
         if not self.summary_config.get("enabled", False):
@@ -1801,7 +1921,7 @@ class DerivativesMonitor:
             list(self.latest_snapshots.values()),
             int(self.summary_config.get("top_n", 5)),
         )
-        self.notify_status("Crypto monitor hourly summary", message)
+        self.notify_status("📊 每小时市场简报", message)
 
     def start_telegram_command_worker(self) -> None:
         if self.telegram_command_thread_started:
@@ -1998,6 +2118,7 @@ class DerivativesMonitor:
                 "by_kind": dict(self.signal_quality_stats["by_kind"]),
                 "by_symbol": dict(self.signal_quality_stats["by_symbol"]),
                 "suppressed_by_priority": dict(self.signal_quality_stats["suppressed_by_priority"]),
+                "pending_merge": self.pending_telegram_merge_count(),
             }
 
         priorities = ("S", "A", "B", "C", "D")
@@ -2005,7 +2126,11 @@ class DerivativesMonitor:
         suppressed_text = " ".join(
             f"{priority}:{stats['suppressed_by_priority'].get(priority, 0)}" for priority in priorities
         )
-        top_kinds = format_top_quality_counts(stats["by_kind"])
+        top_kind_counts: dict[str, int] = {}
+        for kind, count in stats["by_kind"].items():
+            label = signal_kind_label(kind)
+            top_kind_counts[label] = top_kind_counts.get(label, 0) + count
+        top_kinds = format_top_quality_counts(top_kind_counts)
         top_symbols = format_top_quality_counts(stats["by_symbol"])
         return "\n".join(
             [
@@ -2013,10 +2138,11 @@ class DerivativesMonitor:
                 f"总信号: {stats['total']}",
                 f"实时推送: {stats['realtime_sent']}",
                 f"静默: {stats['suppressed']}",
+                f"pending_merge: {stats['pending_merge']}",
                 f"等级分布: {priority_text}",
                 f"静默分布: {suppressed_text}",
-                f"Top kinds: {top_kinds}",
-                f"Top symbols: {top_symbols}",
+                f"信号类型: {top_kinds}",
+                f"币种排行: {top_symbols}",
             ]
         )
 
@@ -2746,7 +2872,7 @@ class DerivativesMonitor:
             return
 
         scored_rows.sort(key=lambda item: item[0], reverse=True)
-        lines = ["高质量信号TOP10"]
+        lines = ["高质量信号前10"]
         for index, (quality_score, row) in enumerate(scored_rows[:10], start=1):
             kind = row.get("kind", "-")
             priority = row.get("signal_priority") or "-"
@@ -2756,18 +2882,21 @@ class DerivativesMonitor:
             strength = format_csv_compact_number(row.get("strength_score"), signed=False)
             suppressed = format_suppressed_status(row.get("suppressed_from_telegram"))
             reason = format_quality_reason_short(row.get("signal_quality_reason", "") or "")
+            trap_text = trap_badge(trap_score).lstrip("🟢🟠⚠️")
             lines.append(
-                f"{index}. {priority_badge(priority)} {direction_badge(signal_direction_label(kind))} "
-                f"{row.get('symbol', '-')} {kind} q{quality_score:.0f} trap{trap_score}"
+                f"{index}. {priority_badge(priority)}级 {direction_badge(signal_direction_label(kind))} "
+                f"{row.get('symbol', '-')} {signal_kind_label(kind)}"
             )
             lines.append(
-                f"   {price_change}% OI{oi_change}% {strength_badge(strength)}{strength} | {suppressed} | {reason}"
+                f"   质量{quality_score:.0f} | 诱捕{trap_text} | 强度{strength} | "
+                f"{price_change}% | OI{oi_change}% | {suppressed}"
             )
+            lines.append(f"   {reason}")
         self.send_telegram_text(bot_token, chat_id, "\n".join(lines))
 
     def send_telegram_text(self, bot_token: str, chat_id: str, text: str) -> None:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        self.post_json(url, {"chat_id": chat_id, "text": text})
+        self.post_json(url, {"chat_id": chat_id, "text": telegram_text(text)})
 
     def load_telegram_update_offset(self) -> int | None:
         path = Path(str(self.telegram_commands_config.get("offset_path", "telegram_update_offset.txt")))
@@ -3781,8 +3910,23 @@ def format_csv_compact_number(value: Any, signed: bool = False) -> str:
     return text
 
 
+def format_compact_percent(value: Any) -> str:
+    if value is None:
+        return "-%"
+    try:
+        return f"{float(value):+.2f}%"
+    except Exception:
+        return f"{value}%"
+
+
 def signal_direction_label(kind: str | None) -> str:
     raw = str(kind or "").strip().lower()
+    if raw in ("long", "看多"):
+        return "看多"
+    if raw in ("short", "看空"):
+        return "看空"
+    if raw in ("neutral", "observe", "观察"):
+        return "观察"
     normalized = raw.replace("_", " ").replace("-", " ")
     bullish = {
         "discovery",
@@ -3802,6 +3946,22 @@ def signal_direction_label(kind: str | None) -> str:
     if raw in bearish or normalized in bearish:
         return "看空"
     return "观察"
+
+
+def signal_kind_label(kind: str | None) -> str:
+    labels = {
+        "discovery": "启动发现",
+        "hot_breakout": "热点突破",
+        "bottom_reversal": "底部反转",
+        "top_risk": "顶部风险",
+        "top_exhaustion": "顶部衰竭",
+        "distribution": "派发风险",
+        "crowded_top_risk": "拥挤顶部",
+        "unknown": "观察信号",
+    }
+    raw = str(kind or "unknown").strip().lower()
+    normalized = raw.replace("-", "_").replace(" ", "_")
+    return labels.get(normalized, labels["unknown"])
 
 
 def entry_timing_direction(kind: str | None) -> str:
@@ -3960,6 +4120,15 @@ def direction_badge(direction: str | None) -> str:
     return "⚪观察"
 
 
+def direction_icon(direction: str | None) -> str:
+    label = str(direction or "").strip()
+    if label == "看多":
+        return "🟢"
+    if label == "看空":
+        return "🔴"
+    return "⚪"
+
+
 def priority_badge(priority: str | None) -> str:
     label = str(priority or "").strip().upper()
     if label == "S":
@@ -3971,6 +4140,17 @@ def priority_badge(priority: str | None) -> str:
     if label in ("C", "D"):
         return f"⚫{label}"
     return "⚫-"
+
+
+def priority_grade_label(priority: str | None) -> str:
+    label = str(priority or "").strip().upper()
+    return f"{label}级" if label else "-级"
+
+
+def best_priority_label(priorities: list[str]) -> str:
+    order = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+    normalized = [str(priority or "").strip().upper() for priority in priorities]
+    return max(normalized or ["-"], key=lambda priority: order.get(priority, -1))
 
 
 def strength_badge(strength: float | int | str | None) -> str:
@@ -4759,19 +4939,23 @@ def format_telegram_signal_digest(
         if not priority_items:
             continue
         lines.append("")
-        lines.append(f"{priority}:")
+        lines.append(f"{priority_grade_label(priority)}:")
         for item in priority_items[:max_per_priority]:
-            main_text = str(item.main_asset_score) if item.main_asset_score is not None else "空"
+            main_text = str(item.main_asset_score) if item.main_asset_score is not None else "-"
+            trap_text = trap_badge(item.trap_score).lstrip("🟢🟠⚠️")
+            price_text = format_compact_percent(item.price_change_percent)
+            oi_text = format_compact_percent(item.oi_change_percent)
             lines.append(
-                f"{item.symbol} {item.kind} "
-                f"q={item.quality_score} trap={item.trap_score} main={main_text} "
-                f"score={item.signal_score} strength={item.strength_score:.1f} {item.reason}"
+                f"{item.symbol} {direction_badge(signal_direction_label(item.kind))} "
+                f"{priority_badge(item.priority)}级 质量{item.quality_score} "
+                f"诱捕{trap_text} 强度{item.strength_score:.1f} "
+                f"{price_text} OI{oi_text} | {signal_kind_label(item.kind)} | 主流分{main_text} | {item.reason}"
             )
 
     lines.append("")
     stats = [f"{priority}: {counts[priority]}" for priority in digest_priorities]
     lines.append(f"总静默: {sum(counts.values())}；" + "；".join(stats))
-    return truncate_text("\n".join(lines), 3500)
+    return telegram_text("\n".join(lines))
 
 
 def format_top_quality_counts(counts: dict[str, int], limit: int = 5) -> str:
@@ -4842,7 +5026,122 @@ def compact_realtime_liquidation_line(liquidation_text: str | None) -> str:
 
 
 def compact_trade_plan(signal: Signal, max_length: int = 120) -> str:
-    return truncate_text(" ".join(signal_trade_plan(signal).split()), max_length)
+    text = " ".join(signal_trade_plan(signal).split())
+    replacements = {
+        "方向:": "方向 ",
+        "入场区:": "入场 ",
+        "回踩观察区:": "回踩 ",
+        "止损:": "止损 ",
+        "止盈: TP1 ": "TP1 ",
+        " / TP2 ": "；TP2 ",
+        "；支撑:": "；支撑 ",
+        "；阻力:": "；阻力 ",
+        "。": "",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = re.sub(r"\([0-9.]+R\)", "", text)
+    return truncate_text_by_lines(text, max_length, "...已精简")
+
+
+def compact_confirmation_label(liquidation_text: str | None, coinglass_text: str | None, symbol: str) -> str:
+    spot_text = cached_spot_alpha_confirmation(symbol)
+    if "偏弱" in spot_text:
+        spot_label = "现货弱"
+    elif "偏强" in spot_text:
+        spot_label = "现货强"
+    else:
+        spot_label = "现货中性"
+
+    liq_text = str(liquidation_text or "")
+    if "多头强平主导" in liq_text:
+        liq_label = "多头强平"
+    elif "空头强平主导" in liq_text:
+        liq_label = "空头强平"
+    elif "双向强平" in liq_text or "剧烈洗盘" in liq_text:
+        liq_label = "双向强平"
+    elif "强平分散" in liq_text or "方向分散" in liq_text:
+        liq_label = "清算分散"
+    else:
+        liq_label = "清算中性"
+
+    judgement = extract_coinglass_judgement(coinglass_text or "")
+    if not judgement:
+        coinglass_label = "CoinGlass中性"
+    elif any(word in judgement for word in ("偏弱", "看空", "风险")):
+        coinglass_label = "CoinGlass偏弱"
+    elif any(word in judgement for word in ("偏强", "看多", "支撑")):
+        coinglass_label = "CoinGlass偏强"
+    else:
+        coinglass_label = "CoinGlass中性"
+    return f"{spot_label} / {liq_label} / {coinglass_label}"
+
+
+def best_pending_signal_index(pending: PendingTelegramSignalMerge) -> int:
+    priority_order = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+    best_index = 0
+    best_key = (-1, -1, -1.0, -1)
+    for index, signal in enumerate(pending.signals):
+        priority = pending.priorities[index] if index < len(pending.priorities) else "-"
+        quality = pending.quality_scores[index] if index < len(pending.quality_scores) else 0
+        key = (priority_order.get(str(priority).upper(), -1), quality, signal_strength_score(signal), signal.score)
+        if key > best_key:
+            best_key = key
+            best_index = index
+    return best_index
+
+
+def format_merged_signal_for_telegram(
+    pending: PendingTelegramSignalMerge,
+    liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
+) -> str:
+    best_index = best_pending_signal_index(pending)
+    signal = pending.signals[best_index]
+    priority = best_priority_label(pending.priorities)
+    quality_score = max(pending.quality_scores) if pending.quality_scores else 0
+    quality_reason = ";".join(pending.quality_reasons)
+    icon = direction_icon(pending.direction)
+
+    kinds: list[str] = []
+    for item in pending.signals:
+        label = signal_kind_label(item.kind)
+        if label not in kinds:
+            kinds.append(label)
+
+    if signal.snapshot is None:
+        return telegram_text(
+            "\n".join(
+                [
+                    f"{icon} {priority_grade_label(priority)} {pending.direction} {pending.symbol}",
+                    f"信号: {' + '.join(kinds) or signal_kind_label(signal.kind)}",
+                    f"质量 q{quality_score} | 信号分 {signal.score}",
+                    f"原因: {format_quality_reason_short(quality_reason or signal.message)}",
+                ]
+            )
+        )
+
+    snapshot = signal.snapshot
+    strength_score = max(signal_strength_score(item) for item in pending.signals)
+    trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+    _entry_score, entry_label, _entry_reason = entry_timing_score(snapshot, signal)
+    flow_score = flow_alignment_score(snapshot)
+    long_flow_score = long_flow_alignment_score(snapshot)
+    reason = format_quality_reason_short(quality_reason or signal.message)
+    trap_text = trap_badge(trap_score).lstrip("🟢🟠⚠️")
+
+    lines = [
+        f"{icon} {priority_grade_label(priority)} {pending.direction} {pending.symbol}",
+        f"信号: {' + '.join(kinds)}",
+        f"质量 q{quality_score} | 信号分 {max(item.score for item in pending.signals)} | 强度 {strength_score:.1f} | 诱捕{trap_text}",
+        f"价格 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}% | 费率 {format_realtime_funding(snapshot.funding_rate_percent)}",
+        f"阶段: {entry_label}",
+        f"资金: 短 {flow_score}/10 | 长 {long_flow_score}/9",
+        f"确认: {compact_confirmation_label(liquidation_text, coinglass_text, pending.symbol)}",
+        f"计划: {compact_trade_plan(signal, 220)}",
+        f"原因: {reason}",
+    ]
+    return telegram_text("\n".join(lines))
 
 
 def why_symbol_conclusion(rows: list[dict[str, str]]) -> str:
@@ -4874,45 +5173,20 @@ def format_signal_for_telegram(
     quality_score: int | None = None,
     quality_reason: str | None = None,
 ) -> str:
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     if priority is None or quality_score is None or quality_reason is None:
         priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
-
-    if signal.snapshot is None:
-        direction = signal_direction_label(signal.kind)
-        return (
-            f"{priority_badge(priority)} {direction_badge(direction)} {signal.symbol} {signal.kind} "
-            f"q{quality_score} score{signal.score}\n"
-            f"理由: {format_quality_reason_short(quality_reason or signal.message)}\n"
-            f"时间: {now}"
-        )
-
-    snapshot = signal.snapshot
-    strength_score = signal_strength_score(signal)
-    trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
-    entry_score, entry_label, entry_reason = entry_timing_score(snapshot, signal)
-    flow_score = flow_alignment_score(snapshot)
-    long_flow_score = long_flow_alignment_score(snapshot)
     direction = signal_direction_label(signal.kind)
-    reason = format_quality_reason_short(quality_reason or signal.message)
-    main_score = main_asset_score(snapshot, liquidation_text)
-    main_part = f" | 主流 {main_score.total_score}/100" if main_score else ""
-    liquidation_line = compact_realtime_liquidation_line(liquidation_text)
-    liquidation_part = f"{liquidation_line}\n" if liquidation_line else ""
-    text = (
-        f"{priority_badge(priority)} {direction_badge(direction)} {signal.symbol} {signal.kind} "
-        f"q{quality_score} score{signal.score} {strength_badge(strength_score)}{strength_score:.1f}\n"
-        f"价格 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}% | "
-        f"Funding {format_realtime_funding(snapshot.funding_rate_percent)}\n"
-        f"资金 {flow_score}/10 | 长周期 {long_flow_score}/9 | "
-        f"诱捕 trap{trap_score} {trap_badge(trap_score)} | 24h位置 {format_optional_value(snapshot.price_position_24h)}%{main_part}\n"
-        f"阶段: {entry_label} {entry_score}/10 - {entry_reason}\n"
-        f"理由: {reason}\n"
-        f"{liquidation_part}"
-        f"计划: {compact_trade_plan(signal)}"
+    pending = PendingTelegramSignalMerge(
+        created_at=time.time(),
+        updated_at=time.time(),
+        symbol=signal.symbol,
+        direction=direction,
+        signals=[signal],
+        priorities=[priority],
+        quality_scores=[quality_score],
+        quality_reasons=[quality_reason],
     )
-    return truncate_text(text, 900)
+    return format_merged_signal_for_telegram(pending, liquidation_text)
 
 
 def format_optional_value(value: float | None) -> str:
@@ -4951,11 +5225,11 @@ def format_hot_watch_for_telegram(snapshots: list[MarketSnapshot], top_n: int) -
         lines.append("暂无候选。")
     for snapshot in ordered:
         lines.append(
-            f"{snapshot.symbol}: score={hot_watch_score(snapshot):+.2f} "
+            f"{snapshot.symbol}: 热度分={hot_watch_score(snapshot):+.2f} "
             f"价格={snapshot.price_change_percent:+.2f}% "
             f"OI={snapshot.oi_change_percent:+.2f}% "
-            f"LS={format_optional_value(snapshot.global_long_short_ratio)} "
-            f"taker={format_optional_value(snapshot.taker_buy_sell_ratio)} "
+            f"多空比={format_optional_value(snapshot.global_long_short_ratio)} "
+            f"主动买卖比={format_optional_value(snapshot.taker_buy_sell_ratio)} "
             f"资金费率={format_optional_value(snapshot.funding_rate_percent)}%"
         )
     lines.extend(["", f"时间: {now}"])
@@ -5450,12 +5724,22 @@ def format_sector_brief_for_summary(snapshots: list[MarketSnapshot]) -> str:
     if not rows:
         return "-"
     hot = sorted(rows, key=lambda row: row["score"], reverse=True)[:3]
-    cold = sorted(rows, key=lambda row: row["score"])[:3]
-    lines = ["热点板块:"]
-    lines.extend(format_sector_row(row) for row in hot)
-    lines.append("冷门板块:")
-    lines.extend(format_sector_row(row) for row in cold)
+    cold = sorted(rows, key=lambda row: row["score"])[:2]
+    lines = ["🔥 热点板块"]
+    lines.extend(format_sector_summary_hot_row(index, row) for index, row in enumerate(hot, start=1))
+    if cold:
+        cold_text = " | ".join(f"{row['sector']} {row['score']:+.2f}" for row in cold)
+        lines.extend(["", "🧊 冷门板块", cold_text])
     return "\n".join(lines)
+
+
+def format_sector_summary_hot_row(index: int, row: dict[str, Any]) -> str:
+    leader = row["leader"]
+    return (
+        f"{index}. {row['sector']} {row['score']:+.1f} | "
+        f"均涨{row['avg_price']:+.2f}% | OI{row['avg_oi']:+.2f}% | "
+        f"龙头 {base_symbol(leader.symbol)} {leader.price_change_percent:+.2f}%"
+    )
 
 
 def format_regime_for_telegram(snapshots: list[MarketSnapshot]) -> str:
@@ -5507,7 +5791,7 @@ def format_regime_for_telegram(snapshots: list[MarketSnapshot]) -> str:
         f"总体状态: {label} ({market_score:.1f}/100)",
         f"上涨占比: {up_ratio * 100:.1f}% | OI扩张: {oi_up_ratio * 100:.1f}%",
         f"15m净流入: {flow15_ratio * 100:.1f}% | 1h净流入: {flow1h_ratio * 100:.1f}%",
-        f"主动买入偏强: {taker_ratio * 100:.1f}% | Funding过热: {funding_hot_ratio * 100:.1f}%",
+        f"主动买入偏强: {taker_ratio * 100:.1f}% | 费率过热: {funding_hot_ratio * 100:.1f}%",
         "",
         "核心资产:",
         core_lines,
@@ -5580,15 +5864,13 @@ def regime_strategy(label: str, alt_relative: float) -> str:
 def format_summary_for_telegram(snapshots: list[MarketSnapshot], top_n: int) -> str:
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if not snapshots:
-        return f"[SUMMARY] 市场温度摘要\n\n暂无快照数据\n时间: {now}"
+        return "📊 每小时市场简报\n[SUMMARY] 市场温度摘要 v2\n暂无快照数据"
 
     total = len(snapshots)
     up_count = sum(1 for item in snapshots if item.price_change_percent > 0)
     oi_up_count = sum(1 for item in snapshots if item.oi_change_percent > 0)
-    taker_buy_count = sum(1 for item in snapshots if (item.taker_buy_sell_ratio or 0) >= 1.1)
     crowded_count = sum(1 for item in snapshots if (item.global_long_short_ratio or 0) >= 2.0)
     hot_funding_count = sum(1 for item in snapshots if (item.funding_rate_percent or 0) >= 0.03)
-    flow_15m_positive = sum(1 for item in snapshots if summary_flow_value(item, "15m") > 0)
     flow_1h_positive = sum(1 for item in snapshots if summary_flow_value(item, "1h") > 0)
 
     discovery_candidates = [item for item in snapshots if is_summary_discovery(item)]
@@ -5596,70 +5878,145 @@ def format_summary_for_telegram(snapshots: list[MarketSnapshot], top_n: int) -> 
     top_risk_candidates = [item for item in snapshots if is_summary_top_risk(item)]
     distribution_candidates = [item for item in snapshots if is_summary_distribution(item)]
 
-    avg_price = sum(item.price_change_percent for item in snapshots) / total
-    avg_oi = sum(item.oi_change_percent for item in snapshots) / total
     temperature = market_temperature_score(snapshots)
 
     hot_set = {item.symbol for item in hot_candidates}
     risk_set = {item.symbol for item in top_risk_candidates}
-    discovery_set = {item.symbol for item in discovery_candidates}
     distribution_set = {item.symbol for item in distribution_candidates}
 
-    hot_leaders = sorted(hot_candidates, key=lambda item: discovery_score(item) + top_risk_score(item), reverse=True)
-    ordered = sorted(
-        [item for item in snapshots if item.symbol not in hot_set and item.symbol not in risk_set and item.symbol not in distribution_set],
+    discovery_leaders = sorted(
+        [
+            item for item in snapshots
+            if item.symbol not in hot_set
+            and item.symbol not in risk_set
+            and item.symbol not in distribution_set
+            and discovery_score(item) > 0
+        ],
         key=discovery_score,
         reverse=True,
-    )
-    flow_leaders = sorted(snapshots, key=lambda item: summary_flow_value(item, "15m"), reverse=True)
-    oi_leaders = sorted(snapshots, key=lambda item: item.oi_change_percent, reverse=True)
+    )[:3]
+    flow_leaders = [item for item in sorted(snapshots, key=lambda item: summary_flow_value(item, "15m"), reverse=True) if summary_flow_value(item, "15m") > 0][:3]
+    oi_leaders = [item for item in sorted(snapshots, key=lambda item: item.oi_change_percent, reverse=True) if item.oi_change_percent > 0][:3]
     risk_leaders = sorted(
-        [item for item in top_risk_candidates if item.symbol not in hot_set and item.symbol not in discovery_set],
+        top_risk_candidates,
         key=top_risk_score,
         reverse=True,
-    )
-    distribution_leaders = sorted(distribution_candidates, key=lambda item: abs(item.oi_change_percent) + abs(min(summary_flow_value(item, "15m"), 0)) / 1_000_000, reverse=True)
+    )[:3]
 
     sections = [
+        "📊 每小时市场简报",
         "[SUMMARY] 市场温度摘要 v2",
+        f"市场温度: {temperature:.0f}/100 {market_temperature_label(temperature)}",
+        f"大盘风向: {summary_market_direction_label(snapshots)}",
+        f"监控: {total}币 | 上涨{up_count / total * 100:.0f}% | OI扩张{oi_up_count / total * 100:.0f}% | 1h净流入{flow_1h_positive / total * 100:.0f}%",
+        f"拥挤: 多头{crowded_count} | 费率过热{hot_funding_count}",
+        f"候选: 启动{len(discovery_candidates)} | 过热{len(hot_candidates)} | 逃顶{len(top_risk_candidates)} | 派发{len(distribution_candidates)}",
         "",
-        f"市场温度: {temperature:.1f}/100 ({market_temperature_label(temperature)})",
-        f"监控币数: {total}",
-        f"上涨占比: {up_count}/{total} ({up_count / total * 100:.1f}%)",
-        f"OI扩张: {oi_up_count}/{total} ({oi_up_count / total * 100:.1f}%)",
-        f"主动买入偏强: {taker_buy_count}/{total} ({taker_buy_count / total * 100:.1f}%)",
-        f"15m净流入: {flow_15m_positive}/{total} ({flow_15m_positive / total * 100:.1f}%)",
-        f"1h净流入: {flow_1h_positive}/{total} ({flow_1h_positive / total * 100:.1f}%)",
-        f"多头拥挤: {crowded_count}/{total} | Funding过热: {hot_funding_count}/{total}",
-        f"平均涨跌: {avg_price:+.2f}% | 平均OI: {avg_oi:+.2f}%",
-        "",
-        market_方向_summary(snapshots),
-        "",
-        f"信号候选: 启动 {len(discovery_candidates)} / 强势过热 {len(hot_candidates)} / 逃顶风险 {len(top_risk_candidates)} / 派发 {len(distribution_candidates)}",
+        format_summary_major_lines(snapshots),
         "",
         format_sector_brief_for_summary(snapshots),
-        "",
-        "🔥 强势过热榜:",
-        format_snapshot_lines(hot_leaders[:top_n], include_score=True, include_risk=True),
-        "",
-        "🟢 最接近启动:",
-        format_snapshot_lines(ordered[:top_n], include_score=True),
-        "",
-        "🟢 15m资金净流入榜:",
-        format_snapshot_lines(flow_leaders[:top_n], include_flow=True),
-        "",
-        "🟢 OI 增长榜:",
-        format_snapshot_lines(oi_leaders[:top_n]),
-        "",
-        "🔴 逃顶风险榜:",
-        format_snapshot_lines(risk_leaders[:top_n], include_risk=True),
-        "",
-        "🟡 疑似派发榜:",
-        format_snapshot_lines(distribution_leaders[:top_n], include_flow=True),
+    ]
+
+    ranking_sections = [
+        format_summary_ranking("🔴 逃顶风险 Top3", risk_leaders, format_summary_risk_item),
+        format_summary_ranking("🟢 接近启动 Top3", discovery_leaders, format_summary_discovery_item),
+        format_summary_ranking("🟢 资金流入 Top3", flow_leaders, format_summary_flow_item),
+        format_summary_ranking("🟡 OI增长 Top3", oi_leaders, format_summary_oi_item),
+    ]
+    ranking_sections = [section for section in ranking_sections if section]
+    if ranking_sections:
+        sections.extend(["", *ranking_sections])
+    else:
+        sections.extend(["", "暂无高价值榜单，继续观察。"])
+
+    sections.extend([
         "",
         f"时间: {now}",
-    ]
-    return "\n".join(sections)
+    ])
+    return telegram_text("\n".join(part for part in sections if part != ""))
+
+
+def summary_market_direction_label(snapshots: list[MarketSnapshot]) -> str:
+    by_symbol = {snapshot.symbol: snapshot for snapshot in snapshots}
+    majors = [by_symbol[symbol] for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT") if symbol in by_symbol]
+    if not majors:
+        return "暂无核心币数据"
+
+    strength = 0
+    for snapshot in majors:
+        if short_term_score(snapshot) >= 6:
+            strength += 1
+        if mid_term_score(snapshot) >= 6:
+            strength += 1
+        if summary_flow_value(snapshot, "15m") > 0:
+            strength += 1
+        if summary_flow_value(snapshot, "1h") > 0:
+            strength += 1
+
+    if strength >= 7:
+        return "偏强"
+    if strength >= 4:
+        return "中性"
+    return "偏弱"
+
+
+def format_summary_major_lines(snapshots: list[MarketSnapshot]) -> str:
+    by_symbol = {snapshot.symbol: snapshot for snapshot in snapshots}
+    lines = []
+    for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+        snapshot = by_symbol.get(symbol)
+        if snapshot is None:
+            continue
+        lines.append(
+            f"{base_symbol(symbol)}: 短{short_term_score(snapshot)}/10 中{mid_term_score(snapshot)}/10 | "
+            f"15m {format_usd(summary_flow_value(snapshot, '15m'))} | "
+            f"1h {format_usd(summary_flow_value(snapshot, '1h'))} | "
+            f"位置{format_optional_value(snapshot.price_position_24h)}%"
+        )
+    return "\n".join(lines) if lines else "核心币: 暂无数据"
+
+
+def format_summary_ranking(
+    title: str,
+    snapshots: list[MarketSnapshot],
+    formatter: Callable[[MarketSnapshot], str],
+) -> str:
+    rows = [formatter(snapshot) for snapshot in snapshots[:3]]
+    rows = [row for row in rows if row]
+    if not rows:
+        return ""
+    return "\n".join([title, *rows])
+
+
+def format_summary_risk_item(snapshot: MarketSnapshot) -> str:
+    return (
+        f"🔴 {base_symbol(snapshot.symbol)} {snapshot.price_change_percent:+.1f}% | "
+        f"OI{snapshot.oi_change_percent:+.1f}% | 费率{format_realtime_funding(snapshot.funding_rate_percent)} | "
+        f"风险{top_risk_score(snapshot):.0f}"
+    )
+
+
+def format_summary_discovery_item(snapshot: MarketSnapshot) -> str:
+    return (
+        f"🟢 {base_symbol(snapshot.symbol)} {snapshot.price_change_percent:+.2f}% | "
+        f"OI{snapshot.oi_change_percent:+.2f}% | 主买{format_optional_value(snapshot.taker_buy_sell_ratio)} | "
+        f"分{discovery_score(snapshot):.1f}"
+    )
+
+
+def format_summary_flow_item(snapshot: MarketSnapshot) -> str:
+    return (
+        f"🟢 {base_symbol(snapshot.symbol)} {snapshot.price_change_percent:+.2f}% | "
+        f"15m {format_usd(summary_flow_value(snapshot, '15m'))} | "
+        f"1h {format_usd(summary_flow_value(snapshot, '1h'))}"
+    )
+
+
+def format_summary_oi_item(snapshot: MarketSnapshot) -> str:
+    return (
+        f"🟡 {base_symbol(snapshot.symbol)} {snapshot.price_change_percent:+.2f}% | "
+        f"OI{snapshot.oi_change_percent:+.1f}% | 费率{format_realtime_funding(snapshot.funding_rate_percent)}"
+    )
 
 
 def market_方向_summary(snapshots: list[MarketSnapshot]) -> str:
@@ -5819,17 +6176,17 @@ def format_snapshot_lines(
         return "-"
     lines = []
     for snapshot in snapshots:
-        score = f" score={discovery_score(snapshot):+.2f}" if include_score else ""
-        risk = f" risk={top_risk_score(snapshot):+.2f}" if include_risk else ""
+        score = f" 启动分={discovery_score(snapshot):+.2f}" if include_score else ""
+        risk = f" 风险分={top_risk_score(snapshot):+.2f}" if include_risk else ""
         flow = ""
         if include_flow:
-            flow = f" flow15m={format_usd(summary_flow_value(snapshot, '15m'))} flow1h={format_usd(summary_flow_value(snapshot, '1h'))}"
+            flow = f" 15m资金={format_usd(summary_flow_value(snapshot, '15m'))} 1h资金={format_usd(summary_flow_value(snapshot, '1h'))}"
         marker = snapshot_direction_marker(snapshot)
         lines.append(
             f"{marker} {snapshot.symbol}: 价格={snapshot.price_change_percent:+.2f}% "
             f"OI={snapshot.oi_change_percent:+.2f}% "
-            f"LS={format_optional_value(snapshot.global_long_short_ratio)} "
-            f"taker={format_optional_value(snapshot.taker_buy_sell_ratio)} "
+            f"多空比={format_optional_value(snapshot.global_long_short_ratio)} "
+            f"主动买卖比={format_optional_value(snapshot.taker_buy_sell_ratio)} "
             f"资金费率={format_optional_value(snapshot.funding_rate_percent)}%{flow}{score}{risk}"
         )
     return "\n".join(lines)
@@ -5864,6 +6221,32 @@ def truncate_text(text: str, limit: int = 3500) -> str:
         return text
     suffix = "\n...已截断"
     return text[: max(0, limit - len(suffix))] + suffix
+
+
+def truncate_text_by_lines(text: str, limit: int = 1800, suffix: str = "...已精简") -> str:
+    if len(text) <= limit:
+        return text
+    result_lines: list[str] = []
+    current_len = 0
+    suffix_len = len(suffix) + 1
+    for line in str(text).splitlines():
+        addition = len(line) + (1 if result_lines else 0)
+        if current_len + addition + suffix_len > limit:
+            break
+        result_lines.append(line)
+        current_len += addition
+    if result_lines:
+        return "\n".join(result_lines + [suffix])
+
+    allowed = max(0, limit - suffix_len)
+    cut = min(len(text), allowed)
+    while cut > 0 and (text[cut - 1].isdigit() or text[cut - 1] in ".+-()（）"):
+        cut -= 1
+    return f"{text[:cut].rstrip()}\n{suffix}"
+
+
+def telegram_text(text: str, limit: int = 1800) -> str:
+    return truncate_text_by_lines(text, limit)
 
 
 def run_dev_command(args: list[str], timeout: int = 20) -> tuple[bool, str]:

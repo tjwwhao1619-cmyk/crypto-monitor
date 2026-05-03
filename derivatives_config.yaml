@@ -47,6 +47,7 @@ telegram_signal_filter:
   digest_priorities: ["C", "D"]
   digest_interval_minutes: 30
   digest_max_per_priority: 8
+  merge_window_seconds: 120
 summary:
   enabled: true
   interval_seconds: 600
