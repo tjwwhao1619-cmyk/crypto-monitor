@@ -132,6 +132,13 @@ SIGNAL_LOG_FIELDS = [
     "long_flow_alignment_score",
     "structure_label",
     "trade_plan",
+    "main_asset_score",
+    "main_asset_score_label",
+    "main_asset_trend_score",
+    "main_asset_flow_score",
+    "main_asset_derivatives_score",
+    "main_asset_spot_orderbook_score",
+    "main_asset_risk_penalty",
 ]
 
 
@@ -1399,6 +1406,8 @@ class DerivativesMonitor:
 
     def log_signal(self, signal: Signal) -> None:
         snapshot = signal.snapshot
+        main_score = main_asset_score(snapshot) if snapshot else None
+        main_score_components = main_score.components if main_score else {}
         row = {
             "time": dt.datetime.now(dt.UTC).isoformat(),
             "symbol": signal.symbol,
@@ -1437,6 +1446,13 @@ class DerivativesMonitor:
             "long_flow_alignment_score": long_flow_alignment_score(snapshot) if snapshot else "",
             "structure_label": market_structure_label(snapshot) if snapshot else "",
             "trade_plan": signal_trade_plan(signal) if snapshot else "",
+            "main_asset_score": main_score.total_score if main_score else "",
+            "main_asset_score_label": main_score.label if main_score else "",
+            "main_asset_trend_score": main_score_components.get("趋势", ""),
+            "main_asset_flow_score": main_score_components.get("资金", ""),
+            "main_asset_derivatives_score": main_score_components.get("衍生品", ""),
+            "main_asset_spot_orderbook_score": main_score_components.get("现货订单簿", ""),
+            "main_asset_risk_penalty": main_score_components.get("风险扣分", ""),
         }
         path = Path(self.signal_log_path)
         fieldnames, write_header = ensure_csv_schema(path, SIGNAL_LOG_FIELDS)

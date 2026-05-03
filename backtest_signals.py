@@ -17,6 +17,12 @@ LONG_FLOW_GROUPS = (
     ("4-6", "长周期分歧", 4, 6),
     ("7-9", "长周期支持", 7, 9),
 )
+MAIN_ASSET_SCORE_GROUPS = (
+    ("0-39", "主流弱", 0, 39),
+    ("40-59", "主流中性", 40, 59),
+    ("60-79", "主流强", 60, 79),
+    ("80-100", "主流极强", 80, 100),
+)
 
 
 def parse_time(value):
@@ -88,6 +94,7 @@ def eval_signal(session, row):
     side = direction(kind)
     out = {"symbol": symbol, "kind": kind, "side": side}
     out["long_flow_alignment_score"] = parse_int(row.get("long_flow_alignment_score"))
+    out["main_asset_score"] = parse_int(row.get("main_asset_score"))
     for name in ("12h", "24h"):
         out[f"flow_{name}"] = parse_float(row.get(f"net_flow_{name}_usd"))
         out[f"flow_{name}_ratio"] = parse_float(row.get(f"net_flow_{name}_ratio"))
@@ -152,6 +159,9 @@ def flow_detail(x):
     long_flow = x.get("long_flow_alignment_score")
     if long_flow is not None:
         parts.append(f"longFlow={long_flow}/9")
+    main_score = x.get("main_asset_score")
+    if main_score is not None:
+        parts.append(f"mainScore={main_score}/100")
     for name in ("12h", "24h"):
         flow = x.get(f"flow_{name}")
         ratio = x.get(f"flow_{name}_ratio")
@@ -164,6 +174,15 @@ def long_flow_group(score):
     if score is None:
         return None
     for label, name, low, high in LONG_FLOW_GROUPS:
+        if low <= score <= high:
+            return label, name
+    return None
+
+
+def main_asset_score_group(score):
+    if score is None:
+        return None
+    for label, name, low, high in MAIN_ASSET_SCORE_GROUPS:
         if low <= score <= high:
             return label, name
     return None
@@ -202,6 +221,37 @@ def print_long_flow_backtest(results):
                 )
             print(" ".join(parts))
         print("")
+
+
+def print_main_asset_score_backtest(results):
+    grouped = [
+        (x, main_asset_score_group(x.get("main_asset_score")))
+        for x in results
+    ]
+    if not any(group for _x, group in grouped):
+        return
+
+    print("[MAIN ASSET SCORE] 主流评分分组回测")
+    for label, name, _low, _high in MAIN_ASSET_SCORE_GROUPS:
+        group_rows = [
+            x
+            for x, group in grouped
+            if group == (label, name)
+        ]
+
+        print(f"{label} {name}: 样本={len(group_rows)}")
+        for h in ["15m", "1h", "4h", "12h", "24h"]:
+            vals = [x[h] for x in group_rows if x[h] is not None]
+            if not vals:
+                print(f"  {h}: 样本=0")
+                continue
+            wins = sum(v > 0 for v in vals)
+            print(
+                f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))} "
+                f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
+            )
+    print("")
 
 
 def main():
@@ -250,6 +300,7 @@ def main():
         print("")
 
     print_long_flow_backtest(results)
+    print_main_asset_score_backtest(results)
 
     print("最近20条:")
     for x in results[:20]:
