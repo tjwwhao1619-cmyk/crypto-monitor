@@ -1,16 +1,22 @@
 import argparse
+import base64
 import concurrent.futures
 import csv
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
 import secrets
 import shutil
+import socket
+import ssl
+import struct
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +28,8 @@ import yaml
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 BINANCE_FUTURES_DATA_BASE = "https://fapi.binance.com/futures/data"
+BINANCE_FORCE_ORDER_WS_HOST = "fstream.binance.com"
+BINANCE_FORCE_ORDER_WS_PATH = "/ws/!forceOrder@arr"
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 FLOW_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h"]
 
@@ -57,6 +65,14 @@ class Signal:
     message: str
     key: str
     snapshot: MarketSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class LiquidationEvent:
+    symbol: str
+    side: str
+    amount_usd: float
+    event_time: float
 
 
 SIGNAL_LOG_FIELDS = [
@@ -138,8 +154,13 @@ class DerivativesMonitor:
         self.telegram_command_thread_started = False
         self.telegram_update_offset = self.load_telegram_update_offset()
         self.pending_dev_confirmations: dict[str, tuple[str, str, float]] = {}
+        self.liquidation_events: deque[LiquidationEvent] = deque()
+        self.liquidation_lock = threading.Lock()
+        self.liquidation_thread_started = False
+        self.liquidation_stop_event = threading.Event()
 
     def run_forever(self) -> None:
+        self.start_liquidation_stream_worker()
         self.start_telegram_command_worker()
         self.send_pending_dev_restart_status()
         self.refresh_symbols_if_due(force=True)
@@ -166,6 +187,106 @@ class DerivativesMonitor:
             signals = self.evaluate_snapshot(snapshot, symbol_config)
             results.append((snapshot, signals))
         return results
+
+    def start_liquidation_stream_worker(self) -> None:
+        if self.liquidation_thread_started:
+            return
+        self.liquidation_thread_started = True
+        thread = threading.Thread(target=self.liquidation_stream_loop, name="binance-force-order-stream", daemon=True)
+        thread.start()
+
+    def liquidation_stream_loop(self) -> None:
+        backoff_seconds = 5
+        while not self.liquidation_stop_event.is_set():
+            sock: ssl.SSLSocket | None = None
+            try:
+                sock = open_binance_force_order_socket()
+                logging.info("Subscribed Binance force order stream !forceOrder@arr")
+                backoff_seconds = 5
+                while not self.liquidation_stop_event.is_set():
+                    frame = websocket_read_frame(sock)
+                    if frame is None:
+                        break
+                    opcode, payload = frame
+                    if opcode == 0x1:
+                        self.record_liquidation_payload(payload.decode("utf-8"))
+                    elif opcode == 0x8:
+                        break
+                    elif opcode == 0x9:
+                        websocket_send_frame(sock, 0xA, payload)
+            except Exception:
+                logging.warning("Binance force order stream disconnected", exc_info=True)
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+            self.liquidation_stop_event.wait(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 60)
+
+    def record_liquidation_payload(self, payload_text: str) -> None:
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            logging.debug("Invalid force order payload: %s", payload_text)
+            return
+
+        items = force_order_items(payload)
+        for item in items:
+            event = liquidation_event_from_order(item)
+            if event is not None:
+                self.add_liquidation_event(event)
+
+    def add_liquidation_event(self, event: LiquidationEvent) -> None:
+        cutoff = time.time() - 3600
+        with self.liquidation_lock:
+            self.liquidation_events.append(event)
+            self.prune_liquidation_events_locked(cutoff)
+
+    def prune_liquidation_events_locked(self, cutoff: float) -> None:
+        while self.liquidation_events and self.liquidation_events[0].event_time < cutoff:
+            self.liquidation_events.popleft()
+
+    def liquidation_stats(self, symbol: str) -> dict[str, dict[str, float]]:
+        symbol = symbol.upper()
+        now = time.time()
+        cutoff_1h = now - 3600
+        cutoff_15m = now - 900
+        stats = {
+            "15m": {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "count": 0.0},
+            "1h": {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "count": 0.0},
+        }
+
+        with self.liquidation_lock:
+            self.prune_liquidation_events_locked(cutoff_1h)
+            events = list(self.liquidation_events)
+
+        for event in events:
+            if event.symbol != symbol:
+                continue
+            if event.event_time >= cutoff_1h:
+                update_liquidation_stats_bucket(stats["1h"], event)
+            if event.event_time >= cutoff_15m:
+                update_liquidation_stats_bucket(stats["15m"], event)
+
+        return stats
+
+    def format_liquidation_stats(self, symbol: str) -> str:
+        stats = self.liquidation_stats(symbol)
+        stats_15m = stats["15m"]
+        stats_1h = stats["1h"]
+        if stats_1h["count"] <= 0:
+            return "真实强平: 近1h暂无明显强平数据"
+        return (
+            "真实强平: "
+            f"15m 多单强平 {format_usd(stats_15m['long_liq_usd'])} / "
+            f"空单强平 {format_usd(stats_15m['short_liq_usd'])}；"
+            f"1h 多单强平 {format_usd(stats_1h['long_liq_usd'])} / "
+            f"空单强平 {format_usd(stats_1h['short_liq_usd'])}；"
+            f"样本 {int(stats_1h['count'])}"
+        )
 
     def refresh_symbols_if_due(self, force: bool = False) -> None:
         if not self.screener_config.get("enabled", False):
@@ -928,7 +1049,8 @@ class DerivativesMonitor:
 
     def send_telegram(self, bot_token: str, chat_id: str, signal: Signal) -> None:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": format_signal_for_telegram(signal)}
+        liquidation_text = self.format_liquidation_stats(signal.symbol)
+        payload = {"chat_id": chat_id, "text": format_signal_for_telegram(signal, liquidation_text)}
         self.post_json(url, payload)
 
     def notify_status(self, title: str, message: str) -> None:
@@ -1082,7 +1204,8 @@ class DerivativesMonitor:
             combined_signal = self.combined_signal(snapshot, signals)
             if combined_signal:
                 signals.append(combined_signal)
-            self.send_telegram_text(bot_token, chat_id, format_symbol_diagnosis(snapshot, signals))
+            liquidation_text = self.format_liquidation_stats(symbol)
+            self.send_telegram_text(bot_token, chat_id, format_symbol_diagnosis(snapshot, signals, liquidation_text))
         except Exception as exc:
             logging.exception("Failed to diagnose symbol from Telegram command")
             self.send_telegram_text(bot_token, chat_id, f"{symbol} 查询失败: {type(exc).__name__}: {exc}")
@@ -1103,7 +1226,8 @@ class DerivativesMonitor:
             display_signals = ([combined_signal] if combined_signal else []) + signals
             market_snapshots = self.ask_market_snapshots()
             recent_rows = self.load_recent_symbol_signal_rows(symbol, 3)
-            context_text = format_ask_context(snapshot, display_signals, market_snapshots, recent_rows)
+            liquidation_text = self.format_liquidation_stats(symbol)
+            context_text = format_ask_context(snapshot, display_signals, market_snapshots, recent_rows, liquidation_text)
             ai_review = ask_ai_review(context_text)
             self.send_telegram_text(bot_token, chat_id, format_ask_response(context_text, ai_review))
         except Exception as exc:
@@ -1735,6 +1859,15 @@ def latest_float(rows: list[dict[str, Any]], key: str) -> float | None:
     return float(value)
 
 
+def parse_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def optional_gte(value: float | None, threshold: float) -> bool:
     return value is not None and value >= threshold
 
@@ -1839,6 +1972,66 @@ def format_usd(value: float | None) -> str:
     if abs_value >= 1_000:
         return f"{sign}{abs_value / 1_000:.1f}K"
     return f"{sign}{abs_value:.0f}"
+
+
+def force_order_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        payload = payload["data"]
+    if isinstance(payload, list):
+        candidates = payload
+    else:
+        candidates = [payload]
+
+    items = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        order = item.get("o")
+        if isinstance(order, dict):
+            items.append(order)
+        else:
+            items.append(item)
+    return items
+
+
+def liquidation_event_from_order(order: dict[str, Any]) -> LiquidationEvent | None:
+    symbol = str(order.get("s", "")).upper()
+    side = str(order.get("S", "")).upper()
+    if not symbol or side not in ("BUY", "SELL"):
+        return None
+
+    amount = liquidation_order_amount_usd(order)
+    if amount <= 0:
+        return None
+
+    event_ms = parse_float(order.get("T"))
+    event_time = (event_ms / 1000) if event_ms and event_ms > 1_000_000_000_000 else time.time()
+    return LiquidationEvent(symbol=symbol, side=side, amount_usd=amount, event_time=event_time)
+
+
+def liquidation_order_amount_usd(order: dict[str, Any]) -> float:
+    average_price = parse_float(order.get("ap"))
+    filled_qty = parse_float(order.get("z")) or parse_float(order.get("l")) or parse_float(order.get("q"))
+    if average_price is not None and filled_qty is not None:
+        amount = average_price * filled_qty
+        if amount > 0:
+            return amount
+
+    price = parse_float(order.get("p"))
+    quantity = parse_float(order.get("q"))
+    if price is not None and quantity is not None:
+        return max(0.0, price * quantity)
+    return 0.0
+
+
+def update_liquidation_stats_bucket(bucket: dict[str, float], event: LiquidationEvent) -> None:
+    if event.side == "SELL":
+        bucket["long_liq_usd"] += event.amount_usd
+    elif event.side == "BUY":
+        bucket["short_liq_usd"] += event.amount_usd
+    else:
+        return
+    bucket["count"] += 1
 
 
 
@@ -2434,7 +2627,7 @@ def ai_signal_review(signal: Signal) -> str:
     return f"{decision}。依据: {detail or '暂无明显共振'}。"
 
 
-def format_signal_for_telegram(signal: Signal) -> str:
+def format_signal_for_telegram(signal: Signal, liquidation_text: str | None = None) -> str:
     labels = {
         "discovery": ("🟢 [看多]", "发现启动信号"),
         "distribution": ("🟡 [减仓]", "疑似派发"),
@@ -2488,6 +2681,7 @@ def format_signal_for_telegram(signal: Signal) -> str:
         f"AI共振复核: {ai_signal_review(signal)}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
+        f"{liquidation_text or '真实强平: n/a'}\n"
         f"交易计划: {signal_trade_plan(signal)}\n"
         f"判断: {reason}\n"
         f"时间: {now}"
@@ -3201,6 +3395,98 @@ def dev_help_text() -> str:
     )
 
 
+def open_binance_force_order_socket() -> ssl.SSLSocket:
+    raw_sock = socket.create_connection((BINANCE_FORCE_ORDER_WS_HOST, 443), timeout=10)
+    sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=BINANCE_FORCE_ORDER_WS_HOST)
+    key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    request = (
+        f"GET {BINANCE_FORCE_ORDER_WS_PATH} HTTP/1.1\r\n"
+        f"Host: {BINANCE_FORCE_ORDER_WS_HOST}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "User-Agent: crypto-monitor/1.0\r\n"
+        "\r\n"
+    )
+    sock.sendall(request.encode("ascii"))
+    response = read_http_response(sock)
+    header_text = response.decode("iso-8859-1", errors="replace")
+    if " 101 " not in header_text.split("\r\n", 1)[0]:
+        raise ConnectionError(f"Unexpected WebSocket handshake response: {header_text.splitlines()[0]}")
+
+    accept = ""
+    for line in header_text.split("\r\n")[1:]:
+        if line.lower().startswith("sec-websocket-accept:"):
+            accept = line.split(":", 1)[1].strip()
+            break
+    expected_accept = base64.b64encode(
+        hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+    ).decode("ascii")
+    if accept != expected_accept:
+        raise ConnectionError("Invalid WebSocket accept header from Binance")
+    sock.settimeout(None)
+    return sock
+
+
+def read_http_response(sock: ssl.SSLSocket) -> bytes:
+    chunks = []
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        data = b"".join(chunks)
+        if len(data) > 65536:
+            raise ConnectionError("WebSocket handshake response too large")
+    return data
+
+
+def recv_exact(sock: ssl.SSLSocket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("WebSocket connection closed")
+        data += chunk
+    return data
+
+
+def websocket_read_frame(sock: ssl.SSLSocket) -> tuple[int, bytes] | None:
+    header = recv_exact(sock, 2)
+    first, second = header
+    opcode = first & 0x0F
+    masked = bool(second & 0x80)
+    length = second & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", recv_exact(sock, 8))[0]
+
+    mask = recv_exact(sock, 4) if masked else b""
+    payload = recv_exact(sock, length) if length else b""
+    if masked:
+        payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    if opcode == 0x8:
+        return None
+    return opcode, payload
+
+
+def websocket_send_frame(sock: ssl.SSLSocket, opcode: int, payload: bytes = b"") -> None:
+    first = 0x80 | opcode
+    length = len(payload)
+    if length < 126:
+        header = struct.pack("!BB", first, 0x80 | length)
+    elif length <= 0xFFFF:
+        header = struct.pack("!BBH", first, 0x80 | 126, length)
+    else:
+        header = struct.pack("!BBQ", first, 0x80 | 127, length)
+    mask = secrets.token_bytes(4)
+    masked_payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    sock.sendall(header + mask + masked_payload)
+
+
 
 def load_config(path: str) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as file:
@@ -3239,7 +3525,8 @@ def main() -> int:
         combined_signal = monitor.combined_signal(snapshot, signals)
         if combined_signal:
             signals.append(combined_signal)
-        print_symbol_diagnosis(snapshot, signals)
+        liquidation_text = monitor.format_liquidation_stats(args.symbol.upper())
+        print_symbol_diagnosis(snapshot, signals, liquidation_text)
         return 0
     if args.once:
         results = monitor.run_once(refresh_symbols=not args.no_refresh)
@@ -3268,7 +3555,11 @@ def print_scan_results(results: list[tuple[MarketSnapshot, list[Signal]]]) -> No
             print(f"  {signal.title}: {signal.message}")
 
 
-def format_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> str:
+def format_symbol_diagnosis(
+    snapshot: MarketSnapshot,
+    signals: list[Signal],
+    liquidation_text: str | None = None,
+) -> str:
     signal_names = ", ".join(signal.kind for signal in signals) or "-"
     return (
         f"{snapshot.symbol}\n"
@@ -3289,6 +3580,7 @@ def format_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> 
         f"信号: {signal_names}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
+        f"{liquidation_text or '真实强平: n/a'}\n"
         f"判断: {diagnose_snapshot(snapshot, signals)}"
     )
 
@@ -3298,6 +3590,7 @@ def format_ask_context(
     signals: list[Signal],
     market_snapshots: list[MarketSnapshot],
     recent_signal_rows: list[dict[str, str]],
+    liquidation_text: str | None = None,
 ) -> str:
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     signal_text = format_ask_signal_list(signals)
@@ -3314,7 +3607,8 @@ def format_ask_context(
         f"24h低 {format_optional_value(snapshot.low_24h)}；"
         f"交易计划 {trade_plan}；"
         f"结构判断 {market_structure_label(snapshot)}；"
-        f"清算风险 {liquidation_risk_label(snapshot)}"
+        f"清算风险 {liquidation_risk_label(snapshot)}；"
+        f"{liquidation_text or '真实强平: n/a'}"
     )
 
     text = (
@@ -3350,6 +3644,7 @@ def format_ask_context(
         f"现货/链上确认: {spot_alpha_confirmation(snapshot.symbol)}\n"
         f"结构判断: {market_structure_label(snapshot)}\n"
         f"清算风险: {liquidation_risk_label(snapshot)}\n"
+        f"{liquidation_text or '真实强平: n/a'}\n"
         f"短线评分: {short_term_score(snapshot)}/10 ({score_note(short_term_score(snapshot))})\n"
         f"中线评分: {mid_term_score(snapshot)}/10 ({score_note(mid_term_score(snapshot))})\n"
         f"综合判断: {system_direction}\n\n"
@@ -3482,7 +3777,11 @@ def format_recent_symbol_signals(rows: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def print_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> None:
+def print_symbol_diagnosis(
+    snapshot: MarketSnapshot,
+    signals: list[Signal],
+    liquidation_text: str | None = None,
+) -> None:
     signal_names = ", ".join(signal.kind for signal in signals) or "-"
     print(snapshot.symbol)
     print(f"价格: {snapshot.close_price:.8g}")
@@ -3504,6 +3803,7 @@ def print_symbol_diagnosis(snapshot: MarketSnapshot, signals: list[Signal]) -> N
     print(f"信号: {signal_names}")
     print(f"结构判断: {market_structure_label(snapshot)}")
     print(f"清算风险: {liquidation_risk_label(snapshot)}")
+    print(liquidation_text or "真实强平: n/a")
     print(f"判断: {diagnose_snapshot(snapshot, signals)}")
 
 
