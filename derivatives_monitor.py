@@ -55,6 +55,9 @@ DEFAULT_TELEGRAM_DIGEST_PRIORITIES = ("C", "D")
 DEFAULT_TELEGRAM_DIGEST_INTERVAL_MINUTES = 30
 DEFAULT_TELEGRAM_DIGEST_MAX_PER_PRIORITY = 8
 DEFAULT_TELEGRAM_MERGE_WINDOW_SECONDS = 120
+DEFAULT_CONVICTION_REALTIME_THRESHOLD = 70
+DEFAULT_CONVICTION_WATCH_THRESHOLD = 55
+DEFAULT_RISK_REALTIME_THRESHOLD = 65
 
 
 @dataclass(frozen=True)
@@ -1769,7 +1772,7 @@ class DerivativesMonitor:
                 )
                 delivery, _delivery_reason = self.telegram_signal_delivery(signal)
                 if delivery == "digest":
-                    self.enqueue_telegram_signal_digest(signal, priority, quality_score, quality_reason)
+                    self.enqueue_telegram_signal_digest(signal, priority, quality_score, quality_reason, force=True)
                 return
             self.enqueue_pending_telegram_signal(signal, priority, quality_score, quality_reason)
 
@@ -1854,6 +1857,24 @@ class DerivativesMonitor:
             config = {}
         return parse_positive_int(config.get("merge_window_seconds"), DEFAULT_TELEGRAM_MERGE_WINDOW_SECONDS)
 
+    def telegram_conviction_thresholds(self) -> tuple[int, int, int]:
+        config = self.config.get("telegram_signal_filter", {})
+        if not isinstance(config, dict):
+            config = {}
+        realtime_threshold = parse_positive_int(
+            config.get("conviction_realtime_threshold"),
+            DEFAULT_CONVICTION_REALTIME_THRESHOLD,
+        )
+        watch_threshold = parse_positive_int(
+            config.get("conviction_watch_threshold"),
+            DEFAULT_CONVICTION_WATCH_THRESHOLD,
+        )
+        risk_realtime_threshold = parse_positive_int(
+            config.get("risk_realtime_threshold"),
+            DEFAULT_RISK_REALTIME_THRESHOLD,
+        )
+        return realtime_threshold, watch_threshold, risk_realtime_threshold
+
     def configured_realtime_priorities(self) -> set[str]:
         config = self.config.get("telegram_signal_filter", {})
         if not isinstance(config, dict):
@@ -1875,14 +1896,16 @@ class DerivativesMonitor:
         intent_label, _intent_score, _intent_reason = market_intent(snapshot, signal)
         risk_intents = {"高位出货", "多杀多风险", "逃顶", "减仓优先"}
         risk_kinds = {"top_risk", "top_exhaustion", "distribution"}
+        realtime_threshold, watch_threshold, risk_realtime_threshold = self.telegram_conviction_thresholds()
+        risk_signal = signal.kind in risk_kinds
 
-        if conviction >= 80:
-            return "realtime", f"conviction {conviction}>=80"
-        if signal.kind in risk_kinds and conviction >= 70 and intent_label in risk_intents:
+        if risk_signal and conviction >= risk_realtime_threshold and intent_label in risk_intents:
             return "realtime", f"risk {signal.kind} conviction {conviction} intent {intent_label}"
-        if 65 <= conviction <= 79:
+        if not risk_signal and conviction >= realtime_threshold:
+            return "realtime", f"conviction {conviction}>={realtime_threshold}"
+        if conviction >= watch_threshold:
             return "digest", f"conviction {conviction} digest only"
-        return "log", f"conviction {conviction}<65"
+        return "log", f"conviction {conviction}<{watch_threshold}"
 
     def telegram_signal_suppression(self, signal: Signal, priority: str, quality_score: int) -> tuple[bool, str]:
         delivery, delivery_reason = self.telegram_signal_delivery(signal)
@@ -1999,11 +2022,12 @@ class DerivativesMonitor:
         priority: str,
         quality_score: int,
         quality_reason: str = "",
+        force: bool = False,
     ) -> None:
         _realtime_priorities, digest_priorities, _digest_interval_minutes, _digest_max_per_priority = (
             self.telegram_signal_filter_settings()
         )
-        if priority not in set(digest_priorities):
+        if not force and priority not in set(digest_priorities):
             return
 
         snapshot = signal.snapshot
@@ -2043,8 +2067,8 @@ class DerivativesMonitor:
         with self.telegram_signal_digest_lock:
             items = self.telegram_signal_digest_queue
             self.telegram_signal_digest_queue = []
-        digest_priority_set = set(digest_priorities)
-        digest_items = [item for item in items if item.priority in digest_priority_set]
+        digest_items = list(items)
+        digest_priorities = extend_digest_priorities(digest_priorities, digest_items)
         if not digest_items:
             return
 
@@ -2280,8 +2304,8 @@ class DerivativesMonitor:
         with self.telegram_signal_digest_lock:
             items = list(self.telegram_signal_digest_queue)
 
-        digest_priority_set = set(digest_priorities)
-        digest_items = [item for item in items if item.priority in digest_priority_set]
+        digest_items = list(items)
+        digest_priorities = extend_digest_priorities(digest_priorities, digest_items)
         if not digest_items:
             return "当前暂无静默信号。"
 
@@ -2294,6 +2318,7 @@ class DerivativesMonitor:
         )
 
     def format_signal_quality_stats(self) -> str:
+        realtime_threshold, watch_threshold, risk_realtime_threshold = self.telegram_conviction_thresholds()
         with self.signal_quality_stats_lock:
             stats = {
                 "total": self.signal_quality_stats["total"],
@@ -2324,6 +2349,9 @@ class DerivativesMonitor:
                 f"实时推送: {stats['realtime_sent']}",
                 f"静默: {stats['suppressed']}",
                 f"pending_merge: {stats['pending_merge']}",
+                f"实时把握阈值: {realtime_threshold}",
+                f"摘要把握阈值: {watch_threshold}",
+                f"风控实时阈值: {risk_realtime_threshold}",
                 f"等级分布: {priority_text}",
                 f"静默分布: {suppressed_text}",
                 f"信号类型: {top_kinds}",
@@ -2363,11 +2391,15 @@ class DerivativesMonitor:
             self.telegram_signal_filter_settings()
         )
         _current_realtime, override_enabled = self.runtime_realtime_priorities_status()
+        realtime_threshold, watch_threshold, risk_realtime_threshold = self.telegram_conviction_thresholds()
         return "\n".join(
             [
                 "Telegram 临时静音等级",
                 f"实时等级: {format_priority_set(realtime_priorities)}",
                 f"摘要等级: {format_priority_set(set(digest_priorities))}",
+                f"实时把握阈值: {realtime_threshold}",
+                f"摘要把握阈值: {watch_threshold}",
+                f"风控实时阈值: {risk_realtime_threshold}",
                 f"override: {'on' if override_enabled else 'off'}",
             ]
         )
@@ -6529,6 +6561,20 @@ def format_priority_set(priorities: set[str]) -> str:
     ordered = [priority for priority in order if priority in priorities]
     ordered.extend(sorted(priority for priority in priorities if priority not in order))
     return "/".join(ordered) if ordered else "-"
+
+
+def extend_digest_priorities(
+    digest_priorities: list[str],
+    items: list[TelegramSignalDigestItem],
+) -> list[str]:
+    extended = list(digest_priorities)
+    for priority in ("S", "A", "B", "C", "D"):
+        if priority not in extended and any(item.priority == priority for item in items):
+            extended.append(priority)
+    for item in items:
+        if item.priority not in extended:
+            extended.append(item.priority)
+    return extended
 
 
 def normalize_usdt_symbol(value: str) -> str:

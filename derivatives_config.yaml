@@ -48,6 +48,9 @@ telegram_signal_filter:
   digest_interval_minutes: 30
   digest_max_per_priority: 8
   merge_window_seconds: 120
+  conviction_realtime_threshold: 70
+  conviction_watch_threshold: 55
+  risk_realtime_threshold: 65
 summary:
   enabled: true
   interval_seconds: 600
