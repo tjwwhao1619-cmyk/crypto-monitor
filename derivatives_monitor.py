@@ -3112,7 +3112,7 @@ class DerivativesMonitor:
             mid_flow = format_csv_compact_number(row.get("mid_flow_score"), signed=False)
             long_flow = format_csv_compact_number(row.get("long_flow_score"), signed=False)
             direction_icon_text = "🔴" if direction == "看空" else "🟢" if direction == "看多" else "⚪"
-            status = "高把握" if conviction_score_value >= 80 else "观察"
+            status = "重点" if conviction_score_value >= 80 else "观察"
             status_icon = "🔴" if conviction_score_value >= 80 and direction == "看空" else "🟢" if conviction_score_value >= 80 else "🟡"
             symbol = str(row.get("symbol", "-")).replace("USDT", "")
             evidence_summary = str(row.get("evidence_summary") or "").strip()
@@ -4486,17 +4486,19 @@ def format_csv_compact_number(value: Any, signed: bool = False) -> str:
 
 
 def topq_action_short(action: str) -> str:
-    if action.startswith("减仓/避险"):
-        return "减仓/避险"
-    if action.startswith("强关注做多"):
-        return "强关注做多"
-    if action.startswith("观察做多"):
-        return "观察做多"
-    if action.startswith("不追"):
-        return "不追"
-    if action.startswith("不抄底"):
-        return "不抄底"
-    return "观望"
+    if action.startswith("建议减仓/避险"):
+        return "建议减仓/避险"
+    if action.startswith("强烈建议关注买入"):
+        return "强烈建议关注买入"
+    if action.startswith("建议观察"):
+        return "建议观察，等确认入场"
+    if action.startswith("禁止追多"):
+        return "禁止追多，等回踩"
+    if action.startswith("禁止抄底"):
+        return "禁止抄底，等待止跌"
+    if action.startswith("关注反弹"):
+        return "关注反弹机会"
+    return "信号不足，继续盯盘"
 
 
 def format_compact_percent(value: Any) -> str:
@@ -5767,26 +5769,30 @@ def action_from_trade_context(
     position_label: str | None = None,
 ) -> tuple[str, str]:
     if conviction >= 80 and intent_label == "真启动观察":
-        return "强关注做多", "高把握真启动"
+        return "强烈建议关注买入", "启动把握高"
     if conviction >= 65 and intent_label in ("真启动观察", "合约先行观察"):
-        return "观察做多，等确认", "启动观察但需确认"
+        return "建议观察，等确认入场", "启动观察但需确认"
     if conviction >= 65 and direction == "看多" and position_label == "多头主动建仓":
-        return "观察做多，等确认", "多头主动建仓但需确认"
+        return "建议观察，等确认入场", "多头主动建仓但需确认"
     if intent_label == "高位出货":
-        return "减仓/避险，不追多", "高位出货风险"
+        return "建议减仓/避险", "高位出货风险"
     if intent_label == "多杀多风险":
-        return "风控优先，防下杀", "多头挤压风险"
+        return "建议减仓/避险", "多头挤压风险"
     if intent_label == "短线逼空":
-        return "不追，等回踩", "逼空后追价风险高"
+        return "禁止追多，等回踩", "逼空后追价风险高"
     if intent_label == "洗盘回踩":
-        return "观察回踩承接", "等待承接确认"
+        return "建议观察，等确认入场", "等待承接确认"
     if intent_label == "下跌中继":
-        return "不抄底", "下跌延续风险"
+        return "禁止抄底，等待止跌", "下跌延续风险"
     if intent_label == "风险释放":
-        return "观察，不追空", "去杠杆后不追空"
+        return "关注反弹机会", "去杠杆后不追空"
+    if direction == "看空" and conviction >= 65:
+        return "建议减仓/避险", "风险信号优先"
+    if direction == "看多" and conviction >= 70:
+        return "建议观察，等确认入场", "多头信号待确认"
     if conviction < 50:
-        return "观望，低把握", "把握性不足"
-    return "观望，等确认", "确认不足"
+        return "信号不足，继续盯盘", "把握不足"
+    return "建议观察，等确认入场", "确认不足"
 
 
 def action_label(snapshot: MarketSnapshot, signal: Signal | None = None) -> tuple[str, str]:
@@ -6636,12 +6642,19 @@ def progress_bar(score: float, max_score: int = 10, width: int = 10) -> str:
 
 
 def trader_panel_title(signal: Signal, intent_label: str, conviction: int) -> str:
-    risk_intents = {"高位出货", "多杀多风险", "逃顶", "减仓优先"}
-    if signal.kind in ("top_exhaustion", "distribution") and conviction >= 80 and intent_label in risk_intents:
-        return "🔴【紧急告警】🔴关注顶部"
-    if intent_label in risk_intents or signal.kind in ("top_risk", "top_exhaustion", "distribution"):
-        return "🔴【高把握】🔴关注风险"
-    return "🟢【高把握】🟢关注做多"
+    kind = str(signal.kind or "").strip().lower()
+    if intent_label in ("高位出货", "多杀多风险") or kind in ("top_risk", "top_exhaustion", "distribution", "crowded_top_risk"):
+        return "🔴【紧急告警】 🔴关注顶部"
+    if intent_label in ("下跌中继",) or kind in ("long_stop_loss", "down_acceleration"):
+        return "🔴【紧急告警】 🔴关注跳水"
+    if intent_label in ("底部承接",) or kind == "bottom_reversal":
+        return "🟢【关注抄底】 🟢关注反弹"
+    if intent_label in ("真启动观察", "合约先行观察") or kind in ("discovery", "hot_breakout"):
+        if conviction >= 70:
+            return "🟢【关注启动】 🟢关注买入"
+    if intent_label == "短线逼空":
+        return "🟡【预警告警】 🟡急跌异动"
+    return "🟡【预警告警】 🟡异动观察"
 
 
 def format_panel_percent(value: float | None) -> str:
@@ -6661,19 +6674,13 @@ def panel_price_change(snapshot: MarketSnapshot, period: str) -> float | None:
 def panel_oi_state(snapshot: MarketSnapshot, period: str) -> str:
     if period in ("15m", "1h"):
         return format_panel_percent(snapshot.oi_change_percent if period == "1h" else snapshot.confirm_oi_change_percent)
-    short_score, mid_score, _long_score, _label, _reason = flow_horizon_scores(snapshot)
-    if period == "4h":
-        if mid_score >= 7:
-            return "持续建仓"
-        if mid_score <= 3:
-            return "持续减仓"
     return "n/a"
 
 
 def flow_panel_value(snapshot: MarketSnapshot, period: str) -> str:
     value = snapshot.net_flow_usd.get(period)
     if value is None:
-        return f"{period} n/a"
+        return f"{period} ⚪ n/a"
     threshold = max((snapshot.quote_volume_24h or 0) * 0.00001, 1000.0)
     if abs(value) < threshold:
         icon = "⚪"
@@ -6695,6 +6702,126 @@ def flow_strength_word(score: int) -> str:
 def trader_panel_flow_trend(snapshot: MarketSnapshot) -> str:
     short_score, mid_score, long_score, _label, _reason = flow_horizon_scores(snapshot)
     return f"短{flow_strength_word(short_score)} / 中{flow_strength_word(mid_score)} / 长{flow_strength_word(long_score)}"
+
+
+def panel_ratio_bias(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    if value > 1.8:
+        return "多头拥挤"
+    if value > 1.2:
+        return "偏多"
+    if value >= 1.0:
+        return "轻微偏多"
+    if value >= 0.8:
+        return "轻微偏空"
+    if value < 0.7:
+        return "空头拥挤"
+    return "偏空"
+
+
+def panel_ratio_text(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.2f} {panel_ratio_bias(value)}"
+
+
+def panel_flow_source_title(snapshot: MarketSnapshot) -> str:
+    return "✅ 主力净流（Binance）" if snapshot.net_flow_usd else "✅ 主力净流（Binance）"
+
+
+def panel_flow_judgement(snapshot: MarketSnapshot) -> str:
+    short_values = [snapshot.net_flow_usd.get(period) for period in ("5m", "15m", "1h")]
+    mid_values = [snapshot.net_flow_usd.get(period) for period in ("4h", "12h", "24h")]
+    long_values = [snapshot.net_flow_usd.get(period) for period in ("72h", "144h")]
+    short_sum = sum(value for value in short_values if value is not None)
+    mid_sum = sum(value for value in mid_values if value is not None)
+    long_sum = sum(value for value in long_values if value is not None)
+    known_mid_values = [value for value in mid_values if value is not None]
+    if short_sum > 0 and mid_sum >= 0:
+        return "短周期多头净流入，主力正在入场"
+    if known_mid_values and all(value < 0 for value in known_mid_values):
+        return "中周期持续净流出，主力中期持续出场"
+    if long_sum > 0 and mid_sum >= 0:
+        return "长周期资金承接，趋势基础较好"
+    if short_sum > 0 and (snapshot.funding_rate_percent or 0) < 0:
+        return "空头过度/多头承接，关注反弹机会"
+    if short_sum < 0 and mid_sum < 0 and (snapshot.funding_rate_percent or 0) > 0.08:
+        return "多头过热/主力出货，注意获利了结"
+    return "多周期资金分歧，方向待确认"
+
+
+def panel_action_icon(action: str) -> str:
+    if action.startswith(("强烈建议关注买入", "关注反弹")):
+        return "🟢"
+    if action.startswith(("建议减仓/避险", "禁止追多", "禁止抄底")):
+        return "🔴"
+    return "🟡"
+
+
+def normalize_evidence_label_for_panel(label: str, item: EvidenceItem | None = None) -> str:
+    mapping = {
+        "OI增仓推涨": "OI持续建仓",
+        "高位增仓追涨": "高位追涨增仓，谨慎接力",
+        "高位增仓": "高位追涨增仓，谨慎接力",
+        "空头回补推涨": "空头回补推涨，非真启动",
+        "跌中增仓承压": "下跌增仓，空头施压",
+        "仓位退出/风险释放": "仓位退出，风险释放",
+        "短线增仓推涨": "短线OI增，主力试盘",
+        "中线持续建仓": "OI中线持续建仓",
+        "增仓分歧/可能派发": "OI增但价格不跟，疑似派发",
+        "主动买盘强": "主买增强，资金主动进攻",
+        "主动卖盘强": "主卖增强，资金主动撤退",
+        "主动卖盘配合": "主卖增强，资金主动撤退",
+        "短线主力流入": "短周期主力净流入",
+        "中线主力流入": "中周期主力净流入",
+        "长线主力流入": "长周期主力净流入",
+        "短线资金不支持": "短周期资金不支持",
+        "中线资金不支持": "中周期资金不支持",
+        "长线资金不支持": "长周期资金不支持",
+        "短强中弱，谨慎追": "短周期强但中周期弱，谨慎追",
+        "回踩承接观察": "回踩有承接，等待确认",
+        "散户多头拥挤": "散户多头拥挤，易被洗",
+        "散户空头拥挤": "散户空头拥挤，关注反弹",
+        "大户偏多建仓": "大户持仓偏多，疑似建仓",
+        "大户偏空建仓": "大户持仓偏空，空方主导",
+        "散户多/大户不跟": "散户多但大户未跟，谨慎追多",
+        "散户空/大户偏多": "散户偏空但大户偏多，关注逼空",
+        "费率偏热": "费率偏热，多头成本升高",
+        "费率极热": "费率极高，多头过热",
+        "空头拥挤": "空头拥挤，关注反弹",
+        "空头极度拥挤": "空头过度拥挤，防逼空",
+        "空头风险释放": "空头回补，风险释放",
+        "多头风险释放": "多头降杠杆，风险释放",
+        "合约溢价偏高": "合约溢价偏高，追多拥挤",
+        "合约溢价极高": "合约溢价偏高，追多拥挤",
+        "合约贴水偏深": "合约贴水偏深，空头激进",
+        "合约贴水极深": "合约贴水偏深，空头激进",
+        "合约多头拥挤": "合约多头拥挤，防回落",
+        "空头挤压条件": "空头挤压条件形成",
+        "现货/链上确认": "现货/链上同步确认",
+        "现货承接": "现货承接，买盘跟随",
+        "现货/链上出货": "现货/链上转弱，疑似出货",
+        "高位现货未确认": "高位合约拉升，现货未确认",
+        "流动性增加": "链上流动性增加",
+        "流动性下降拉盘": "流动性下降仍拉盘，谨慎",
+        "空头被挤压": "空头被挤，短线冲高",
+        "多头止损释放": "多头止损释放",
+        "双向洗盘": "双向爆仓洗盘",
+        "空头挤压+现货承接": "空头挤压 + 现货承接",
+        "多头挤压+现货出货": "多头挤压 + 现货出货",
+    }
+    return mapping.get(str(label or "").strip(), str(label or "").strip())
+
+
+def panel_evidence_category(item: EvidenceItem) -> tuple[int, str]:
+    if item.polarity == "risk":
+        return 0, "🔴【风险】"
+    if item.polarity == "positive" and item.source in {"OI", "FLOW", "FUNDING", "BASIS", "LSR", "WHALE"}:
+        return 1, "🟢【领先】"
+    if item.polarity == "positive" and item.source in {"SPOT", "ONCHAIN", "LIQ"}:
+        return 2, "🟢【确认】"
+    return 3, "🟡【观察】"
 
 
 def normalize_trigger_phrase(text: str) -> str:
@@ -6730,13 +6857,17 @@ def normalize_trigger_phrase(text: str) -> str:
 
 def trader_panel_triggers(snapshot: MarketSnapshot, signal: Signal, merged_kinds: list[str]) -> list[str]:
     _ev_score, _ev_direction, _ev_summary, evidence_items = evidence_score(snapshot, signal)
-    triggers: list[str] = []
+    trigger_items: list[tuple[int, int, str]] = []
     if len(merged_kinds) > 1:
-        triggers.append(f"信号: {' + '.join(merged_kinds)}")
+        trigger_items.append((3, 0, f"🟡【信号】{' + '.join(merged_kinds)}"))
     for item in evidence_items:
-        points = evidence_item_signed_points(item)
-        triggers.append(f"{evidence_item_icon(item)} {item.label} {points:+d}")
-    return list(dict.fromkeys(triggers))[:6]
+        rank, category = panel_evidence_category(item)
+        points = abs(item.points)
+        label = normalize_evidence_label_for_panel(item.label, item)
+        trigger_items.append((rank, -points, f"{category}{label} +{points}"))
+    trigger_items.sort(key=lambda row: (row[0], row[1]))
+    triggers = [text for _rank, _points, text in trigger_items]
+    return list(dict.fromkeys(triggers))[:8]
 
 
 def format_trader_panel(
@@ -6763,18 +6894,16 @@ def format_trader_panel(
     score_10 = max(0, min(10, int(round(conviction / 10))))
     title = trader_panel_title(signal, intent_label, conviction)
     symbol_text = snapshot.symbol.replace("USDT", "/USDT")
-    account_text = format_optional_value(snapshot.top_account_ratio)
-    position_text = format_optional_value(snapshot.top_position_ratio)
     basis_text = "n/a" if basis_pct is None else f"{basis_pct:+.2f}%"
     triggers = trader_panel_triggers(snapshot, signal, kinds)
-    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
-    ev_display_score = evidence_display_score(ev_direction, ev_items, ev_score)
+    _ev_score, _ev_direction, _ev_summary, ev_items = evidence_score(snapshot, signal)
+    ev_display_score = sum(abs(item.points) for item in ev_items)
 
     lines = [
         title,
         "━━━━━━━━━━━━",
         f"◆ {symbol_text}",
-        f"评分 {progress_bar(score_10)} {score_10}/10 | 把握 {conviction}/100",
+        f"评分 {progress_bar(score_10)} {score_10}/10",
         "━━━━━━━━━━━━",
         f"💰 价格 ${snapshot.close_price:.8g}",
         (
@@ -6787,24 +6916,31 @@ def format_trader_panel(
             f"1h {panel_oi_state(snapshot, '1h')} | "
             f"4h {panel_oi_state(snapshot, '4h')}"
         ),
-        f"💸 费率 {format_realtime_funding(snapshot.funding_rate_percent)} | 基差 {basis_text}",
+        f"💸 费率 {format_realtime_funding(snapshot.funding_rate_percent)}",
+        f"📊 基差 {basis_text}",
         "━━━━━━━━━━━━",
         "👥 多空",
-        f"账户 空{account_text} | 持仓 多{position_text}",
+        f"账户多空比 {panel_ratio_text(snapshot.top_account_ratio)} | 大户持仓 {panel_ratio_text(snapshot.top_position_ratio)}",
         "━━━━━━━━━━━━",
-        "✅ 主力净流",
-        " | ".join(flow_panel_value(snapshot, period) for period in ("5m", "15m", "1h")),
-        " | ".join(flow_panel_value(snapshot, period) for period in ("4h", "12h", "24h")),
-        " | ".join(flow_panel_value(snapshot, period) for period in ("72h", "144h")),
-        f"趋势: {trader_panel_flow_trend(snapshot)}",
+        panel_flow_source_title(snapshot),
+        flow_panel_value(snapshot, "5m"),
+        flow_panel_value(snapshot, "15m"),
+        flow_panel_value(snapshot, "1h"),
+        flow_panel_value(snapshot, "4h"),
+        flow_panel_value(snapshot, "12h"),
+        flow_panel_value(snapshot, "24h"),
+        flow_panel_value(snapshot, "72h"),
+        flow_panel_value(snapshot, "144h"),
+        f"💬 {panel_flow_judgement(snapshot)}",
         "━━━━━━━━━━━━",
-        f"🎯 触发证据（共{ev_display_score}分）",
+        f"💡 操作建议 {panel_action_icon(action)} {action} 置信度 {score_10}/10",
+        "━━━━━━━━━━━━",
+        f"触发信号（共{ev_display_score}分）:",
     ]
-    lines.extend(f"- {trigger}" for trigger in triggers)
+    lines.extend(f"• {trigger}" for trigger in triggers)
     lines.extend(
         [
             "━━━━━━━━━━━━",
-            f"💡 建议: {action}",
             f"⏰ {dt.datetime.now().strftime('%H:%M:%S')}",
         ]
     )
