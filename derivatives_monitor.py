@@ -2896,11 +2896,7 @@ def format_coinglass_market_context_text(context: dict[str, Any]) -> str:
         oi_1h,
         oi_4h,
         funding_oi_weight,
-        negative,
-        positive,
-        total,
-        extreme_negative,
-        extreme_positive,
+        distribution.get("exchange_rates"),
         sell_ratio,
     )
     exchange_text = format_coinglass_exchange_funding(distribution.get("exchange_rates"))
@@ -3046,20 +3042,8 @@ def format_major_long_cycle_one_line(snapshot: MarketSnapshot, coinglass_text: s
     if not is_major_asset_tier(snapshot.symbol):
         return ""
     oi_text = extract_labeled_segment(coinglass_text, "OI ", "；") or "OI n/a"
-    taker_text = extract_labeled_segment(coinglass_text, "主动买卖 24h", "；")
-    taker_7d = extract_labeled_segment(coinglass_text, "CoinGlass主动买卖 7d", "；")
-    balance_text = extract_labeled_segment(coinglass_text, "交易所余额", "；") or "余额 n/a"
-    funding_text = extract_labeled_segment(coinglass_text, "Funding累计", "；") or "Funding n/a"
-    funds_text = (
-        f"资金 1h {format_usd(snapshot.net_flow_usd.get('1h'))}/"
-        f"4h {format_usd(snapshot.net_flow_usd.get('4h'))}/"
-        f"12h {format_usd(snapshot.net_flow_usd.get('12h'))}/"
-        f"24h {format_usd(snapshot.net_flow_usd.get('24h'))}; "
-        f"共振 {long_flow_alignment_score(snapshot)}/9"
-    )
-    taker_parts = [part for part in (taker_text, taker_7d) if part]
-    taker_summary = "主动买卖 " + " / ".join(taker_parts) if taker_parts else "主动买卖 n/a"
-    return f"主流长周期: {oi_text}; {funds_text}; {taker_summary}; {balance_text}; {funding_text}"
+    balance_text = extract_labeled_segment(coinglass_text, "交易所余额", "；") or "交易所余额 n/a"
+    return f"主流长周期: {oi_text}; {balance_text}; 资金共振 {long_flow_alignment_score(snapshot)}/9"
 
 
 def extract_labeled_segment(text: str | None, start: str, end: str) -> str | None:
@@ -3150,23 +3134,14 @@ def coinglass_market_context_judgement(
     oi_1h: float | None,
     oi_4h: float | None,
     funding_oi_weight: float | None,
-    negative: int,
-    positive: int,
-    total: int,
-    extreme_negative: int,
-    extreme_positive: int,
+    exchange_rates: Any,
     sell_ratio: float | None,
 ) -> str:
-    negative_crowded = (
-        total > 0
-        and negative / total >= 0.7
-        and (extreme_negative >= 2 or (funding_oi_weight is not None and funding_oi_weight <= -0.01))
-    )
-    positive_crowded = (
-        total > 0
-        and positive / total >= 0.7
-        and (extreme_positive >= 2 or (funding_oi_weight is not None and funding_oi_weight >= 0.01))
-    )
+    major_exchange_rates = coinglass_major_exchange_rates(exchange_rates)
+    extreme_negative = sum(1 for value in major_exchange_rates if value <= -0.1)
+    extreme_positive = sum(1 for value in major_exchange_rates if value >= 0.1)
+    negative_crowded = (funding_oi_weight is not None and funding_oi_weight <= -0.1) or extreme_negative >= 2
+    positive_crowded = (funding_oi_weight is not None and funding_oi_weight >= 0.1) or extreme_positive >= 2
     oi_rising = oi_1h is not None and oi_4h is not None and oi_1h > 0 and oi_4h > 0
     oi_falling = oi_1h is not None and oi_4h is not None and oi_1h < 0 and oi_4h < 0
     sell_pressure = False
@@ -3177,18 +3152,33 @@ def coinglass_market_context_judgement(
     judgement_parts: list[str] = []
     if oi_falling:
         judgement_parts.append("仓位退出/风险释放")
-    elif oi_rising and positive_crowded:
-        judgement_parts.append("全市场杠杆升温/多头拥挤")
-    elif negative_crowded:
+    if negative_crowded:
         judgement_parts.append("全市场空头拥挤")
-    elif positive_crowded:
+    if positive_crowded:
         judgement_parts.append("全市场多头拥挤")
+    if oi_rising and positive_crowded:
+        judgement_parts.append("全市场杠杆升温/多头拥挤")
 
     if sell_pressure:
-        judgement_parts.append("全市场主动卖压偏强")
+        judgement_parts.append("主动卖压偏强")
     if not judgement_parts:
         judgement_parts.append("全市场衍生品中性/分歧")
     return "；".join(judgement_parts)
+
+
+def coinglass_major_exchange_rates(exchange_rates: Any) -> list[float]:
+    if not isinstance(exchange_rates, dict):
+        return []
+    values = []
+    for exchange in ("Binance", "OKX", "Bybit"):
+        for key, rate in exchange_rates.items():
+            if str(key).lower() != exchange.lower():
+                continue
+            value = parse_float(rate)
+            if value is not None:
+                values.append(value)
+            break
+    return values
 
 
 def format_coinglass_liquidation_stats(stats: dict[str, float]) -> str:
@@ -4959,7 +4949,7 @@ def ask_ai_review(context_text: str) -> str | None:
         "如果真实强平为'双向强平/剧烈洗盘'，必须解释: '上下波动都剧烈，适合观望等待结构确认。'"
         "如果真实强平为'强平分散'、'强平活跃但方向分散'或'近1h暂无明显强平数据'，不得把清算作为方向确认依据。"
         "如果信号列表为'暂无触发信号'或信号触发状态为'无触发信号'，不得强行给看多/看空，只能写观望、偏观望或等待确认。"
-        "解释规则: OI下降+价格下跌，多为仓位退出/风险释放，不等于新空进场；OI上升+价格上涨，多为空头/多头博弈加剧，需结合主动买卖比和资金流；极端负Funding表示空头拥挤或异常，不等于直接做多，只能提示可能反抽/插针风险；极端正Funding表示多头成本高，不等于直接做空，只能提示追多风险；资金流多周期分歧时，必须降置信度；现货/链上与合约背离时，必须写成风险。"
+        "解释规则: OI下降+价格下跌，多为仓位退出/风险释放，不等于新空进场；OI上升+价格上涨，多为空头/多头博弈加剧，需结合主动买卖比和资金流；极端负Funding表示空头成本高、空头拥挤，可能反抽/插针，但不能直接作为做多依据，绝不能写成多头成本高；极端正Funding表示多头成本高、多头拥挤，追多风险高，不能直接作为做空依据；资金流多周期分歧时，必须降置信度；现货/链上与合约背离时，必须写成风险。"
         "禁止编造系统上下文没有的支撑、阻力、清算带、目标价。确认条件和失效条件里的价格位只能来自当前价格、24h高低、交易计划、结构判断、清算风险；没有可用价位就写'上下文无明确价位'。"
         "如果交易计划为'暂无交易计划'或'暂无交易计划参考'，操作倾向必须包含'暂无交易计划，不建议按 AI 文本直接开仓'。"
         "固定输出格式，且只输出这些字段: [AI复核]\n系统方向:\nAI复核结论:\n置信度:\n核心理由:\n- 最多3条\n主要风险:\n- 最多3条\n操作倾向:"
@@ -5115,6 +5105,9 @@ def format_ask_core_data(
     major_long_part = f"{major_long_text}\n" if major_long_text else ""
     orderbook_text = compact_coinglass_orderbook_context(snapshot, coinglass_text)
     orderbook_part = f"订单簿: {orderbook_text}\n" if orderbook_text else ""
+    coinglass_part = ""
+    if not is_major_asset_tier(snapshot.symbol):
+        coinglass_part = f"CoinGlass: {compact_coinglass_market_context(coinglass_text or 'CoinGlass聚合: n/a')}"
     return (
         "[核心数据]\n"
         f"价格/OI/Funding: {snapshot.close_price:.8g}; 价格 {snapshot.price_change_percent:+.2f}%; "
@@ -5128,7 +5121,7 @@ def format_ask_core_data(
         f"真实强平: {liq_text}\n"
         f"{major_long_part}"
         f"{orderbook_part}"
-        f"CoinGlass: {compact_coinglass_market_context(coinglass_text or 'CoinGlass聚合: n/a')}"
+        f"{coinglass_part}"
     )
 
 
@@ -5172,6 +5165,7 @@ def ask_confidence_capped_at_medium(context_text: str) -> bool:
 
 def post_process_ask_ai_review(review_text: str, context_text: str) -> str:
     text = review_text.strip()
+    text = fix_negative_funding_cost_explanation(text)
     if ask_confidence_capped_at_medium(context_text):
         text = re.sub(r"(置信度:\s*)高", r"\1中", text)
     short_score = ask_context_score(context_text, "短线评分")
@@ -5194,6 +5188,15 @@ def post_process_ask_ai_review(review_text: str, context_text: str) -> str:
     return text
 
 
+def fix_negative_funding_cost_explanation(text: str) -> str:
+    pattern = (
+        r"(?:极端负\s*Funding|负\s*Funding|极端负费率|负费率)"
+        r"[^。；\n]*(?:多头成本高|多头成本较高|多头持仓成本高|多头持仓成本较高)"
+        r"[^。；\n]*"
+    )
+    return re.sub(pattern, "极端负Funding显示空头成本高/空头拥挤", text, flags=re.IGNORECASE)
+
+
 def compact_coinglass_market_context(text: str) -> str:
     first_line = str(text).splitlines()[0] if str(text).splitlines() else str(text)
     return first_line.removeprefix("CoinGlass聚合: ").strip()
@@ -5205,7 +5208,25 @@ def compact_coinglass_orderbook_context(snapshot: MarketSnapshot, coinglass_text
     orderbook_text = extract_labeled_segment(coinglass_text, "CoinGlass订单簿: ", "\n")
     if not orderbook_text:
         return "n/a"
-    return orderbook_text.removeprefix("CoinGlass订单簿: ").strip()
+    orderbook_text = orderbook_text.removeprefix("CoinGlass订单簿: ").strip()
+    match = re.search(r"近1h\s*买盘([^/；]+)\s*/\s*卖盘([^；]+).*判断:\s*([^；\n]+)", orderbook_text)
+    if not match:
+        judgement_match = re.search(r"判断:\s*([^；\n]+)", orderbook_text)
+        return compact_orderbook_judgement(judgement_match.group(1).strip()) if judgement_match else "n/a"
+    bids = match.group(1).strip()
+    asks = match.group(2).strip()
+    judgement = compact_orderbook_judgement(match.group(3).strip())
+    return f"{judgement}（1h买{bids}/卖{asks}）"
+
+
+def compact_orderbook_judgement(judgement: str) -> str:
+    if "下方承接偏强" in judgement:
+        return "下方承接偏强"
+    if "上方卖压偏强" in judgement:
+        return "上方卖压偏强"
+    if "均衡" in judgement or "相对均衡" in judgement:
+        return "均衡"
+    return judgement
 
 
 def normalize_ai_review_text(text: str) -> str:
