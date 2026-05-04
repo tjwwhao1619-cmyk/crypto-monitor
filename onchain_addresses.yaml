@@ -1,5 +1,9 @@
-# Local on-chain address label examples.
-# Keep this file conservative: only add addresses that have been independently verified.
+# Local on-chain address label examples and audit candidates.
+# Active addresses are scanned. Keep them conservative:
+# - Active labels require a block explorer explicit label, official docs, or exchange public documentation.
+# - Third-party articles, social posts, Lookonchain, and Whale Alert are leads only; they are not enough for high confidence.
+# - Uncertain addresses must stay under candidates/TODO and must not be enabled for collection.
+# - Exchange active addresses must include source and confidence.
 # Placeholder addresses are intentionally skipped by the loader.
 
 ethereum:
@@ -39,3 +43,104 @@ solana:
     assets: [SOL, USDC]
     source: "placeholder"
     confidence: low
+
+candidates:
+  ethereum:
+    - label: Binance exchange wallet candidates
+      entity: Binance
+      type: exchange
+      address: ""
+      assets: [USDT, USDC, ETH]
+      candidate_source: "TODO: Etherscan explicit exchange label or Binance public documentation required"
+      verification_status: pending
+      notes: "Do not enable from third-party articles or social posts alone."
+    - label: OKX exchange wallet candidates
+      entity: OKX
+      type: exchange
+      address: ""
+      assets: [USDT, USDC, ETH]
+      candidate_source: "TODO: Etherscan explicit exchange label or OKX public documentation required"
+      verification_status: pending
+      notes: "No active address until source is verified."
+    - label: Bybit exchange wallet candidates
+      entity: Bybit
+      type: exchange
+      address: ""
+      assets: [USDT, USDC, ETH]
+      candidate_source: "TODO: Etherscan explicit exchange label or Bybit public documentation required"
+      verification_status: pending
+      notes: "No active address until source is verified."
+    - label: Coinbase exchange wallet candidates
+      entity: Coinbase
+      type: exchange
+      address: ""
+      assets: [USDT, USDC, ETH]
+      candidate_source: "TODO: Etherscan explicit exchange label or Coinbase public documentation required"
+      verification_status: pending
+      notes: "No active address until source is verified."
+    - label: Kraken exchange wallet candidates
+      entity: Kraken
+      type: exchange
+      address: ""
+      assets: [USDT, USDC, ETH]
+      candidate_source: "TODO: Etherscan explicit exchange label or Kraken public documentation required"
+      verification_status: pending
+      notes: "No active address until source is verified."
+    - label: Circle Treasury Ethereum candidates
+      entity: Circle
+      type: treasury
+      address: ""
+      assets: [USDC]
+      candidate_source: "TODO: Etherscan explicit Circle/Centre treasury label or Circle official documentation required"
+      verification_status: pending
+      notes: "Do not enable from unlabeled mint/burn transactions alone."
+  tron:
+    - label: Tether MultiSigWallet TBPx
+      entity: Tether
+      type: treasury
+      address: "TBPxhVAsuzoFnKyXtc1o2UySEydPHgATto"
+      assets: [USDT]
+      candidate_source: "Tokenview labels this address as Tether MultiSigWallet (TBPx), not Tether Treasury"
+      verification_status: rejected
+      notes: "Rejected for active Tether Treasury label until Tronscan/Tokenview/official source explicitly says Tether Treasury."
+    - label: Binance Tron exchange candidates
+      entity: Binance
+      type: exchange
+      address: ""
+      assets: [USDT]
+      candidate_source: "TODO: Tronscan explicit exchange label or Binance public documentation required"
+      verification_status: pending
+      notes: "No active address until source is verified."
+    - label: OKX Tron exchange candidates
+      entity: OKX
+      type: exchange
+      address: ""
+      assets: [USDT]
+      candidate_source: "TODO: Tronscan explicit exchange label or OKX public documentation required"
+      verification_status: pending
+      notes: "No active address until source is verified."
+    - label: Bybit Tron exchange candidates
+      entity: Bybit
+      type: exchange
+      address: ""
+      assets: [USDT]
+      candidate_source: "TODO: Tronscan explicit exchange label or Bybit public documentation required"
+      verification_status: pending
+      notes: "No active address until source is verified."
+  solana:
+    - label: Binance Solana exchange candidates
+      entity: Binance
+      type: exchange
+      address: ""
+      assets: [SOL, USDC]
+      candidate_source: "TODO: Solscan explicit exchange label or Binance public documentation required"
+      verification_status: pending
+      notes: "No active address until source is verified."
+    - label: Coinbase Solana exchange candidates
+      entity: Coinbase
+      type: exchange
+      address: ""
+      assets: [SOL, USDC]
+      candidate_source: "TODO: Solscan explicit exchange label or Coinbase public documentation required"
+      verification_status: pending
+      notes: "No active address until source is verified."
