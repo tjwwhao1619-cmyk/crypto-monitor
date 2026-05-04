@@ -1,0 +1,37 @@
+# Local on-chain address label examples.
+# Keep this file conservative: only add addresses that have been independently verified.
+# Placeholder addresses are intentionally skipped by the loader.
+
+ethereum:
+  - label: Tether Treasury Ethereum
+    entity: Tether
+    type: treasury
+    address: "0x..."
+    assets: [USDT]
+    source: "placeholder"
+    confidence: low
+  - label: Binance Hot Wallet Ethereum
+    entity: Binance
+    type: exchange
+    address: "0x..."
+    assets: [USDT, USDC, ETH]
+    source: "placeholder"
+    confidence: low
+
+tron:
+  - label: Tether Treasury Tron
+    entity: Tether
+    type: treasury
+    address: "T..."
+    assets: [USDT]
+    source: "placeholder"
+    confidence: low
+
+solana:
+  - label: Binance Solana Hot Wallet
+    entity: Binance
+    type: exchange
+    address: "..."
+    assets: [SOL, USDC]
+    source: "placeholder"
+    confidence: low

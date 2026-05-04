@@ -44,6 +44,7 @@ TELEGRAM_SNAPSHOT_CACHE_TTL_SECONDS = 600
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 DEFILLAMA_STABLECOINS_URL = "https://stablecoins.llama.fi/stablecoins"
 DEFAULT_EXTERNAL_DATA_DB_PATH = "external_data.sqlite"
+DEFAULT_ONCHAIN_ADDRESS_CONFIG_PATH = "onchain_addresses.yaml"
 DEFILLAMA_STABLECOIN_TTL_SECONDS = 2700
 DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS = 900
 FLOW_SHORT_PERIODS = ["5m", "15m", "1h"]
@@ -273,6 +274,18 @@ class ExternalDataPoint:
 
 
 @dataclass(frozen=True)
+class OnchainAddressLabel:
+    chain: str
+    label: str
+    entity: str
+    type: str
+    address: str
+    assets: list[str]
+    source: str
+    confidence: str
+
+
+@dataclass(frozen=True)
 class MainAssetScore:
     total_score: int
     label: str
@@ -457,10 +470,13 @@ class DerivativesMonitor:
         self.coinglass_liquidation_cache: dict[str, tuple[float, dict[str, float]]] = {}
         self.coinglass_market_context_cache: dict[str, tuple[float, str]] = {}
         self.external_data_db_path = str(config.get("external_data_db_path", DEFAULT_EXTERNAL_DATA_DB_PATH))
+        self.onchain_address_config_path = str(config.get("onchain_address_config_path", DEFAULT_ONCHAIN_ADDRESS_CONFIG_PATH))
         self.external_data_lock = threading.Lock()
         self.data_sources = self.build_data_source_specs()
+        self.onchain_address_labels: list[OnchainAddressLabel] = []
         self.last_external_stablecoin_collect_at = 0.0
         self.init_external_data_store()
+        self.load_and_store_onchain_address_labels()
         self.flow_metrics_cache: dict[tuple[str, str], tuple[float, float | None, float | None]] = {}
         self.flow_metrics_cache_lock = threading.Lock()
         self.telegram_signal_cooldowns: dict[str, tuple[float, int]] = {}
@@ -493,6 +509,9 @@ class DerivativesMonitor:
 
     def build_data_source_specs(self) -> dict[str, DataSourceSpec]:
         coinglass_enabled = bool(os.getenv("COINGLASS_API_KEY", "").strip())
+        etherscan_enabled = bool(os.getenv("ETHERSCAN_API_KEY", "").strip())
+        tronscan_enabled = bool(os.getenv("TRONSCAN_API_KEY", "").strip() or os.getenv("TRONGRID_API_KEY", "").strip())
+        solscan_enabled = bool(os.getenv("SOLSCAN_API_KEY", "").strip())
         return {
             "Binance futures": DataSourceSpec(
                 name="Binance futures",
@@ -556,10 +575,21 @@ class DerivativesMonitor:
                 enabled=True,
                 confidence="low",
             ),
+            "Address labels": DataSourceSpec(
+                name="Address labels",
+                category="onchain",
+                is_real_onchain=False,
+                requires_api_key=False,
+                ttl_seconds=3600,
+                priority=70,
+                enabled=True,
+                last_error="自建地址标签覆盖有限，不能等同 Arkham/Nansen 实体标签",
+                confidence="low",
+            ),
             "Whale Alert": DataSourceSpec("Whale Alert", "onchain", True, True, 3600, 80, False, last_error="adapter reserved", confidence="low"),
-            "Etherscan": DataSourceSpec("Etherscan", "onchain", True, True, 3600, 81, False, last_error="adapter reserved", confidence="low"),
-            "Tronscan": DataSourceSpec("Tronscan", "onchain", True, True, 3600, 82, False, last_error="adapter reserved", confidence="low"),
-            "Solscan": DataSourceSpec("Solscan", "onchain", True, True, 3600, 83, False, last_error="adapter reserved", confidence="low"),
+            "Etherscan": DataSourceSpec("Etherscan", "onchain", True, True, 3600, 81, etherscan_enabled, last_error="" if etherscan_enabled else "ETHERSCAN_API_KEY not configured", confidence="low"),
+            "Tronscan": DataSourceSpec("Tronscan", "onchain", True, True, 3600, 82, tronscan_enabled, last_error="" if tronscan_enabled else "TRONSCAN_API_KEY/TRONGRID_API_KEY not configured", confidence="low"),
+            "Solscan": DataSourceSpec("Solscan", "onchain", True, True, 3600, 83, solscan_enabled, last_error="" if solscan_enabled else "SOLSCAN_API_KEY not configured", confidence="low"),
             "CryptoQuant": DataSourceSpec("CryptoQuant", "onchain", True, True, 3600, 84, False, last_error="adapter reserved", confidence="low"),
             "Glassnode": DataSourceSpec("Glassnode", "onchain", True, True, 3600, 85, False, last_error="adapter reserved", confidence="low"),
             "Arkham": DataSourceSpec("Arkham", "onchain", True, True, 3600, 86, False, last_error="adapter reserved", confidence="low"),
@@ -661,6 +691,41 @@ class DerivativesMonitor:
                         created_at REAL NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS idx_dex_market_symbol_time ON dex_market_snapshots(symbol, timestamp);
+                    CREATE TABLE IF NOT EXISTS onchain_address_labels (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chain TEXT NOT NULL,
+                        label TEXT NOT NULL,
+                        entity TEXT,
+                        type TEXT,
+                        address TEXT NOT NULL,
+                        assets TEXT,
+                        source TEXT,
+                        confidence TEXT,
+                        updated_at REAL NOT NULL,
+                        UNIQUE(chain, address)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_onchain_address_labels_asset ON onchain_address_labels(assets);
+                    CREATE INDEX IF NOT EXISTS idx_onchain_address_labels_entity ON onchain_address_labels(entity);
+                    CREATE TABLE IF NOT EXISTS onchain_transfer_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chain TEXT NOT NULL,
+                        tx_hash TEXT NOT NULL,
+                        timestamp REAL NOT NULL,
+                        asset TEXT,
+                        amount REAL,
+                        amount_usd REAL,
+                        from_address TEXT,
+                        to_address TEXT,
+                        from_label TEXT,
+                        to_label TEXT,
+                        direction TEXT,
+                        source TEXT,
+                        raw_json TEXT,
+                        created_at REAL NOT NULL,
+                        UNIQUE(chain, tx_hash, asset, amount, from_address, to_address)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_onchain_transfer_events_asset_time ON onchain_transfer_events(asset, timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_onchain_transfer_events_direction_time ON onchain_transfer_events(direction, timestamp);
                     """
                 )
         for spec in self.data_sources.values():
@@ -710,6 +775,158 @@ class DerivativesMonitor:
                         now,
                     ),
                 )
+
+    def load_onchain_address_labels(self) -> list[OnchainAddressLabel]:
+        path = Path(self.onchain_address_config_path)
+        if not path.exists():
+            logging.info("onchain address labels config missing: %s", path)
+            return []
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            logging.warning("Failed to read onchain address labels config: %s", path, exc_info=True)
+            self.update_source_health("Address labels", False, f"config read failed: {type(exc).__name__}")
+            return []
+        if not isinstance(payload, dict):
+            self.update_source_health("Address labels", False, "config root must be mapping")
+            return []
+        labels: list[OnchainAddressLabel] = []
+        for chain, rows in payload.items():
+            chain_name = str(chain or "").strip().lower()
+            if chain_name not in {"ethereum", "tron", "solana"} or not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                address = str(row.get("address") or "").strip()
+                if is_placeholder_onchain_address(address):
+                    continue
+                label = str(row.get("label") or "").strip()
+                entity = str(row.get("entity") or "").strip()
+                label_type = str(row.get("type") or "unknown").strip().lower()
+                if label_type not in {"exchange", "treasury", "fund", "project", "whale", "unknown"}:
+                    label_type = "unknown"
+                assets = row.get("assets") if isinstance(row.get("assets"), list) else []
+                normalized_assets = [str(asset).strip().upper() for asset in assets if str(asset).strip()]
+                if not label or not entity:
+                    continue
+                labels.append(
+                    OnchainAddressLabel(
+                        chain=chain_name,
+                        label=label,
+                        entity=entity,
+                        type=label_type,
+                        address=address,
+                        assets=normalized_assets,
+                        source=str(row.get("source") or "local config"),
+                        confidence=str(row.get("confidence") or "low"),
+                    )
+                )
+        logging.info("onchain address labels loaded: count=%s path=%s", len(labels), path)
+        return labels
+
+    def load_and_store_onchain_address_labels(self) -> None:
+        labels = self.load_onchain_address_labels()
+        self.onchain_address_labels = labels
+        self.store_onchain_address_labels(labels)
+        if labels:
+            spec = self.data_sources.get("Address labels")
+            if spec:
+                spec.confidence = "medium" if len(labels) >= 10 else "low"
+            self.update_source_health("Address labels", True, f"loaded {len(labels)} labels")
+        else:
+            self.update_source_health("Address labels", False, "no valid labels loaded; 自建地址标签覆盖有限")
+
+    def store_onchain_address_labels(self, labels: list[OnchainAddressLabel]) -> None:
+        now = time.time()
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                conn.execute("DELETE FROM onchain_address_labels")
+                if labels:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO onchain_address_labels (
+                            chain, label, entity, type, address, assets, source, confidence, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                item.chain,
+                                item.label,
+                                item.entity,
+                                item.type,
+                                item.address,
+                                ",".join(item.assets),
+                                item.source,
+                                item.confidence,
+                                now,
+                            )
+                            for item in labels
+                        ],
+                    )
+
+    def onchain_transfer_event_count(self, since_seconds: int = 86400) -> int:
+        cutoff = time.time() - since_seconds
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM onchain_transfer_events WHERE timestamp >= ?",
+                    (cutoff,),
+                ).fetchone()
+        return int(row[0] if row else 0)
+
+    def format_onchain_address_sources(self) -> str:
+        labels = list(self.onchain_address_labels)
+        by_chain: dict[str, int] = {}
+        by_entity: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        for item in labels:
+            by_chain[item.chain] = by_chain.get(item.chain, 0) + 1
+            by_entity[item.entity] = by_entity.get(item.entity, 0) + 1
+            by_type[item.type] = by_type.get(item.type, 0) + 1
+        lines = [
+            "链上地址标签源",
+            f"已加载地址标签数量: {len(labels)}",
+            "说明: 自建地址标签覆盖有限，不能等同 Arkham/Nansen 实体标签。",
+            f"按 chain: {format_count_mapping(by_chain)}",
+            f"按 entity: {format_count_mapping(by_entity)}",
+            f"按 type: {format_count_mapping(by_type)}",
+            f"Etherscan key: {'configured' if os.getenv('ETHERSCAN_API_KEY', '').strip() else 'disabled/not configured'}",
+            f"Tronscan key: {'configured' if (os.getenv('TRONSCAN_API_KEY', '').strip() or os.getenv('TRONGRID_API_KEY', '').strip()) else 'disabled/not configured'}",
+            f"Solscan key: {'configured' if os.getenv('SOLSCAN_API_KEY', '').strip() else 'disabled/not configured'}",
+            f"最近24h onchain_transfer_events: {self.onchain_transfer_event_count()}",
+        ]
+        return "\n".join(lines)
+
+    def format_onchain_address_query(self, query: str) -> str:
+        target = str(query or "").strip()
+        if not target:
+            return "用法: !地址 USDT 或 !地址 Binance"
+        upper_target = target.upper()
+        lower_target = target.lower()
+        matches = [
+            item for item in self.onchain_address_labels
+            if upper_target in item.assets
+            or lower_target == item.entity.lower()
+            or lower_target in item.label.lower()
+            or lower_target == item.type.lower()
+        ]
+        lines = [
+            f"地址标签查询: {target}",
+            "说明: 自建地址标签覆盖有限，不能等同 Arkham/Nansen 实体标签。",
+        ]
+        if not matches:
+            lines.append("暂无匹配的有效地址标签。")
+            return "\n".join(lines)
+        for item in matches[:20]:
+            assets = "/".join(item.assets) if item.assets else "-"
+            lines.append(
+                f"- {item.chain} | {item.entity} | {item.type} | {item.label} | "
+                f"assets={assets} | confidence={item.confidence} | {short_address(item.address)}"
+            )
+        if len(matches) > 20:
+            lines.append(f"共 {len(matches)} 条，展示前 20 条。")
+        return "\n".join(lines)
 
     def write_external_data_points(self, points: list[ExternalDataPoint]) -> None:
         if not points:
@@ -1040,6 +1257,8 @@ class DerivativesMonitor:
             )
             if spec.name == "DefiLlama stablecoin supply":
                 lines.append("  说明: 稳定币供应聚合，不等同钱包流/交易所净流")
+            if spec.name == "Address labels":
+                lines.append("  说明: 自建地址标签覆盖有限，不能等同 Arkham/Nansen 实体标签")
         if len(lines) <= 2:
             lines.append("当前没有确认可用的外部资金数据源。")
         return "\n".join(lines)
@@ -3857,7 +4076,13 @@ class DerivativesMonitor:
         if command == "!数据源":
             return discord_summary_embed_v2("数据源健康检查", self.format_external_source_health(), "debug")
         if command == "!外部资金来源":
-            return discord_onchain_embed_v2("外部资金来源", self.format_external_source_health(only_available=True), "onchain")
+            return discord_onchain_embed_v2("外部资金来源", self.format_external_source_health(only_available=False), "onchain")
+        if command == "!地址源":
+            return discord_onchain_embed_v2("地址标签源", self.format_onchain_address_sources(), "onchain")
+        if command == "!地址":
+            if len(parts) < 2:
+                return "用法: !地址 USDT 或 !地址 Binance"
+            return discord_onchain_embed_v2(f"地址标签 {parts[1]}", self.format_onchain_address_query(parts[1]), "onchain")
         if command in ("!链上摘要", "!外部资金摘要"):
             return discord_onchain_embed_v2("外部资金确认摘要", self.format_onchain_summary_from_cache(), "onchain")
         if command in ("!链上", "!链上资金", "!外部资金"):
@@ -6559,6 +6784,32 @@ def yes_no(value: bool) -> str:
     return "是" if value else "否"
 
 
+def format_count_mapping(values: dict[str, int], limit: int = 8) -> str:
+    if not values:
+        return "-"
+    parts = [f"{key}={count}" for key, count in sorted(values.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+    return " / ".join(parts)
+
+
+def short_address(address: str) -> str:
+    value = str(address or "").strip()
+    if len(value) <= 16:
+        return value
+    return f"{value[:8]}...{value[-6:]}"
+
+
+def is_placeholder_onchain_address(address: str) -> bool:
+    value = str(address or "").strip()
+    lower = value.lower()
+    if not value or "..." in value or "placeholder" in lower or lower in {"todo", "tbd", "0x"}:
+        return True
+    if lower.startswith("0x") and len(value) < 20:
+        return True
+    if value.startswith("T") and len(value) < 20:
+        return True
+    return False
+
+
 def format_ts_short(timestamp: float | None) -> str:
     if not timestamp:
         return "-"
@@ -6693,6 +6944,8 @@ def discord_help_text() -> str:
         "!山寨 - 查看最近山寨观察队列 Top10\n"
         "!数据源 - 查看采集层数据源健康状态\n"
         "!外部资金来源 - 查看当前真实可用外部资金来源\n"
+        "!地址源 - 查看自建链上地址标签库状态\n"
+        "!地址 USDT - 查询资产或实体相关地址标签\n"
         "!外部资金 - 查看 BTC/ETH/SOL/BNB/DOGE 现货/DEX/CoinGlass 外部资金确认\n"
         "!外部资金 BTCUSDT - 单币现货/DEX/CoinGlass 外部资金确认\n"
         "!链上 BTCUSDT - 旧别名，当前不代表真实钱包流\n"
