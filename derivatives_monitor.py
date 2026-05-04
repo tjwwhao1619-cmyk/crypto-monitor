@@ -262,6 +262,9 @@ class DataSourceSpec:
     last_success: float | None = None
     last_error: str = ""
     confidence: str = "medium"
+    scanned_addresses: int = 0
+    fetched_events: int = 0
+    written_events: int = 0
 
 
 @dataclass(frozen=True)
@@ -515,7 +518,9 @@ class DerivativesMonitor:
         self.discord_suppressed_digest_queue: list[DiscordSuppressedDigestItem] = []
         self.discord_suppressed_digest_lock = threading.Lock()
         self.discord_suppressed_digest_recent: deque[float] = deque(maxlen=1000)
-        self.last_discord_suppressed_digest_flush_at = time.time()
+        self.last_discord_suppressed_digest_flush_at = 0.0
+        self.last_discord_suppressed_digest_flush_attempt_at = 0.0
+        self.last_discord_suppressed_digest_flush_status = "not attempted"
         self.last_discord_suppressed_digest_sent_at = 0.0
         self.runtime_realtime_priorities_override: set[str] | None = None
         self.runtime_realtime_priorities_lock = threading.Lock()
@@ -658,6 +663,9 @@ class DerivativesMonitor:
                         confidence TEXT,
                         last_success REAL,
                         last_error TEXT,
+                        scanned_addresses INTEGER NOT NULL DEFAULT 0,
+                        fetched_events INTEGER NOT NULL DEFAULT 0,
+                        written_events INTEGER NOT NULL DEFAULT 0,
                         updated_at REAL NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS stablecoin_supply (
@@ -754,10 +762,25 @@ class DerivativesMonitor:
                         ON onchain_transfer_events(chain, tx_hash, asset, from_address, to_address);
                     """
                 )
+                self.ensure_source_health_scan_columns(conn)
         for spec in self.data_sources.values():
             self.update_source_health(spec.name)
 
-    def update_source_health(self, source_name: str, success: bool | None = None, error: str | None = None) -> None:
+    def ensure_source_health_scan_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(source_health)").fetchall()}
+        for column in ("scanned_addresses", "fetched_events", "written_events"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE source_health ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+
+    def update_source_health(
+        self,
+        source_name: str,
+        success: bool | None = None,
+        error: str | None = None,
+        scanned_addresses: int | None = None,
+        fetched_events: int | None = None,
+        written_events: int | None = None,
+    ) -> None:
         spec = self.data_sources.get(source_name)
         if not spec:
             return
@@ -767,14 +790,21 @@ class DerivativesMonitor:
             spec.last_error = ""
         elif success is False:
             spec.last_error = truncate_text(str(error or "unknown error"), 300)
+        if scanned_addresses is not None:
+            spec.scanned_addresses = max(0, int(scanned_addresses))
+        if fetched_events is not None:
+            spec.fetched_events = max(0, int(fetched_events))
+        if written_events is not None:
+            spec.written_events = max(0, int(written_events))
         with self.external_data_lock:
             with self.external_db_connection() as conn:
                 conn.execute(
                     """
                     INSERT INTO source_health (
                         source, category, enabled, is_real_onchain, requires_api_key, ttl_seconds,
-                        priority, confidence, last_success, last_error, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        priority, confidence, last_success, last_error, scanned_addresses,
+                        fetched_events, written_events, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(source) DO UPDATE SET
                         category=excluded.category,
                         enabled=excluded.enabled,
@@ -785,6 +815,9 @@ class DerivativesMonitor:
                         confidence=excluded.confidence,
                         last_success=excluded.last_success,
                         last_error=excluded.last_error,
+                        scanned_addresses=excluded.scanned_addresses,
+                        fetched_events=excluded.fetched_events,
+                        written_events=excluded.written_events,
                         updated_at=excluded.updated_at
                     """,
                     (
@@ -798,6 +831,9 @@ class DerivativesMonitor:
                         spec.confidence,
                         spec.last_success,
                         spec.last_error,
+                        spec.scanned_addresses,
+                        spec.fetched_events,
+                        spec.written_events,
                         now,
                     ),
                 )
@@ -936,6 +972,67 @@ class DerivativesMonitor:
                 ).fetchall()
         return {str(direction): int(count) for direction, count in rows}
 
+    def scan_adapter_health_rows(self) -> dict[str, dict[str, Any]]:
+        names = ["Etherscan", "Tronscan", "Solscan"]
+        placeholders = {
+            name: {
+                "source": name,
+                "enabled": int(bool(self.data_sources.get(name) and self.data_sources[name].enabled)),
+                "last_success": self.data_sources.get(name).last_success if self.data_sources.get(name) else None,
+                "last_error": self.data_sources.get(name).last_error if self.data_sources.get(name) else "",
+                "scanned_addresses": self.data_sources.get(name).scanned_addresses if self.data_sources.get(name) else 0,
+                "fetched_events": self.data_sources.get(name).fetched_events if self.data_sources.get(name) else 0,
+                "written_events": self.data_sources.get(name).written_events if self.data_sources.get(name) else 0,
+            }
+            for name in names
+        }
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT source, enabled, last_success, last_error, scanned_addresses, fetched_events, written_events
+                    FROM source_health
+                    WHERE source IN ('Etherscan', 'Tronscan', 'Solscan')
+                    """
+                ).fetchall()
+        for row in rows:
+            source = str(row[0])
+            placeholders[source] = {
+                "source": source,
+                "enabled": int(row[1] or 0),
+                "last_success": parse_float(row[2]),
+                "last_error": str(row[3] or ""),
+                "scanned_addresses": int(row[4] or 0),
+                "fetched_events": int(row[5] or 0),
+                "written_events": int(row[6] or 0),
+            }
+        return placeholders
+
+    def format_scan_adapter_status_lines(self) -> list[str]:
+        rows = self.scan_adapter_health_rows()
+        lines = ["Scan adapters:"]
+        for name in ("Etherscan", "Tronscan", "Solscan"):
+            row = rows.get(name, {})
+            lines.append(
+                f"- {name}: enabled={yes_no(bool(row.get('enabled')))} | "
+                f"scanned={int(row.get('scanned_addresses') or 0)} | "
+                f"fetched={int(row.get('fetched_events') or 0)} | "
+                f"written={int(row.get('written_events') or 0)} | "
+                f"last_success={format_ts_short(parse_float(row.get('last_success')))} | "
+                f"last_error={truncate_text(str(row.get('last_error') or '-'), 80)}"
+            )
+        return lines
+
+    def onchain_event_empty_status_text(self) -> str:
+        rows = self.scan_adapter_health_rows()
+        any_configured = any(bool(row.get("enabled")) for row in rows.values())
+        any_success = any(parse_float(row.get("last_success")) for row in rows.values())
+        if any_success:
+            return "最近扫描正常，但暂无匹配转账事件。"
+        if any_configured:
+            return "尚未扫描或等待下一轮采集。"
+        return "尚未扫描/数据源未配置。"
+
     def format_onchain_address_sources(self) -> str:
         labels = list(self.onchain_address_labels)
         by_chain: dict[str, int] = {}
@@ -958,6 +1055,7 @@ class DerivativesMonitor:
             f"最近24h onchain_transfer_events: {self.onchain_transfer_event_count()}",
             f"最近24h direction: {format_count_mapping(self.onchain_transfer_direction_counts())}",
         ]
+        lines.extend(self.format_scan_adapter_status_lines())
         return "\n".join(lines)
 
     def format_onchain_address_query(self, query: str) -> str:
@@ -1105,7 +1203,7 @@ class DerivativesMonitor:
             "说明: 仅来自 onchain_addresses.yaml 已配置地址标签；覆盖有限。",
         ]
         if not events:
-            lines.append("暂无钱包级转账事件。")
+            lines.append(self.onchain_event_empty_status_text())
             return "\n".join(lines)
         for event in events:
             amount = format_optional_value(parse_float(event.get("amount")))
@@ -1378,40 +1476,73 @@ class DerivativesMonitor:
             for source_name in ("Etherscan", "Tronscan"):
                 spec = self.data_sources.get(source_name)
                 if spec and spec.enabled:
-                    self.update_source_health(source_name, False, "no configured onchain address labels")
+                    self.update_source_health(
+                        source_name,
+                        False,
+                        "no configured onchain address labels",
+                        scanned_addresses=0,
+                        fetched_events=0,
+                        written_events=0,
+                    )
             solscan = self.data_sources.get("Solscan")
             if solscan and not solscan.enabled:
-                self.update_source_health("Solscan", False, "SOLSCAN_API_KEY not configured; adapter reserved")
+                self.update_source_health(
+                    "Solscan",
+                    False,
+                    "SOLSCAN_API_KEY not configured; adapter reserved",
+                    scanned_addresses=0,
+                    fetched_events=0,
+                    written_events=0,
+                )
             return
-        scanned = 0
+        attempted = 0
+        scan_totals = {"Etherscan": [0, 0, 0], "Tronscan": [0, 0, 0]}
         for label in labels:
-            if scanned >= ONCHAIN_SCAN_ADDRESS_LIMIT:
+            if attempted >= ONCHAIN_SCAN_ADDRESS_LIMIT:
                 break
             cache_key = (label.chain, normalize_onchain_address(label.chain, label.address))
             if not force and now - self.onchain_scan_address_cache.get(cache_key, 0.0) < ONCHAIN_SCAN_ADDRESS_TTL_SECONDS:
                 continue
             self.onchain_scan_address_cache[cache_key] = now
+            attempted += 1
             if label.chain == "ethereum":
-                self.collect_etherscan_transfers_for_label(label)
-                scanned += 1
+                result = self.collect_etherscan_transfers_for_label(label)
+                if result is not None:
+                    fetched, written = result
+                    scan_totals["Etherscan"][0] += 1
+                    scan_totals["Etherscan"][1] += fetched
+                    scan_totals["Etherscan"][2] += written
             elif label.chain == "tron":
-                self.collect_tron_transfers_for_label(label)
-                scanned += 1
+                result = self.collect_tron_transfers_for_label(label)
+                if result is not None:
+                    fetched, written = result
+                    scan_totals["Tronscan"][0] += 1
+                    scan_totals["Tronscan"][1] += fetched
+                    scan_totals["Tronscan"][2] += written
+        for source_name, values in scan_totals.items():
+            if values[0] > 0:
+                self.update_source_health(
+                    source_name,
+                    True,
+                    scanned_addresses=values[0],
+                    fetched_events=values[1],
+                    written_events=values[2],
+                )
         solscan = self.data_sources.get("Solscan")
         if solscan:
             if solscan.enabled:
-                self.update_source_health("Solscan", False, "adapter reserved; collection not implemented")
+                self.update_source_health("Solscan", False, "adapter reserved; collection not implemented", scanned_addresses=0, fetched_events=0, written_events=0)
             else:
-                self.update_source_health("Solscan", False, "SOLSCAN_API_KEY not configured; adapter reserved")
+                self.update_source_health("Solscan", False, "SOLSCAN_API_KEY not configured; adapter reserved", scanned_addresses=0, fetched_events=0, written_events=0)
 
-    def collect_etherscan_transfers_for_label(self, label: OnchainAddressLabel) -> None:
+    def collect_etherscan_transfers_for_label(self, label: OnchainAddressLabel) -> tuple[int, int] | None:
         api_key = os.getenv("ETHERSCAN_API_KEY", "").strip()
         source_name = "Etherscan"
         if not api_key:
-            self.update_source_health(source_name, False, "ETHERSCAN_API_KEY not configured")
-            return
+            self.update_source_health(source_name, False, "ETHERSCAN_API_KEY not configured", scanned_addresses=0, fetched_events=0, written_events=0)
+            return None
         if not any(asset in {"USDT", "USDC", "ETH"} for asset in label.assets):
-            return
+            return None
         try:
             events: list[OnchainTransferEvent] = []
             token_params = {
@@ -1447,11 +1578,18 @@ class DerivativesMonitor:
                         if isinstance(row, dict):
                             events.append(self.etherscan_eth_row_to_event(row))
             written = self.write_onchain_transfer_events([event for event in events if event])
-            logging.info("onchain transfer scan Etherscan: address=%s events=%s written=%s", short_address(label.address), len(events), written)
-            self.update_source_health(source_name, True)
+            logging.info(
+                "onchain transfer scan Etherscan: address=%s scanned_addresses=1 fetched_events=%s written_events=%s",
+                short_address(label.address),
+                len(events),
+                written,
+            )
+            self.update_source_health(source_name, True, scanned_addresses=1, fetched_events=len(events), written_events=written)
+            return len(events), written
         except Exception as exc:
             logging.debug("Etherscan onchain transfer scan failed: address=%s", short_address(label.address), exc_info=True)
-            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}")
+            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}", scanned_addresses=1, fetched_events=0, written_events=0)
+            return None
 
     def etherscan_token_row_to_event(self, row: dict[str, Any], asset: str) -> OnchainTransferEvent:
         decimals = parse_float(row.get("tokenDecimal")) or 0
@@ -1498,15 +1636,15 @@ class DerivativesMonitor:
             raw_json=row,
         )
 
-    def collect_tron_transfers_for_label(self, label: OnchainAddressLabel) -> None:
+    def collect_tron_transfers_for_label(self, label: OnchainAddressLabel) -> tuple[int, int] | None:
         trongrid_key = os.getenv("TRONGRID_API_KEY", "").strip()
         tronscan_key = os.getenv("TRONSCAN_API_KEY", "").strip()
         source_name = "Tronscan"
         if not (trongrid_key or tronscan_key):
-            self.update_source_health(source_name, False, "TRONSCAN_API_KEY/TRONGRID_API_KEY not configured")
-            return
+            self.update_source_health(source_name, False, "TRONSCAN_API_KEY/TRONGRID_API_KEY not configured", scanned_addresses=0, fetched_events=0, written_events=0)
+            return None
         if "USDT" not in label.assets:
-            return
+            return None
         try:
             if trongrid_key:
                 events = self.fetch_trongrid_trc20_transfers(label, trongrid_key)
@@ -1515,11 +1653,19 @@ class DerivativesMonitor:
                 events = self.fetch_tronscan_trc20_transfers(label, tronscan_key)
                 source_label = "Tronscan"
             written = self.write_onchain_transfer_events(events)
-            logging.info("onchain transfer scan %s: address=%s events=%s written=%s", source_label, short_address(label.address), len(events), written)
-            self.update_source_health(source_name, True)
+            logging.info(
+                "onchain transfer scan %s: address=%s scanned_addresses=1 fetched_events=%s written_events=%s",
+                source_label,
+                short_address(label.address),
+                len(events),
+                written,
+            )
+            self.update_source_health(source_name, True, scanned_addresses=1, fetched_events=len(events), written_events=written)
+            return len(events), written
         except Exception as exc:
             logging.debug("Tron onchain transfer scan failed: address=%s", short_address(label.address), exc_info=True)
-            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}")
+            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}", scanned_addresses=1, fetched_events=0, written_events=0)
+            return None
 
     def fetch_trongrid_trc20_transfers(self, label: OnchainAddressLabel, api_key: str) -> list[OnchainTransferEvent]:
         headers = {"TRON-PRO-API-KEY": api_key} if api_key else {}
@@ -1706,6 +1852,11 @@ class DerivativesMonitor:
                 f"confidence={spec.confidence} | last_success={success_text} | "
                 f"last_error={truncate_text(error_text, 80)} | 24h数据={count}"
             )
+            if spec.name in {"Etherscan", "Tronscan", "Solscan"}:
+                lines.append(
+                    f"  scan: scanned_addresses={spec.scanned_addresses} / "
+                    f"fetched_events={spec.fetched_events} / written_events={spec.written_events}"
+                )
             if spec.name == "DefiLlama stablecoin supply":
                 lines.append("  说明: 稳定币供应聚合，不等同钱包流/交易所净流")
             if spec.name == "Address labels":
@@ -4141,24 +4292,42 @@ class DerivativesMonitor:
         )
         logging.info("Discord alt watch digest sent: count=%s", len(selected))
 
-    def flush_discord_suppressed_digest_if_due(self, now: float | None = None) -> None:
+    def flush_discord_suppressed_digest_if_due(self, now: float | None = None, force: bool = False) -> tuple[bool, str, int]:
         current_time = time.time() if now is None else now
-        if current_time - self.last_discord_suppressed_digest_flush_at < DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS:
-            return
+        self.last_discord_suppressed_digest_flush_attempt_at = current_time
+        next_allowed_at = self.last_discord_suppressed_digest_sent_at + DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS
+        if not force and self.last_discord_suppressed_digest_sent_at and current_time < next_allowed_at:
+            remaining = int(max(0, next_allowed_at - current_time))
+            self.last_discord_suppressed_digest_flush_status = f"waiting interval {remaining}s"
+            return False, self.last_discord_suppressed_digest_flush_status, 0
         self.last_discord_suppressed_digest_flush_at = current_time
         with self.discord_suppressed_digest_lock:
             items = self.discord_suppressed_digest_queue
             self.discord_suppressed_digest_queue = []
         if not items:
+            self.last_discord_suppressed_digest_flush_status = "empty"
             logging.info("Discord suppressed digest flush skipped: empty")
-            return
+            return False, "静默摘要队列为空", 0
         channel_key = "digest" if self.discord_config.channel_ids.get("digest") else "main"
         try:
-            self.enqueue_discord_message(discord_suppressed_digest_embed_v2(items, channel_key))
+            enqueued = self.enqueue_discord_message(discord_suppressed_digest_embed_v2(items, channel_key))
+            if not enqueued:
+                with self.discord_suppressed_digest_lock:
+                    self.discord_suppressed_digest_queue = items + self.discord_suppressed_digest_queue
+                self.last_discord_suppressed_digest_flush_status = "enqueue failed"
+                logging.error("Discord suppressed digest send failed: count=%s channel=%s reason=enqueue_failed", len(items), channel_key)
+                return False, "静默摘要发送失败：Discord 队列已满或未配置", len(items)
             self.last_discord_suppressed_digest_sent_at = current_time
+            self.last_discord_suppressed_digest_flush_status = f"enqueued count={len(items)} channel={channel_key}"
+            logging.info("Discord suppressed digest enqueued: count=%s channel=%s", len(items), channel_key)
             logging.info("Discord suppressed digest sent: count=%s channel=%s", len(items), channel_key)
+            return True, f"已发送静默摘要 {len(items)} 条", len(items)
         except Exception:
+            with self.discord_suppressed_digest_lock:
+                self.discord_suppressed_digest_queue = items + self.discord_suppressed_digest_queue
+            self.last_discord_suppressed_digest_flush_status = "exception"
             logging.exception("Discord suppressed digest send failed: count=%s channel=%s", len(items), channel_key)
+            return False, "静默摘要发送失败，请查看服务日志", len(items)
 
     def flush_telegram_signal_digest_if_due(self) -> None:
         _realtime_priorities, digest_priorities, digest_interval_minutes, digest_max_per_priority = (
@@ -4494,11 +4663,11 @@ class DerivativesMonitor:
         except Exception:
             logging.exception("Discord bot worker stopped unexpectedly")
 
-    def enqueue_discord_message(self, item: DiscordOutboundMessage) -> None:
+    def enqueue_discord_message(self, item: DiscordOutboundMessage) -> bool:
         if not self.discord_config.enabled:
-            return
+            return False
         if not self.discord_config.bot_token:
-            return
+            return False
         try:
             self.discord_outbound_queue.put_nowait(item)
             logging.info(
@@ -4506,8 +4675,10 @@ class DerivativesMonitor:
                 item.channel_key,
                 item.title or item.kind or item.symbol or "-",
             )
+            return True
         except queue.Full:
             logging.warning("Discord outbound queue is full; dropping message for channel=%s", item.channel_key)
+            return False
 
     def enqueue_discord_signal(
         self,
@@ -4569,6 +4740,10 @@ class DerivativesMonitor:
             return discord_summary_embed_v2("信号质量统计", self.format_signal_quality_stats(), "debug")
         if command == "!静默":
             return discord_summary_embed_v2("静默状态", self.format_quiet_status(), "debug")
+        if command == "!静默发送":
+            success, message, _count = self.flush_discord_suppressed_digest_if_due(force=True)
+            title = "静默摘要发送" if success else "静默摘要状态"
+            return discord_summary_embed_v2(title, message, "debug")
         if command == "!诊断":
             if len(parts) < 2:
                 return "用法: !诊断 BTCUSDT"
@@ -4858,6 +5033,23 @@ class DerivativesMonitor:
         with self.discord_alt_watch_lock:
             alt_watch_pending = len(self.discord_alt_watch_queue)
         digest_channel_configured = bool(self.discord_config.channel_ids.get("digest"))
+        now = time.time()
+        if suppressed_pending and not self.last_discord_suppressed_digest_sent_at:
+            next_digest_in = 0
+        else:
+            next_digest_in = int(
+                max(
+                    0,
+                    self.last_discord_suppressed_digest_sent_at
+                    + DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS
+                    - now,
+                )
+            )
+        flush_callable_status = (
+            "ready"
+            if self.discord_config.enabled and self.discord_config.bot_token and (digest_channel_configured or self.discord_config.channel_ids.get("main"))
+            else "disabled"
+        )
         return "\n".join(
             [
                 "Telegram 临时静音等级",
@@ -4873,6 +5065,10 @@ class DerivativesMonitor:
                 f"suppressed digest pending: {suppressed_pending}",
                 f"last suppressed digest sent: {format_ts_short(self.last_discord_suppressed_digest_sent_at)}",
                 f"interval seconds: {DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS}",
+                f"next digest in seconds: {next_digest_in}",
+                f"last flush attempt: {format_ts_short(self.last_discord_suppressed_digest_flush_attempt_at)}",
+                f"flush callable status: {flush_callable_status}",
+                f"last flush status: {self.last_discord_suppressed_digest_flush_status}",
                 f"recent suppressed count: {recent_suppressed}",
                 f"alt_watch pending: {alt_watch_pending}",
             ]
@@ -7447,6 +7643,7 @@ def discord_help_text() -> str:
         "!诊断 BTCUSDT - 单币诊断简版\n"
         "!质量 - 信号质量统计\n"
         "!静默 - 等同 /quiet status\n"
+        "!静默发送 - 立即发送 Discord 静默摘要队列\n"
         "!测试推送 - 向各已配置频道发送测试消息\n"
         "!帮助 - 查看命令"
     )
