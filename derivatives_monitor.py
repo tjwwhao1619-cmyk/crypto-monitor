@@ -294,6 +294,19 @@ class OnchainAddressLabel:
 
 
 @dataclass(frozen=True)
+class OnchainAddressCandidate:
+    chain: str
+    label: str
+    entity: str
+    type: str
+    address: str
+    assets: list[str]
+    candidate_source: str
+    verification_status: str
+    notes: str
+
+
+@dataclass(frozen=True)
 class OnchainTransferEvent:
     chain: str
     tx_hash: str
@@ -465,6 +478,7 @@ class DerivativesMonitor:
         self.last_hourly_summary_key: int | None = None
         self.last_onchain_summary_hour_key: int | None = None
         self.last_stablecoin_liquidity_hour_key: int | None = None
+        self.last_coinglass_summary_hour_key: int | None = None
         self.last_market_summary_text = ""
         self.last_market_summary_ts = 0.0
         self.last_market_summary_source = ""
@@ -500,6 +514,7 @@ class DerivativesMonitor:
         self.external_data_lock = threading.Lock()
         self.data_sources = self.build_data_source_specs()
         self.onchain_address_labels: list[OnchainAddressLabel] = []
+        self.onchain_address_candidates: list[OnchainAddressCandidate] = []
         self.last_external_stablecoin_collect_at = 0.0
         self.last_onchain_scan_collect_at = 0.0
         self.onchain_scan_address_cache: dict[tuple[str, str], float] = {}
@@ -898,9 +913,50 @@ class DerivativesMonitor:
         logging.info("onchain address labels loaded: count=%s path=%s", len(labels), path)
         return labels
 
+    def load_onchain_address_candidates(self) -> list[OnchainAddressCandidate]:
+        path = Path(self.onchain_address_config_path)
+        if not path.exists():
+            return []
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            logging.warning("Failed to read onchain address candidates config: %s", path, exc_info=True)
+            return []
+        candidates_root = payload.get("candidates") if isinstance(payload, dict) else None
+        if not isinstance(candidates_root, dict):
+            return []
+        candidates: list[OnchainAddressCandidate] = []
+        for chain, rows in candidates_root.items():
+            chain_name = str(chain or "").strip().lower()
+            if chain_name not in {"ethereum", "tron", "solana"} or not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                status = str(row.get("verification_status") or "pending").strip().lower()
+                if status not in {"pending", "verified", "rejected"}:
+                    status = "pending"
+                assets = row.get("assets") if isinstance(row.get("assets"), list) else []
+                candidates.append(
+                    OnchainAddressCandidate(
+                        chain=chain_name,
+                        label=str(row.get("label") or "").strip(),
+                        entity=str(row.get("entity") or "").strip(),
+                        type=str(row.get("type") or "unknown").strip().lower(),
+                        address=str(row.get("address") or "").strip(),
+                        assets=[str(asset).strip().upper() for asset in assets if str(asset).strip()],
+                        candidate_source=str(row.get("candidate_source") or "").strip(),
+                        verification_status=status,
+                        notes=str(row.get("notes") or "").strip(),
+                    )
+                )
+        logging.info("onchain address candidates loaded: count=%s path=%s", len(candidates), path)
+        return candidates
+
     def load_and_store_onchain_address_labels(self) -> None:
         labels = self.load_onchain_address_labels()
         self.onchain_address_labels = labels
+        self.onchain_address_candidates = self.load_onchain_address_candidates()
         self.store_onchain_address_labels(labels)
         if labels:
             spec = self.data_sources.get("Address labels")
@@ -1075,6 +1131,7 @@ class DerivativesMonitor:
 
     def format_onchain_address_sources(self) -> str:
         labels = list(self.onchain_address_labels)
+        candidates = list(self.onchain_address_candidates)
         by_chain: dict[str, int] = {}
         by_entity: dict[str, int] = {}
         by_type: dict[str, int] = {}
@@ -1082,10 +1139,18 @@ class DerivativesMonitor:
             by_chain[item.chain] = by_chain.get(item.chain, 0) + 1
             by_entity[item.entity] = by_entity.get(item.entity, 0) + 1
             by_type[item.type] = by_type.get(item.type, 0) + 1
+        candidate_counts = self.onchain_address_candidate_counts(candidates)
         lines = [
             "链上地址标签源",
             f"已加载地址标签数量: {len(labels)}",
+            (
+                f"候选地址数量: {len(candidates)} | "
+                f"verified={candidate_counts.get('verified', 0)} / "
+                f"pending={candidate_counts.get('pending', 0)} / "
+                f"rejected={candidate_counts.get('rejected', 0)}"
+            ),
             "说明: 自建地址标签覆盖有限，不能等同 Arkham/Nansen 实体标签。",
+            "规则: candidates 只作审计记录，不会被 Scan API 采集。",
             f"按 chain: {format_count_mapping(by_chain)}",
             f"按 entity: {format_count_mapping(by_entity)}",
             f"按 type: {format_count_mapping(by_type)}",
@@ -1096,6 +1161,33 @@ class DerivativesMonitor:
             f"最近24h direction: {format_count_mapping(self.onchain_transfer_direction_counts())}",
         ]
         lines.extend(self.format_scan_adapter_status_lines())
+        return "\n".join(lines)
+
+    def onchain_address_candidate_counts(self, candidates: list[OnchainAddressCandidate] | None = None) -> dict[str, int]:
+        counts = {"verified": 0, "pending": 0, "rejected": 0}
+        for item in (candidates if candidates is not None else self.onchain_address_candidates):
+            status = item.verification_status if item.verification_status in counts else "pending"
+            counts[status] += 1
+        return counts
+
+    def format_onchain_address_candidates(self, limit: int = 20) -> str:
+        candidates = list(self.onchain_address_candidates)
+        counts = self.onchain_address_candidate_counts(candidates)
+        lines = [
+            "地址候选审计",
+            "说明: 候选地址不会被 Scan API 采集；只有明确来源验证后才可迁入 active 地址。",
+            f"candidate={len(candidates)} | verified={counts.get('verified', 0)} | pending={counts.get('pending', 0)} | rejected={counts.get('rejected', 0)}",
+        ]
+        if not candidates:
+            lines.append("暂无候选地址。")
+            return "\n".join(lines)
+        for item in candidates[:limit]:
+            source = truncate_text(item.candidate_source or "-", 90)
+            label = item.label or "-"
+            entity = item.entity or "-"
+            lines.append(f"{entity} | {item.chain} | {label} | {item.verification_status} | {source}")
+        if len(candidates) > limit:
+            lines.append(f"共 {len(candidates)} 条，展示前 {limit} 条。")
         return "\n".join(lines)
 
     def format_onchain_address_query(self, query: str) -> str:
@@ -2073,6 +2165,154 @@ class DerivativesMonitor:
         self.enqueue_discord_message(discord_onchain_embed_v2("🟠 稳定币流动性雷达", message, channel_key))
         logging.info("Discord stablecoin liquidity radar enqueued: channel=%s hour_key=%s", channel_key, hour_key)
 
+    def recent_coinglass_metric_values(self, symbol: str, since_seconds: int = 86400) -> dict[str, tuple[Any, float]]:
+        normalized = normalize_usdt_symbol(symbol)
+        cutoff = time.time() - since_seconds
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT metric, value, timestamp
+                    FROM external_data_points
+                    WHERE source = 'CoinGlass aggregation'
+                      AND symbol = ?
+                      AND timestamp >= ?
+                    ORDER BY timestamp ASC
+                    """,
+                    (normalized, cutoff),
+                ).fetchall()
+        values: dict[str, tuple[Any, float]] = {}
+        for metric, value, timestamp in rows:
+            values[str(metric)] = (parse_float(value) if parse_float(value) is not None else value, float(timestamp or 0))
+        return values
+
+    def recent_coinglass_exchange_balances(self, symbol: str, since_seconds: int = 86400) -> dict[str, dict[str, Any]]:
+        normalized = normalize_usdt_symbol(symbol)
+        asset = normalized[:-4] if normalized.endswith("USDT") else normalized
+        cutoff = time.time() - since_seconds
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT range_label, balance, balance_usd, change_value, change_percent, timestamp
+                    FROM exchange_balances
+                    WHERE source = 'CoinGlass aggregation'
+                      AND asset = ?
+                      AND timestamp >= ?
+                    ORDER BY timestamp ASC
+                    """,
+                    (asset, cutoff),
+                ).fetchall()
+        ranges: dict[str, dict[str, Any]] = {}
+        for range_label, balance, balance_usd, change_value, change_percent, timestamp in rows:
+            ranges[str(range_label)] = {
+                "balance": parse_float(balance),
+                "balance_usd": parse_float(balance_usd),
+                "change": parse_float(change_value),
+                "change_percent": parse_float(change_percent),
+                "timestamp": parse_float(timestamp),
+            }
+        return ranges
+
+    def coinglass_panel_snapshot(self, symbol: str) -> dict[str, Any]:
+        normalized = normalize_usdt_symbol(symbol)
+        metrics = self.recent_coinglass_metric_values(normalized)
+        balances = self.recent_coinglass_exchange_balances(normalized)
+        timestamps = [timestamp for _value, timestamp in metrics.values() if timestamp]
+        timestamps.extend(parse_float(row.get("timestamp")) for row in balances.values() if parse_float(row.get("timestamp")))
+        return {
+            "symbol": normalized,
+            "metrics": metrics,
+            "balances": balances,
+            "updated_at": max(timestamps) if timestamps else None,
+            "cached_text": cached_coinglass_market_context_text(normalized),
+        }
+
+    def format_coinglass_panel(self, target: str | None = None) -> str:
+        symbols = [normalize_usdt_symbol(target)] if target else ONCHAIN_SUMMARY_SYMBOLS
+        lines = [
+            "说明: CoinGlass 是外部聚合数据，不是钱包级链上流；仅用于外部资金确认。",
+        ]
+        for symbol in symbols:
+            if not is_valid_binance_usdt_symbol(symbol):
+                return "用法: !coinglass 或 !coinglass BTCUSDT"
+            snapshot = self.coinglass_panel_snapshot(symbol)
+            lines.extend(self.format_coinglass_panel_symbol_lines(snapshot, detail=bool(target)))
+        return "\n".join(lines)
+
+    def format_coinglass_panel_symbol_lines(self, snapshot: dict[str, Any], detail: bool = False) -> list[str]:
+        symbol = str(snapshot.get("symbol") or "-")
+        metrics = snapshot.get("metrics") if isinstance(snapshot.get("metrics"), dict) else {}
+        balances = snapshot.get("balances") if isinstance(snapshot.get("balances"), dict) else {}
+        balance_text = (
+            f"余额 1d {format_coinglass_balance_snapshot(balances.get('24h'))} / "
+            f"7d {format_coinglass_balance_snapshot(balances.get('7d'))} / "
+            f"30d {format_coinglass_balance_snapshot(balances.get('30d'))}"
+        )
+        oi_text = (
+            f"OI 1h {format_percent_optional(metric_value(metrics, 'open_interest_change_1h'))} / "
+            f"4h {format_percent_optional(metric_value(metrics, 'open_interest_change_4h'))} / "
+            f"24h {format_percent_optional(metric_value(metrics, 'open_interest_change_24h'))}"
+        )
+        funding_text = (
+            f"Funding 当前 {format_percent_optional(metric_value(metrics, 'funding_oi_weight'))} / "
+            f"1d {format_percent_optional(metric_value(metrics, 'funding_accumulated_24h'))} / "
+            f"7d {format_percent_optional(metric_value(metrics, 'funding_accumulated_7d'))}"
+        )
+        taker_text = (
+            f"主动买卖24h 买{format_ratio_percent(metric_value(metrics, 'taker_flow_buy_ratio'))} / "
+            f"卖{format_ratio_percent(metric_value(metrics, 'taker_flow_sell_ratio'))}"
+        )
+        orderbook_text = (
+            f"订单簿 1h 买{format_usd(metric_value(metrics, 'orderbook_bids_usd_1h'))} / "
+            f"卖{format_usd(metric_value(metrics, 'orderbook_asks_usd_1h'))}；"
+            f"4h 买{format_usd(metric_value(metrics, 'orderbook_bids_usd_avg_4h'))} / "
+            f"卖{format_usd(metric_value(metrics, 'orderbook_asks_usd_avg_4h'))}"
+        )
+        judgement = coinglass_panel_judgement(metrics, balances)
+        cached_text = str(snapshot.get("cached_text") or "")
+        cached_line = f"缓存摘要: {compact_coinglass_market_context(cached_text)}" if cached_text and not metrics and not balances else ""
+        updated = format_ts_short(parse_float(snapshot.get("updated_at")))
+        if detail:
+            lines = [
+                "",
+                symbol,
+                balance_text,
+                oi_text,
+                funding_text,
+                taker_text,
+                orderbook_text,
+                f"数据更新时间: {updated}",
+                f"综合判断: {judgement}",
+            ]
+            if cached_line:
+                lines.insert(-1, cached_line)
+            return lines
+        lines = [
+            "",
+            f"{symbol}: {balance_text}",
+            f"{oi_text} | {funding_text}",
+            f"{taker_text} | {orderbook_text}",
+            f"更新时间 {updated} | 判断: {judgement}",
+        ]
+        if cached_line:
+            lines.insert(-1, cached_line)
+        return lines
+
+    def send_coinglass_summary_if_due(self) -> None:
+        if not self.discord_config.enabled or not self.discord_config.bot_token:
+            return
+        now = time.time()
+        hour_key = int(now // 3600)
+        if self.last_coinglass_summary_hour_key == hour_key:
+            return
+        message = self.format_coinglass_panel()
+        self.last_coinglass_summary_hour_key = hour_key
+        self.save_state()
+        channel_key = "onchain" if self.discord_config.channel_ids.get("onchain") else "summary"
+        self.enqueue_discord_message(discord_onchain_embed_v2("🔷 CoinGlass 聚合资金摘要", message, channel_key))
+        logging.info("Discord CoinGlass summary enqueued: channel=%s hour_key=%s", channel_key, hour_key)
+
     def format_stablecoin_onchain_event_summary(self, asset: str) -> str:
         events = self.recent_onchain_transfer_events(asset, limit=5)
         if not events:
@@ -2134,6 +2374,7 @@ class DerivativesMonitor:
                 self.send_summary_if_due()
                 self.send_onchain_summary_if_due()
                 self.send_stablecoin_liquidity_summary_if_due()
+                self.send_coinglass_summary_if_due()
                 self.flush_telegram_signal_digest_if_due()
                 self.flush_discord_alt_watch_digest_if_due()
                 self.flush_discord_suppressed_digest_if_due()
@@ -3649,6 +3890,8 @@ class DerivativesMonitor:
             self.last_onchain_summary_hour_key = int(loaded_onchain_key) if loaded_onchain_key is not None else None
             loaded_stablecoin_key = payload.get("last_stablecoin_liquidity_hour_key")
             self.last_stablecoin_liquidity_hour_key = int(loaded_stablecoin_key) if loaded_stablecoin_key is not None else None
+            loaded_coinglass_key = payload.get("last_coinglass_summary_hour_key")
+            self.last_coinglass_summary_hour_key = int(loaded_coinglass_key) if loaded_coinglass_key is not None else None
         except Exception:
             logging.warning("Failed to load monitor state", exc_info=True)
 
@@ -3659,6 +3902,7 @@ class DerivativesMonitor:
             "last_hourly_summary_key": self.last_hourly_summary_key,
             "last_onchain_summary_hour_key": self.last_onchain_summary_hour_key,
             "last_stablecoin_liquidity_hour_key": self.last_stablecoin_liquidity_hour_key,
+            "last_coinglass_summary_hour_key": self.last_coinglass_summary_hour_key,
         }
         try:
             with path.open("w", encoding="utf-8") as file:
@@ -4886,6 +5130,8 @@ class DerivativesMonitor:
             return discord_onchain_embed_v2("外部资金来源", self.format_external_source_health(only_available=False), "onchain")
         if command == "!地址源":
             return discord_onchain_embed_v2("地址标签源", self.format_onchain_address_sources(), "onchain")
+        if command == "!地址候选":
+            return discord_onchain_embed_v2("地址候选", self.format_onchain_address_candidates(), "onchain")
         if command == "!地址":
             if len(parts) < 2:
                 return "用法: !地址 USDT 或 !地址 Binance"
@@ -4900,6 +5146,10 @@ class DerivativesMonitor:
                 return discord_onchain_embed_v2("稳定币流动性雷达", "用法: !稳定币 或 !稳定币 USDT / !稳定币 USDC", "onchain")
             title = f"🟠 稳定币流动性雷达 {str(target).upper()}" if target else "🟠 稳定币流动性雷达"
             return discord_onchain_embed_v2(title, self.format_stablecoin_liquidity_radar(target), "onchain")
+        if command == "!coinglass":
+            target = parts[1] if len(parts) >= 2 else None
+            title = f"🔷 CoinGlass 聚合资金 {normalize_usdt_symbol(target)}" if target else "🔷 CoinGlass 聚合资金摘要"
+            return discord_onchain_embed_v2(title, self.format_coinglass_panel(target), "onchain")
         if command in ("!链上摘要", "!外部资金摘要"):
             return discord_onchain_embed_v2("外部资金确认摘要", self.format_onchain_summary_from_cache(), "onchain")
         if command in ("!链上", "!链上资金", "!外部资金"):
@@ -7891,9 +8141,11 @@ def discord_help_text() -> str:
         "!数据源 - 查看采集层数据源健康状态\n"
         "!外部资金来源 - 查看当前真实可用外部资金来源\n"
         "!地址源 - 查看自建链上地址标签库状态\n"
+        "!地址候选 - 查看交易所/treasury 地址候选审计\n"
         "!地址 USDT - 查询资产或实体相关地址标签\n"
         "!链上事件 - 查看最近24h已标记地址链上转账事件\n"
         "!稳定币 - 查看 DefiLlama 稳定币供应聚合变化\n"
+        "!coinglass BTCUSDT - 查看 CoinGlass 聚合外部资金面板\n"
         "!外部资金 - 查看 BTC/ETH/SOL/BNB/DOGE 现货/DEX/CoinGlass 外部资金确认\n"
         "!外部资金 BTCUSDT - 单币现货/DEX/CoinGlass 外部资金确认\n"
         "!链上 BTCUSDT - 旧别名，当前不代表真实钱包流\n"
@@ -8384,6 +8636,69 @@ def format_coinglass_market_context_text(context: dict[str, Any]) -> str:
     if is_major_asset_tier(str(context.get("symbol") or "")):
         text = f"{text}\n{format_coinglass_orderbook_context_text(context.get('orderbook'))}"
     return text
+
+
+def metric_value(metrics: dict[str, Any], key: str) -> float | None:
+    value = metrics.get(key)
+    if isinstance(value, tuple):
+        return parse_float(value[0])
+    return parse_float(value)
+
+
+def format_coinglass_balance_snapshot(row: Any) -> str:
+    if not isinstance(row, dict):
+        return "n/a"
+    change = parse_float(row.get("change"))
+    change_percent = parse_float(row.get("change_percent"))
+    if change is None and change_percent is None:
+        return "n/a"
+    parts = []
+    if change is not None:
+        parts.append(format_usd(change))
+    if change_percent is not None:
+        parts.append(format_percent_optional(change_percent))
+    return " ".join(parts) if parts else "n/a"
+
+
+def coinglass_panel_judgement(metrics: dict[str, Any], balances: dict[str, Any]) -> str:
+    balance_1d = parse_float((balances.get("24h") or {}).get("change"))
+    balance_7d = parse_float((balances.get("7d") or {}).get("change"))
+    balance_30d = parse_float((balances.get("30d") or {}).get("change"))
+    buy_ratio = metric_value(metrics, "taker_flow_buy_ratio")
+    sell_ratio = metric_value(metrics, "taker_flow_sell_ratio")
+    bid_ask_ratio = metric_value(metrics, "orderbook_bid_ask_ratio")
+    oi_1h = metric_value(metrics, "open_interest_change_1h")
+    oi_4h = metric_value(metrics, "open_interest_change_4h")
+    oi_24h = metric_value(metrics, "open_interest_change_24h")
+    funding_current = metric_value(metrics, "funding_oi_weight")
+    funding_1d = metric_value(metrics, "funding_accumulated_24h")
+    funding_7d = metric_value(metrics, "funding_accumulated_7d")
+
+    balance_down = any(value is not None and value < 0 for value in (balance_1d, balance_7d, balance_30d))
+    balance_up = any(value is not None and value > 0 for value in (balance_1d, balance_7d))
+    buy_support = ratio_gte(buy_ratio, 52) or (bid_ask_ratio is not None and bid_ask_ratio >= 1.15)
+    sell_pressure = ratio_gte(sell_ratio, 52) or (bid_ask_ratio is not None and bid_ask_ratio <= 0.85)
+    oi_rising = any(value is not None and value > 0 for value in (oi_1h, oi_4h, oi_24h))
+    funding_extreme = any(value is not None and abs(value) >= 0.08 for value in (funding_current, funding_1d, funding_7d))
+
+    if funding_extreme and oi_rising:
+        return "杠杆拥挤，需防波动放大"
+    if balance_down and buy_support and not sell_pressure:
+        return "外部资金偏支撑"
+    if balance_up and sell_pressure:
+        return "交易所余额回流且卖压增强，潜在抛压"
+    if (balance_down and sell_pressure) or (balance_up and buy_support):
+        return "CoinGlass 数据分歧，暂不构成强确认"
+    if not metrics and not balances:
+        return "CoinGlass 数据不足，等待缓存"
+    return "CoinGlass 聚合数据中性/分歧"
+
+
+def ratio_gte(value: float | None, threshold_percent: float) -> bool:
+    if value is None:
+        return False
+    threshold = threshold_percent / 100 if abs(value) <= 1 else threshold_percent
+    return value >= threshold
 
 
 def coinglass_orderbook_context_from_rows(rows: list[dict[str, Any]]) -> dict[str, float | None] | None:
