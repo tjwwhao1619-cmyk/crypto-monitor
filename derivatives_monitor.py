@@ -74,6 +74,7 @@ MAINSTREAM_WATCH_SYMBOLS = {
     "OPUSDT",
     "ARBUSDT",
 }
+ONCHAIN_SUMMARY_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"]
 DISCORD_CHANNEL_ENV_KEYS = {
     "main": "DISCORD_MAIN_CHANNEL_ID",
     "alerts": "DISCORD_ALERTS_CHANNEL_ID",
@@ -82,6 +83,7 @@ DISCORD_CHANNEL_ENV_KEYS = {
     "digest": "DISCORD_DIGEST_CHANNEL_ID",
     "debug": "DISCORD_DEBUG_CHANNEL_ID",
     "alt_watch": "DISCORD_ALT_WATCH_CHANNEL_ID",
+    "onchain": "DISCORD_ONCHAIN_CHANNEL_ID",
 }
 DISCORD_COLOR_BULLISH = 0x2ECC71
 DISCORD_COLOR_RISK = 0xE74C3C
@@ -359,6 +361,7 @@ class DerivativesMonitor:
         self.summary_config = config.get("summary", {})
         self.last_summary_at = 0.0
         self.last_hourly_summary_key: int | None = None
+        self.last_onchain_summary_hour_key: int | None = None
         self.last_market_summary_text = ""
         self.last_market_summary_ts = 0.0
         self.last_market_summary_source = ""
@@ -428,6 +431,7 @@ class DerivativesMonitor:
                 self.run_cycle()
                 self.flush_pending_telegram_signals()
                 self.send_summary_if_due()
+                self.send_onchain_summary_if_due()
                 self.flush_telegram_signal_digest_if_due()
                 self.flush_discord_alt_watch_digest_if_due()
             except Exception:
@@ -1935,6 +1939,8 @@ class DerivativesMonitor:
             }
             loaded_summary_key = payload.get("last_hourly_summary_key")
             self.last_hourly_summary_key = int(loaded_summary_key) if loaded_summary_key is not None else None
+            loaded_onchain_key = payload.get("last_onchain_summary_hour_key")
+            self.last_onchain_summary_hour_key = int(loaded_onchain_key) if loaded_onchain_key is not None else None
         except Exception:
             logging.warning("Failed to load monitor state", exc_info=True)
 
@@ -1943,6 +1949,7 @@ class DerivativesMonitor:
         payload = {
             "last_alerted_at": self.last_alerted_at,
             "last_hourly_summary_key": self.last_hourly_summary_key,
+            "last_onchain_summary_hour_key": self.last_onchain_summary_hour_key,
         }
         try:
             with path.open("w", encoding="utf-8") as file:
@@ -2642,6 +2649,12 @@ class DerivativesMonitor:
             return "当前暂无山寨观察候选。"
         return "🟡 山寨观察（最近30分钟，非开仓信号）\n" + self.format_discord_alt_watch_digest(items)
 
+    def discord_alt_watch_command_response(self) -> str | DiscordOutboundMessage:
+        items = self.merged_discord_alt_watch_top(10)
+        if not items:
+            return "当前暂无山寨观察候选。"
+        return discord_alt_watch_embed_v2(items, self.discord_alt_watch_channel_key(), "山寨观察")
+
     def flush_discord_alt_watch_digest_if_due(self, now: float | None = None) -> None:
         if not self.discord_config.enabled or not self.discord_config.bot_token:
             return
@@ -2667,12 +2680,7 @@ class DerivativesMonitor:
             for item in selected:
                 self.discord_alt_watch_symbol_sent_at[item.symbol] = current_time
         self.enqueue_discord_message(
-            DiscordOutboundMessage(
-                channel_key=self.discord_alt_watch_channel_key(),
-                content=self.format_discord_alt_watch_digest(selected),
-                title="🟡 山寨观察摘要（非开仓信号）",
-                color=DISCORD_COLOR_WATCH,
-            )
+            discord_alt_watch_embed_v2(selected, self.discord_alt_watch_channel_key(), "山寨观察摘要")
         )
         logging.info("Discord alt watch digest sent: count=%s", len(selected))
 
@@ -2776,6 +2784,40 @@ class DerivativesMonitor:
         except Exception:
             logging.warning("Failed to send hourly summary for hour_key=%s; will not retry this hour", hourly_summary_key, exc_info=True)
 
+    def send_onchain_summary_if_due(self) -> None:
+        if not self.discord_config.enabled or not self.discord_config.bot_token:
+            return
+        if not self.discord_config.channel_ids.get("onchain"):
+            return
+        now = time.time()
+        hour_key = int(now // 3600)
+        if self.last_onchain_summary_hour_key == hour_key:
+            return
+        if not self.latest_snapshots:
+            return
+
+        message = self.format_onchain_summary_from_cache()
+        self.last_onchain_summary_hour_key = hour_key
+        self.save_state()
+        self.enqueue_discord_message(
+            discord_onchain_embed_v2("链上资金摘要", message, "onchain")
+        )
+
+    def format_onchain_summary_from_cache(self) -> str:
+        lines: list[str] = []
+        for symbol in ONCHAIN_SUMMARY_SYMBOLS:
+            snapshot = self.latest_snapshots.get(symbol)
+            if snapshot is None:
+                continue
+            coinglass_text = cached_coinglass_market_context_text(symbol)
+            spot_text = cached_spot_alpha_confirmation(symbol)
+            line = format_onchain_brief(snapshot, coinglass_text, spot_text, compact=True)
+            if onchain_brief_has_confirmation_data(line):
+                lines.append(line)
+        if not lines:
+            return "链上数据不足，等待缓存"
+        return "链上资金摘要\n" + "\n".join(lines)
+
     def refresh_market_summary_cache_from_latest(self, source: str = "scan") -> str:
         if not self.latest_snapshots:
             return ""
@@ -2854,32 +2896,39 @@ class DerivativesMonitor:
                 channel = await client.fetch_channel(numeric_channel_id)
             return channel
 
+        def build_embed(item: DiscordOutboundMessage) -> Any:
+            description = discord_embed_description_text(item)
+            embed = discord.Embed(
+                title=item.title or "Crypto Monitor",
+                description=truncate_text(description, 900) if description else None,
+                color=item.color if item.color is not None else DISCORD_COLOR_WATCH,
+            )
+            for name, value, inline in item.fields or []:
+                embed.add_field(name=name, value=truncate_text(str(value), 1024) or "-", inline=inline)
+            return embed
+
+        async def send_discord_payload(channel: Any, payload: str | DiscordOutboundMessage) -> None:
+            if isinstance(payload, DiscordOutboundMessage):
+                await channel.send(embed=build_embed(payload))
+                logging.info("Discord sent: channel=command title=%s", payload.title or payload.kind or payload.symbol or "-")
+                return
+            await channel.send(truncate_text(str(payload or ""), 1900))
+
         async def send_outbound(item: DiscordOutboundMessage) -> None:
             try:
                 channel = await resolve_channel(item.channel_key)
                 if channel is None:
                     return
-                embed = None
                 if item.title or item.fields:
-                    description = discord_embed_description_text(item)
-                    embed = discord.Embed(
-                        title=item.title or "Crypto Monitor",
-                        description=truncate_text(description, 3800) if description else None,
-                        color=item.color if item.color is not None else DISCORD_COLOR_WATCH,
-                    )
-                    for name, value, inline in item.fields or []:
-                        embed.add_field(name=name, value=truncate_text(str(value), 1024) or "-", inline=inline)
-                if embed is not None:
-                    await channel.send(embed=embed)
+                    await channel.send(embed=build_embed(item))
                     logging.info(
-                        "Discord sent: %s %s channel=%s",
-                        item.symbol or "-",
-                        item.kind or "-",
+                        "Discord sent: channel=%s title=%s",
                         item.channel_key,
+                        item.title or item.kind or item.symbol or "-",
                     )
                     return
                 await channel.send(truncate_text(item.content or "", 1900))
-                logging.info("Discord sent: %s %s channel=%s", item.symbol or "-", item.kind or "-", item.channel_key)
+                logging.info("Discord sent: channel=%s title=%s", item.channel_key, item.title or item.kind or item.symbol or "-")
             except Exception:
                 logging.exception(
                     "Failed to send Discord message: %s %s channel=%s",
@@ -2896,6 +2945,7 @@ class DerivativesMonitor:
                 ("summary", "市场摘要频道", "测试 市场摘要"),
                 ("digest", "静默摘要频道", "测试 静默摘要"),
                 ("debug", "机器人调试频道", "测试 调试"),
+                ("onchain", "链上资金频道", "测试 链上资金"),
             ]
             failures: list[str] = []
             for channel_key, label, test_text in test_targets:
@@ -2950,7 +3000,7 @@ class DerivativesMonitor:
                     return
                 response = await asyncio.to_thread(self.discord_command_response, text)
                 if response:
-                    await message.channel.send(truncate_text(response, 1900))
+                    await send_discord_payload(message.channel, response)
             except Exception:
                 logging.exception("Failed to handle Discord command")
                 await message.channel.send("命令处理失败，请查看服务日志。")
@@ -2972,10 +3022,9 @@ class DerivativesMonitor:
         try:
             self.discord_outbound_queue.put_nowait(item)
             logging.info(
-                "Discord enqueue: %s %s channel=%s",
-                item.symbol or "-",
-                item.kind or "-",
+                "Discord enqueue: channel=%s title=%s",
                 item.channel_key,
+                item.title or item.kind or item.symbol or "-",
             )
         except queue.Full:
             logging.warning("Discord outbound queue is full; dropping message for channel=%s", item.channel_key)
@@ -2990,31 +3039,15 @@ class DerivativesMonitor:
         channel_key: str | None = None,
     ) -> None:
         channel = channel_key or discord_channel_for_signal(signal, priority)
-        fields = discord_signal_fields(signal, priority, quality_score, quality_reason)
         self.enqueue_discord_message(
-            DiscordOutboundMessage(
-                channel_key=channel,
-                content=discord_signal_content_title(signal, priority),
-                title=discord_signal_title(signal, priority),
-                color=discord_signal_color(signal),
-                fields=fields,
-                symbol=signal.symbol,
-                kind=signal.kind,
-            )
+            discord_signal_embed_v2(signal, priority, quality_score, quality_reason, channel)
         )
 
     def enqueue_discord_status(self, title: str, message: str) -> None:
         channel_key = "summary" if "摘要" in title or "简报" in title else "debug"
-        self.enqueue_discord_message(
-            DiscordOutboundMessage(
-                channel_key=channel_key,
-                content=discord_clean_summary_text(message, title=title, remove_title=True),
-                title=title,
-                color=DISCORD_COLOR_SUMMARY,
-            )
-        )
+        self.enqueue_discord_message(discord_summary_embed_v2(title, message, channel_key))
 
-    def discord_command_response(self, text: str) -> str:
+    def discord_command_response(self, text: str) -> str | DiscordOutboundMessage:
         parts = text.split()
         command = parts[0].lower()
         if command == "!帮助":
@@ -3022,19 +3055,34 @@ class DerivativesMonitor:
         if command == "!摘要":
             cached_text, cached_at, _cache_source = self.cached_market_summary()
             if cached_text:
-                return discord_clean_summary_text(
+                summary_text = discord_clean_summary_text(
                     self.format_cached_market_summary_response(cached_text, cached_at),
                     title="📊 每小时市场简报",
                 )
+                return discord_summary_embed_v2("市场摘要", summary_text, "summary")
             return "当前暂无市场摘要缓存，请等待下一轮扫描完成后重试。"
         if command == "!候选":
-            return self.format_topq_response()
+            return discord_summary_embed_v2("把握候选TOP10", self.format_topq_response(discord_view=True), "digest")
         if command == "!山寨":
-            return self.format_discord_alt_watch_command_response()
+            return self.discord_alt_watch_command_response()
+        if command == "!链上摘要":
+            return discord_onchain_embed_v2("链上资金摘要", self.format_onchain_summary_from_cache(), "onchain")
+        if command == "!链上":
+            if len(parts) < 2:
+                return "用法: !链上 BTCUSDT"
+            symbol = normalize_usdt_symbol(parts[1])
+            snapshot, data_source_text, degradation_text = self.telegram_command_snapshot(symbol)
+            coinglass_text = self.format_coinglass_market_context(symbol)
+            spot_text = cached_spot_alpha_confirmation(symbol) or spot_alpha_confirmation(symbol)
+            response_parts = [data_source_text]
+            if degradation_text:
+                response_parts.append(degradation_text)
+            response_parts.append(format_onchain_brief(snapshot, coinglass_text, spot_text))
+            return discord_onchain_embed_v2(f"{symbol} 链上确认", "\n".join(response_parts), "onchain")
         if command == "!质量":
-            return self.format_signal_quality_stats()
+            return discord_summary_embed_v2("信号质量统计", self.format_signal_quality_stats(), "debug")
         if command == "!静默":
-            return self.format_quiet_status()
+            return discord_summary_embed_v2("静默状态", self.format_quiet_status(), "debug")
         if command == "!诊断":
             if len(parts) < 2:
                 return "用法: !诊断 BTCUSDT"
@@ -3050,7 +3098,7 @@ class DerivativesMonitor:
             if degradation_text:
                 response_parts.append(degradation_text)
             response_parts.append(format_symbol_diagnosis(snapshot, signals, liquidation_text, coinglass_text))
-            return truncate_text("\n".join(response_parts), 1900)
+            return discord_diagnosis_embed_v2(symbol, snapshot, signals, liquidation_text, coinglass_text, response_parts)
         return ""
 
     def start_telegram_command_worker(self) -> None:
@@ -4013,7 +4061,7 @@ class DerivativesMonitor:
     def handle_topq_command(self, bot_token: str, chat_id: str) -> None:
         self.send_telegram_text(bot_token, chat_id, self.format_topq_response())
 
-    def format_topq_response(self) -> str:
+    def format_topq_response(self, discord_view: bool = False) -> str:
         try:
             rows = self.load_recent_signal_rows(200)
         except Exception:
@@ -4052,6 +4100,8 @@ class DerivativesMonitor:
                 continue
             if direction == "看空" and leading_direction == "long" and leading_score_value >= 6:
                 conviction_score_value = min(conviction_score_value, 79)
+            if kind == "main_momentum_watch" and topq_main_momentum_hard_downgrade(row):
+                conviction_score_value = min(conviction_score_value, 69)
             price_change_value = parse_float(row.get("price_change_percent"))
             oi_change_value = parse_float(row.get("oi_change_percent"))
             if kind == "main_risk_watch" and (price_change_value or 0) < 1.5 and (oi_change_value or 0) < 3:
@@ -4108,6 +4158,8 @@ class DerivativesMonitor:
             flow_label = str(row.get("flow_trend_label") or "")
             evidence_summary = str(row.get("evidence_summary") or "").strip()
             risk_row = topq_is_risk_candidate(kind)
+            momentum_downgraded = topq_kind_normalized(kind) == "main_momentum_watch" and topq_main_momentum_hard_downgrade(row)
+            discord_downgraded = discord_view and topq_discord_bullish_display_downgrade(row)
             position_label = row.get("position_behavior_label") or ""
             action, _action_reason = structural_action_override(
                 kind,
@@ -4127,7 +4179,7 @@ class DerivativesMonitor:
             if risk_row:
                 action = topq_risk_action(evidence_summary, row.get("basis_state") or "")
             elif topq_kind_normalized(kind) == "main_momentum_watch":
-                action = "短线拉盘观察，等待确认，不追高"
+                action = MAIN_MOMENTUM_DOWNGRADE_TEXT if momentum_downgraded else "短线拉盘观察，等待确认，不追高"
             elif direction == "看多":
                 if (
                     action.startswith("强烈建议关注买入")
@@ -4137,13 +4189,15 @@ class DerivativesMonitor:
                 if long_flow_score_value < 3 and action.startswith("强烈建议关注买入"):
                     action = "建议观察，等确认入场"
                 action = topq_action_short(action)
+            if discord_downgraded:
+                action = DISCORD_BULLISH_DOWNGRADE_TEXT
             short_flow = format_csv_compact_number(row.get("short_flow_score"), signed=False)
             mid_flow = format_csv_compact_number(row.get("mid_flow_score"), signed=False)
             long_flow = format_csv_compact_number(row.get("long_flow_score"), signed=False)
             direction_icon_text = "🔴" if direction == "看空" else "🟢" if direction == "看多" else "⚪"
             quality_score_value = parse_float(row.get("signal_quality_score")) or 0
             status = "重点" if conviction_score_value >= 80 else "观察"
-            if flow_label in TOPQ_WEAK_FLOW_LABELS:
+            if flow_label in TOPQ_WEAK_FLOW_LABELS or momentum_downgraded or discord_downgraded:
                 status = "观察"
             if risk_row and intent == "震荡分歧" and not (conviction_score_value >= 90 and quality_score_value >= 70):
                 status = "观察"
@@ -4164,10 +4218,12 @@ class DerivativesMonitor:
             )
             if main_momentum_observation:
                 conclusion = (
-                    "短线强，中线未确认"
-                    if flow_label in ("短强中弱", "中长线派发", "资金分歧")
+                    MAIN_MOMENTUM_TOPQ_TEXT
+                    if momentum_downgraded
                     else "短线拉盘，等确认"
                 )
+            elif discord_downgraded:
+                conclusion = "等待确认，不追高"
             else:
                 conclusion = topq_conclusion_text(
                     direction,
@@ -4338,8 +4394,9 @@ def main_momentum_watch_signal(snapshot: MarketSnapshot) -> Signal | None:
     if not reasons:
         return None
 
+    downgraded = main_momentum_hard_downgrade(snapshot)
     mid_unconfirmed = flow_1h < 0 or mid_flow <= 4 or flow_label in ("短强中弱", "中长线派发", "资金分歧")
-    conclusion = "短线强，中线未确认" if mid_unconfirmed else "短线拉盘观察"
+    conclusion = MAIN_MOMENTUM_DOWNGRADE_TEXT if downgraded else "短线强，中线未确认" if mid_unconfirmed else "短线拉盘观察"
     score = min(
         10,
         5
@@ -4585,10 +4642,16 @@ def discord_channel_for_pending_signal(pending: PendingTelegramSignalMerge) -> s
 
 def discord_signal_title(signal: Signal, priority: str) -> str:
     normalized_kind = str(signal.kind or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if normalized_kind in {"main_momentum_watch", "main_trend_watch"}:
+    if normalized_kind == "main_momentum_watch":
+        if signal.snapshot and main_momentum_hard_downgrade(signal.snapshot):
+            return "🟡 主流异动观察"
         return "🟡 主流异动雷达"
+    if normalized_kind == "main_trend_watch":
+        return "🟢 主流趋势雷达"
     if normalized_kind in {"main_risk_watch", "top_risk", "top_exhaustion", "distribution"} or is_risk_structure_kind(signal.kind):
         return "🔴 主流风险雷达"
+    if signal.snapshot and discord_bullish_display_downgrade(signal):
+        return "🟡 观察信号"
     if str(priority or "").strip().upper() in {"S", "A", "B"}:
         return "🟢 高把握信号"
     return signal_kind_label(signal.kind)
@@ -4608,6 +4671,8 @@ def discord_signal_content_title(signal: Signal, priority: str) -> str:
 def discord_signal_color(signal: Signal) -> int:
     if is_risk_structure_kind(signal.kind):
         return DISCORD_COLOR_RISK
+    if signal.snapshot and discord_bullish_display_downgrade(signal):
+        return DISCORD_COLOR_WATCH
     if signal_direction_label(signal.kind) == "看多":
         return DISCORD_COLOR_BULLISH
     return DISCORD_COLOR_WATCH
@@ -4646,6 +4711,8 @@ def discord_evidence_field(
     fallback: str,
 ) -> tuple[str, str, bool]:
     if signal.kind == "main_momentum_watch" and signal.snapshot:
+        if main_momentum_hard_downgrade(signal.snapshot):
+            return ("证据", MAIN_MOMENTUM_DOWNGRADE_TEXT, False)
         short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(signal.snapshot)
         if flow_label == "短强中弱":
             return ("证据", "短线异动，中线未确认", False)
@@ -4709,19 +4776,196 @@ def discord_signal_fields(
     ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
     ev_display = evidence_display_score(ev_direction, ev_items, ev_score)
     trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
+    display_downgraded = discord_bullish_display_downgrade(signal, ev_summary)
+    level_text = f"{priority} / 质量 {quality_score} / 把握 {conviction} {conviction_label}"
+    if display_downgraded:
+        level_text = f"{level_text}\n{DISCORD_BULLISH_DOWNGRADE_NOTE}"
+        action = DISCORD_BULLISH_DOWNGRADE_TEXT
+        action_reason = "Discord展示降级"
     fields = [
         ("币种", signal.symbol, True),
         ("方向", direction, True),
-        ("等级/把握", f"{priority} / 质量 {quality_score} / 把握 {conviction} {conviction_label}", True),
+        ("等级/把握", level_text, True),
         ("价格/OI", f"价格 {snapshot.close_price:.8g} | 涨跌 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}%", False),
         ("资金流", discord_flow_field_value(snapshot), False),
-        ("操作建议", f"{action}。{action_reason}", False),
     ]
     fields.append(discord_evidence_field(signal, ev_direction, ev_display, ev_summary, quality_reason or signal.message))
     risk_tip = discord_risk_tip_field(signal, trap_score, trap_label, trap_reason)
     if risk_tip:
         fields.append(risk_tip)
+    fields.append(("操作建议", f"{action}。{action_reason}", False))
     return fields[:8]
+
+
+def discord_signal_embed_v2(
+    signal: Signal,
+    priority: str,
+    quality_score: int,
+    quality_reason: str,
+    channel_key: str,
+) -> DiscordOutboundMessage:
+    normalized_kind = topq_kind_normalized(signal.kind)
+    if normalized_kind == "main_momentum_watch":
+        return discord_main_momentum_watch_embed_v2(signal, priority, quality_score, quality_reason, channel_key)
+    if normalized_kind in {"main_risk_watch", "top_risk", "top_exhaustion", "distribution"} or is_risk_structure_kind(signal.kind):
+        return discord_main_risk_watch_embed_v2(signal, priority, quality_score, quality_reason, channel_key)
+    return discord_realtime_signal_embed_v2(signal, priority, quality_score, quality_reason, channel_key)
+
+
+def discord_main_momentum_watch_embed_v2(
+    signal: Signal,
+    priority: str,
+    quality_score: int,
+    quality_reason: str,
+    channel_key: str,
+) -> DiscordOutboundMessage:
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=discord_signal_title(signal, priority),
+        color=DISCORD_COLOR_WATCH,
+        fields=discord_signal_fields(signal, priority, quality_score, quality_reason),
+        symbol=signal.symbol,
+        kind=signal.kind,
+    )
+
+
+def discord_main_risk_watch_embed_v2(
+    signal: Signal,
+    priority: str,
+    quality_score: int,
+    quality_reason: str,
+    channel_key: str,
+) -> DiscordOutboundMessage:
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=discord_signal_title(signal, priority),
+        color=DISCORD_COLOR_RISK,
+        fields=discord_signal_fields(signal, priority, quality_score, quality_reason),
+        symbol=signal.symbol,
+        kind=signal.kind,
+    )
+
+
+def discord_realtime_signal_embed_v2(
+    signal: Signal,
+    priority: str,
+    quality_score: int,
+    quality_reason: str,
+    channel_key: str,
+) -> DiscordOutboundMessage:
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=discord_signal_title(signal, priority),
+        color=discord_signal_color(signal),
+        fields=discord_signal_fields(signal, priority, quality_score, quality_reason),
+        symbol=signal.symbol,
+        kind=signal.kind,
+    )
+
+
+def discord_alt_watch_embed_v2(
+    items: list[DiscordAltWatchItem],
+    channel_key: str,
+    title: str = "山寨观察",
+) -> DiscordOutboundMessage:
+    fields: list[tuple[str, str, bool]] = []
+    for item in items[:10]:
+        fields.append(
+            (
+                item.symbol,
+                (
+                    f"{signal_kind_label(item.kind)} | 把握 {item.conviction_score} | 质量 {item.quality_score}\n"
+                    f"领先 {item.leading_score} | 证据 {item.evidence_score} | 风险 {item.trap_score}\n"
+                    f"价格 {format_percent_optional(item.price_change_percent)} | OI {format_percent_optional(item.oi_change_percent)} | {item.flow_label}\n"
+                    f"{item.reason}"
+                ),
+                False,
+            )
+        )
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=f"🟡 {title}",
+        color=DISCORD_COLOR_WATCH,
+        fields=fields or [("状态", "当前暂无山寨观察候选。", False)],
+        kind="alt_watch",
+    )
+
+
+def discord_chunk_fields(text: str, field_prefix: str = "内容", chunk_size: int = 800) -> list[tuple[str, str, bool]]:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        candidate = f"{current}\n{line}".strip() if current else line
+        if len(candidate) > chunk_size and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return [(f"{field_prefix}{index}", chunk, False) for index, chunk in enumerate(chunks[:6], start=1)]
+
+
+def discord_summary_embed_v2(title: str, message: str, channel_key: str = "summary") -> DiscordOutboundMessage:
+    text = discord_clean_summary_text(message, title=title, remove_title=True)
+    fields = discord_chunk_fields(text, "摘要")
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=title,
+        color=DISCORD_COLOR_SUMMARY,
+        fields=fields or [("状态", "当前暂无摘要缓存。", False)],
+        kind="summary",
+    )
+
+
+def discord_onchain_embed_v2(title: str, message: str, channel_key: str = "onchain") -> DiscordOutboundMessage:
+    text = discord_clean_summary_text(message, title=title, remove_title=True)
+    fields = discord_chunk_fields(text, "链上")
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=title,
+        color=DISCORD_COLOR_SUMMARY,
+        fields=fields or [("状态", "链上数据不足，等待缓存", False)],
+        kind="onchain",
+    )
+
+
+def discord_diagnosis_embed_v2(
+    symbol: str,
+    snapshot: MarketSnapshot,
+    signals: list[Signal],
+    liquidation_text: str | None,
+    coinglass_text: str | None,
+    response_parts: list[str],
+) -> DiscordOutboundMessage:
+    signal = signals[0] if signals else None
+    action, action_reason = action_label(snapshot, signal)
+    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
+    ev_display = evidence_display_score(ev_direction, ev_items, ev_score)
+    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
+    fields = [
+        ("币种/方向", f"{symbol} / {signal_direction_label(signal.kind if signal else '')}", True),
+        ("等级/把握", f"把握 {conviction_score(snapshot, signal)[0]}/100", True),
+        ("价格/OI", f"价格 {snapshot.close_price:.8g} | 涨跌 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}%", False),
+        ("资金流", discord_flow_field_value(snapshot), False),
+        ("证据", f"{ev_direction} {ev_display}分 - {ev_summary or '暂无明确证据'}", False),
+        ("风险", f"{trap_label} {trap_score}/10 - {trap_reason}\n{compact_coinglass_market_context(coinglass_text or 'CoinGlass聚合: n/a')}", False),
+        ("操作建议", f"{action}。{action_reason}", False),
+    ]
+    source = response_parts[0] if response_parts else ""
+    if source:
+        fields.append(("数据来源", source, False))
+    if liquidation_text:
+        fields.append(("强平", truncate_text(liquidation_text, 500), False))
+    return DiscordOutboundMessage(
+        channel_key="debug",
+        title=f"{symbol} 单币诊断",
+        color=DISCORD_COLOR_WATCH,
+        fields=fields[:8],
+        symbol=symbol,
+        kind="diagnosis",
+    )
 
 
 def discord_help_text() -> str:
@@ -4730,6 +4974,8 @@ def discord_help_text() -> str:
         "!摘要 - 返回缓存市场摘要，不触发全市场实时生成\n"
         "!候选 - 等同 /topq，把握候选排行\n"
         "!山寨 - 查看最近山寨观察队列 Top10\n"
+        "!链上 BTCUSDT - 单币链上/现货确认简报\n"
+        "!链上摘要 - BTC/ETH/SOL/BNB/DOGE 链上资金摘要\n"
         "!诊断 BTCUSDT - 单币诊断简版\n"
         "!质量 - 信号质量统计\n"
         "!静默 - 等同 /quiet status\n"
@@ -5355,6 +5601,67 @@ def extract_labeled_segment(text: str | None, start: str, end: str) -> str | Non
     if end_index >= 0:
         segment = segment[:end_index]
     return segment.strip()
+
+
+def format_onchain_brief(
+    snapshot: MarketSnapshot,
+    coinglass_text: str | None = None,
+    spot_text: str | None = None,
+    compact: bool = False,
+) -> str:
+    resolved_spot_text = spot_text if spot_text is not None else (
+        cached_spot_alpha_confirmation(snapshot.symbol) or spot_alpha_confirmation(snapshot.symbol)
+    )
+    spot_score, spot_label, spot_reason = spot_onchain_score_from_text(snapshot, None, resolved_spot_text)
+    div_label, div_score, div_reason = contract_spot_divergence_from_text(snapshot, None, resolved_spot_text)
+    cg_text = str(coinglass_text or "")
+    balance_text = extract_labeled_segment(cg_text, "交易所余额", "；") or "交易所余额: 1d n/a / 7d n/a / 30d n/a"
+    taker_24h = extract_labeled_segment(cg_text, "主动买卖 24h", "；")
+    taker_7d = extract_labeled_segment(cg_text, "CoinGlass主动买卖 7d", "；")
+    orderbook_text = extract_labeled_segment(cg_text, "CoinGlass订单簿: ", "\n")
+    conclusion = onchain_conclusion(snapshot, spot_score, div_score, cg_text)
+
+    if compact:
+        coinglass_parts = "；".join(part for part in (balance_text, taker_24h, taker_7d, orderbook_text) if part)
+        return (
+            f"{snapshot.symbol}: {balance_text} | 现货{spot_score}/10 {spot_label} | "
+            f"{div_label} | {coinglass_parts or 'CoinGlass: n/a'} | 结论: {conclusion}"
+        )
+
+    lines = [
+        f"币种: {snapshot.symbol}",
+        f"{balance_text}",
+        f"现货确认: {spot_score}/10 {spot_label} - {spot_reason}",
+        f"合约现货背离: {div_label} {div_score}/10 - {div_reason}",
+        f"CoinGlass主动买卖: {' / '.join(part for part in (taker_24h, taker_7d) if part) or 'n/a'}",
+        f"CoinGlass订单簿: {orderbook_text or 'n/a'}",
+        f"结论: {conclusion}",
+    ]
+    return "\n".join(lines)
+
+
+def onchain_conclusion(snapshot: MarketSnapshot, spot_score: int, divergence_score: int, coinglass_text: str | None) -> str:
+    balance_1d = extract_coinglass_balance_change(coinglass_text, "1d")
+    balance_7d = extract_coinglass_balance_change(coinglass_text, "7d")
+    balance_30d = extract_coinglass_balance_change(coinglass_text, "30d")
+    balances = [value for value in (balance_1d, balance_7d, balance_30d) if value is not None]
+    if any(value > 0 for value in balances):
+        return "交易所入金风险"
+    if divergence_score >= 3 and spot_score <= 5:
+        return "合约拉动但现货未确认"
+    if spot_score >= 7 or (balances and all(value <= 0 for value in balances)):
+        return "现货承接"
+    if snapshot.price_change_percent > 0 and snapshot.oi_change_percent > 0 and spot_score <= 5:
+        return "合约拉动但现货未确认"
+    return "数据不足"
+
+
+def onchain_brief_has_confirmation_data(text: str) -> bool:
+    if "交易所余额: 1d n/a / 7d n/a / 30d n/a" not in text:
+        return True
+    if "CoinGlass主动买卖" in text or "CoinGlass订单簿" in text or "近1h 买盘" in text:
+        return True
+    return "现货5/10 中性" not in text and "暂无明显现货/链上确认" not in text
 
 
 def spot_onchain_score(snapshot: MarketSnapshot | None, signal: Signal | None = None) -> tuple[int, str, str]:
@@ -7412,12 +7719,108 @@ PREMIUM_BASIS_STATES = {"明显溢价", "极端溢价"}
 BAD_LONG_ENTRY_LABELS = {"追高风险", "不宜追", "下跌中继"}
 TOPQ_BAD_LONG_EVIDENCE_KEYWORDS = ("高位拥挤", "出货", "派发", "禁止追多", "不追")
 TOPQ_RISK_EVIDENCE_KEYWORDS = ("高位拥挤", "出货", "派发", "追多风险", "多头过热", "顶部风险", "短线强，中线不支持", "中长线资金不支持")
-TOPQ_WEAK_FLOW_LABELS = {"短强中弱", "中长线派发"}
+TOPQ_WEAK_FLOW_LABELS = {"资金分歧", "短强中弱", "短弱中强", "中长线派发"}
+MAIN_MOMENTUM_DOWNGRADE_TEXT = "短线异动增强，等待中长周期确认，不追高"
+MAIN_MOMENTUM_TOPQ_TEXT = "短线异动，等确认"
+MAIN_MOMENTUM_DOWNGRADE_FLOW_KEYWORDS = ("资金分歧", "短强中弱", "短弱中强", "中长线派发")
+DISCORD_BULLISH_DOWNGRADE_TEXT = "短线信号较强，但中长周期未确认，等待回踩/放量确认，不追高"
+DISCORD_BULLISH_DOWNGRADE_NOTE = "展示降级：资金分歧，观察为主"
+DISCORD_BULLISH_DOWNGRADE_EVIDENCE_KEYWORDS = ("高位拥挤", "注意出货", "不宜追", "谨慎追")
 
 
 def text_has_any(text: str | None, keywords: tuple[str, ...]) -> bool:
     value = str(text or "")
     return any(keyword in value for keyword in keywords)
+
+
+def positive_flow_count(snapshot: MarketSnapshot, periods: tuple[str, ...]) -> int:
+    return sum(1 for period in periods if summary_flow_value(snapshot, period) > 0)
+
+
+def main_momentum_hard_downgrade(snapshot: MarketSnapshot) -> bool:
+    _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    return (
+        long_flow_alignment_score(snapshot) <= 3
+        or text_has_any(flow_label, MAIN_MOMENTUM_DOWNGRADE_FLOW_KEYWORDS)
+        or positive_flow_count(snapshot, ("4h", "12h", "72h")) < 2
+    )
+
+
+def main_momentum_strong_buy_allowed(snapshot: MarketSnapshot, signal: Signal | None = None) -> bool:
+    if signal is None or signal.kind != "main_momentum_watch":
+        return False
+    if main_momentum_hard_downgrade(snapshot):
+        return False
+    _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    leading = leading_signal_score(snapshot, signal)
+    ev_score, _ev_direction, _ev_summary, _ev_items = evidence_score(snapshot, signal)
+    return (
+        leading.leading_score >= 6
+        and ev_score >= 8
+        and long_flow_alignment_score(snapshot) >= 5
+        and summary_flow_value(snapshot, "15m") > 0
+        and summary_flow_value(snapshot, "1h") > 0
+        and not text_has_any(flow_label, MAIN_MOMENTUM_DOWNGRADE_FLOW_KEYWORDS)
+    )
+
+
+def discord_bullish_display_downgrade(signal: Signal, evidence_summary: str | None = None) -> bool:
+    snapshot = signal.snapshot
+    if snapshot is None:
+        return False
+    direction = signal_direction_label(signal.kind)
+    if direction != "看多" and not is_bullish_structure_kind(signal.kind):
+        return False
+    _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    summary = evidence_summary
+    if summary is None:
+        _ev_score, _ev_direction, summary, _ev_items = evidence_score(snapshot, signal)
+    return (
+        long_flow_alignment_score(snapshot) <= 3
+        or text_has_any(flow_label, MAIN_MOMENTUM_DOWNGRADE_FLOW_KEYWORDS)
+        or positive_flow_count(snapshot, ("4h", "12h", "24h", "72h")) < 2
+        or text_has_any(summary, DISCORD_BULLISH_DOWNGRADE_EVIDENCE_KEYWORDS)
+    )
+
+
+def topq_discord_bullish_display_downgrade(row: dict[str, str]) -> bool:
+    kind = topq_kind_normalized(row.get("kind"))
+    direction = signal_direction_label(kind)
+    if direction != "看多" and not topq_is_bullish_candidate(kind):
+        return False
+    flow_label = str(row.get("flow_trend_label") or "")
+    long_flow_alignment = parse_float(row.get("long_flow_alignment_score"))
+    if long_flow_alignment is None:
+        long_flow_alignment = parse_float(row.get("long_flow_score"))
+    positives = sum(
+        1
+        for key in ("net_flow_4h_usd", "net_flow_12h_usd", "net_flow_24h_usd", "net_flow_72h_usd")
+        if (parse_float(row.get(key)) or 0) > 0
+    )
+    evidence_summary = str(row.get("evidence_summary") or "")
+    return (
+        (long_flow_alignment is not None and long_flow_alignment <= 3)
+        or text_has_any(flow_label, MAIN_MOMENTUM_DOWNGRADE_FLOW_KEYWORDS)
+        or positives < 2
+        or text_has_any(evidence_summary, DISCORD_BULLISH_DOWNGRADE_EVIDENCE_KEYWORDS)
+    )
+
+
+def topq_main_momentum_hard_downgrade(row: dict[str, str]) -> bool:
+    flow_label = str(row.get("flow_trend_label") or "")
+    long_flow_alignment = parse_float(row.get("long_flow_alignment_score"))
+    if long_flow_alignment is None:
+        long_flow_alignment = parse_float(row.get("long_flow_score"))
+    positives = sum(
+        1
+        for key in ("net_flow_4h_usd", "net_flow_12h_usd", "net_flow_72h_usd")
+        if (parse_float(row.get(key)) or 0) > 0
+    )
+    return (
+        (long_flow_alignment is not None and long_flow_alignment <= 3)
+        or text_has_any(flow_label, MAIN_MOMENTUM_DOWNGRADE_FLOW_KEYWORDS)
+        or positives < 2
+    )
 
 
 def topq_kind_normalized(kind: str | None) -> str:
@@ -7447,10 +7850,16 @@ def topq_risk_action(evidence_summary: str, basis_label: str) -> str:
 def topq_strong_buy_allowed(row: dict[str, str], conviction: float, leading_score: float, evidence_score: float) -> bool:
     flow_label = str(row.get("flow_trend_label") or "")
     evidence_summary = str(row.get("evidence_summary") or "")
+    long_flow_alignment = parse_float(row.get("long_flow_alignment_score")) or 0
+    flow_15m = parse_float(row.get("net_flow_15m_usd")) or 0
+    flow_1h = parse_float(row.get("net_flow_1h_usd")) or 0
     return (
         conviction >= 80
         and leading_score >= 6
-        and evidence_score >= 5
+        and evidence_score >= 8
+        and long_flow_alignment >= 5
+        and flow_15m > 0
+        and flow_1h > 0
         and flow_label not in TOPQ_WEAK_FLOW_LABELS
         and not text_has_any(evidence_summary, ("高位拥挤", "出货", "派发"))
     )
@@ -7648,6 +8057,8 @@ def conviction_score(snapshot: MarketSnapshot, signal: Signal | None = None) -> 
         cap(64, "看空但不追空")
     if intent_label == "震荡分歧":
         cap(74 if risk_signal else 64, "震荡分歧")
+    if kind == "main_momentum_watch" and main_momentum_hard_downgrade(snapshot):
+        cap(69, MAIN_MOMENTUM_DOWNGRADE_TEXT)
 
     final_score = clamp_int(score, 0, 100)
     if not reasons:
@@ -7780,6 +8191,10 @@ def action_label(snapshot: MarketSnapshot, signal: Signal | None = None) -> tupl
     if is_telegram_risk_signal(signal):
         return risk_signal_action_label(conviction, intent_label, ev_summary, ev_display, basis_label)
     if signal and signal.kind == "main_momentum_watch":
+        if main_momentum_hard_downgrade(snapshot):
+            return MAIN_MOMENTUM_DOWNGRADE_TEXT, "主流异动雷达降级，等待中长周期确认"
+        if main_momentum_strong_buy_allowed(snapshot, signal) and conviction >= 80 and intent_label == "真启动观察":
+            return "强烈建议关注买入", "启动把握高"
         return "短线异动观察，等待确认，不追高", "主流异动雷达只做观察提醒"
     override, override_reason = structural_action_override(
         signal.kind if signal else None,
@@ -8964,6 +9379,8 @@ def panel_evidence_category_for_signal(item: EvidenceItem, risk_panel: bool) -> 
 
 
 def main_momentum_panel_conclusion(snapshot: MarketSnapshot) -> str:
+    if main_momentum_hard_downgrade(snapshot):
+        return MAIN_MOMENTUM_TOPQ_TEXT
     _short_flow, mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
     if summary_flow_value(snapshot, "1h") < 0 or mid_flow <= 4 or flow_label in ("短强中弱", "中长线派发", "资金分歧"):
         return "短线强，中线未确认"
