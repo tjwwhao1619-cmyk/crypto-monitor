@@ -14,6 +14,7 @@ import secrets
 import shutil
 import socket
 import ssl
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -41,6 +42,10 @@ COINGLASS_BASE_URL = "https://open-api-v4.coinglass.com"
 COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS = 2700
 TELEGRAM_SNAPSHOT_CACHE_TTL_SECONDS = 600
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+DEFILLAMA_STABLECOINS_URL = "https://stablecoins.llama.fi/stablecoins"
+DEFAULT_EXTERNAL_DATA_DB_PATH = "external_data.sqlite"
+DEFILLAMA_STABLECOIN_TTL_SECONDS = 2700
+DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS = 900
 FLOW_SHORT_PERIODS = ["5m", "15m", "1h"]
 FLOW_MID_PERIODS = ["4h", "12h", "24h"]
 FLOW_LONG_PERIODS = ["48h", "72h", "96h", "120h", "144h"]
@@ -146,6 +151,23 @@ class LeadingSignalScore:
 
 
 @dataclass(frozen=True)
+class MultiTimeframePriceAction:
+    score: int
+    label: str
+    direction: str
+    short_score: int
+    mid_score: int
+    long_score: int
+    short_label: str
+    mid_label: str
+    long_label: str
+    items: list[str]
+    risk_items: list[str]
+    patterns: list[str]
+    recommendation: str
+
+
+@dataclass(frozen=True)
 class TelegramSignalDigestItem:
     created_at: float
     symbol: str
@@ -159,6 +181,21 @@ class TelegramSignalDigestItem:
     price_change_percent: float | None
     oi_change_percent: float | None
     reason: str
+
+
+@dataclass(frozen=True)
+class DiscordSuppressedDigestItem:
+    timestamp: float
+    symbol: str
+    kind: str
+    priority: str
+    quality: int
+    conviction: int
+    reason: str
+    price_change: float | None
+    oi_change: float | None
+    flow_label: str
+    evidence_summary: str
 
 
 @dataclass
@@ -206,6 +243,33 @@ class DiscordAltWatchItem:
     flow_label: str
     reason: str
     sort_score: int
+
+
+@dataclass
+class DataSourceSpec:
+    name: str
+    category: str
+    is_real_onchain: bool
+    requires_api_key: bool
+    ttl_seconds: int
+    priority: int
+    enabled: bool
+    last_success: float | None = None
+    last_error: str = ""
+    confidence: str = "medium"
+
+
+@dataclass(frozen=True)
+class ExternalDataPoint:
+    source: str
+    symbol: str | None
+    asset: str | None
+    metric: str
+    value: float | str | None
+    timestamp: float
+    raw_json: dict[str, Any] | list[Any] | str | None
+    confidence: str
+    is_real_onchain: bool
 
 
 @dataclass(frozen=True)
@@ -392,6 +456,11 @@ class DerivativesMonitor:
         self.coinglass_api_key = os.getenv("COINGLASS_API_KEY", "").strip()
         self.coinglass_liquidation_cache: dict[str, tuple[float, dict[str, float]]] = {}
         self.coinglass_market_context_cache: dict[str, tuple[float, str]] = {}
+        self.external_data_db_path = str(config.get("external_data_db_path", DEFAULT_EXTERNAL_DATA_DB_PATH))
+        self.external_data_lock = threading.Lock()
+        self.data_sources = self.build_data_source_specs()
+        self.last_external_stablecoin_collect_at = 0.0
+        self.init_external_data_store()
         self.flow_metrics_cache: dict[tuple[str, str], tuple[float, float | None, float | None]] = {}
         self.flow_metrics_cache_lock = threading.Lock()
         self.telegram_signal_cooldowns: dict[str, tuple[float, int]] = {}
@@ -404,6 +473,11 @@ class DerivativesMonitor:
         self.discord_alt_watch_lock = threading.Lock()
         self.last_discord_alt_watch_digest_at = time.time()
         self.discord_alt_watch_symbol_sent_at: dict[str, float] = {}
+        self.discord_suppressed_digest_queue: list[DiscordSuppressedDigestItem] = []
+        self.discord_suppressed_digest_lock = threading.Lock()
+        self.discord_suppressed_digest_recent: deque[float] = deque(maxlen=1000)
+        self.last_discord_suppressed_digest_flush_at = time.time()
+        self.last_discord_suppressed_digest_sent_at = 0.0
         self.runtime_realtime_priorities_override: set[str] | None = None
         self.runtime_realtime_priorities_lock = threading.Lock()
         self.signal_quality_stats = {
@@ -417,6 +491,630 @@ class DerivativesMonitor:
         }
         self.signal_quality_stats_lock = threading.Lock()
 
+    def build_data_source_specs(self) -> dict[str, DataSourceSpec]:
+        coinglass_enabled = bool(os.getenv("COINGLASS_API_KEY", "").strip())
+        return {
+            "Binance futures": DataSourceSpec(
+                name="Binance futures",
+                category="derivatives",
+                is_real_onchain=False,
+                requires_api_key=bool(os.getenv(str(self.config.get("binance_api_key_env", "BINANCE_API_KEY")), "").strip()),
+                ttl_seconds=120,
+                priority=10,
+                enabled=True,
+                confidence="high",
+            ),
+            "Binance spot": DataSourceSpec(
+                name="Binance spot",
+                category="spot",
+                is_real_onchain=False,
+                requires_api_key=False,
+                ttl_seconds=180,
+                priority=20,
+                enabled=True,
+                confidence="high",
+            ),
+            "DexScreener": DataSourceSpec(
+                name="DexScreener",
+                category="dex",
+                is_real_onchain=False,
+                requires_api_key=False,
+                ttl_seconds=300,
+                priority=30,
+                enabled=True,
+                confidence="medium",
+            ),
+            "CoinGlass aggregation": DataSourceSpec(
+                name="CoinGlass aggregation",
+                category="external",
+                is_real_onchain=False,
+                requires_api_key=True,
+                ttl_seconds=COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS,
+                priority=40,
+                enabled=coinglass_enabled,
+                last_error="" if coinglass_enabled else "COINGLASS_API_KEY not configured",
+                confidence="medium",
+            ),
+            "DefiLlama stablecoin supply": DataSourceSpec(
+                name="DefiLlama stablecoin supply",
+                category="stablecoin",
+                is_real_onchain=False,
+                requires_api_key=False,
+                ttl_seconds=DEFILLAMA_STABLECOIN_TTL_SECONDS,
+                priority=50,
+                enabled=True,
+                last_error="稳定币供应聚合，不等同钱包流/交易所净流",
+                confidence="medium",
+            ),
+            "Derived spot/DEX confirmation": DataSourceSpec(
+                name="Derived spot/DEX confirmation",
+                category="external",
+                is_real_onchain=False,
+                requires_api_key=False,
+                ttl_seconds=180,
+                priority=60,
+                enabled=True,
+                confidence="low",
+            ),
+            "Whale Alert": DataSourceSpec("Whale Alert", "onchain", True, True, 3600, 80, False, last_error="adapter reserved", confidence="low"),
+            "Etherscan": DataSourceSpec("Etherscan", "onchain", True, True, 3600, 81, False, last_error="adapter reserved", confidence="low"),
+            "Tronscan": DataSourceSpec("Tronscan", "onchain", True, True, 3600, 82, False, last_error="adapter reserved", confidence="low"),
+            "Solscan": DataSourceSpec("Solscan", "onchain", True, True, 3600, 83, False, last_error="adapter reserved", confidence="low"),
+            "CryptoQuant": DataSourceSpec("CryptoQuant", "onchain", True, True, 3600, 84, False, last_error="adapter reserved", confidence="low"),
+            "Glassnode": DataSourceSpec("Glassnode", "onchain", True, True, 3600, 85, False, last_error="adapter reserved", confidence="low"),
+            "Arkham": DataSourceSpec("Arkham", "onchain", True, True, 3600, 86, False, last_error="adapter reserved", confidence="low"),
+            "Nansen": DataSourceSpec("Nansen", "onchain", True, True, 3600, 87, False, last_error="adapter reserved", confidence="low"),
+        }
+
+    def external_db_connection(self) -> sqlite3.Connection:
+        path = Path(self.external_data_db_path)
+        if path.parent != Path("."):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def init_external_data_store(self) -> None:
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS external_data_points (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        symbol TEXT,
+                        asset TEXT,
+                        metric TEXT NOT NULL,
+                        value TEXT,
+                        timestamp REAL NOT NULL,
+                        raw_json TEXT,
+                        confidence TEXT,
+                        is_real_onchain INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_external_data_source_time ON external_data_points(source, timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_external_data_symbol_metric ON external_data_points(symbol, metric, timestamp);
+                    CREATE TABLE IF NOT EXISTS source_health (
+                        source TEXT PRIMARY KEY,
+                        category TEXT,
+                        enabled INTEGER NOT NULL,
+                        is_real_onchain INTEGER NOT NULL DEFAULT 0,
+                        requires_api_key INTEGER NOT NULL DEFAULT 0,
+                        ttl_seconds INTEGER,
+                        priority INTEGER,
+                        confidence TEXT,
+                        last_success REAL,
+                        last_error TEXT,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS stablecoin_supply (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        asset TEXT NOT NULL,
+                        supply_usd REAL,
+                        supply_native REAL,
+                        timestamp REAL NOT NULL,
+                        raw_json TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_stablecoin_supply_asset_time ON stablecoin_supply(asset, timestamp);
+                    CREATE TABLE IF NOT EXISTS exchange_balances (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        asset TEXT NOT NULL,
+                        range_label TEXT,
+                        balance REAL,
+                        balance_usd REAL,
+                        change_value REAL,
+                        change_percent REAL,
+                        timestamp REAL NOT NULL,
+                        raw_json TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_exchange_balances_asset_time ON exchange_balances(asset, timestamp);
+                    CREATE TABLE IF NOT EXISTS whale_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        asset TEXT,
+                        value_usd REAL,
+                        from_label TEXT,
+                        to_label TEXT,
+                        timestamp REAL NOT NULL,
+                        raw_json TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS dex_market_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        symbol TEXT,
+                        asset TEXT,
+                        chain TEXT,
+                        dex TEXT,
+                        quote_symbol TEXT,
+                        price_change_1h REAL,
+                        price_change_24h REAL,
+                        volume_1h_usd REAL,
+                        volume_24h_usd REAL,
+                        liquidity_usd REAL,
+                        timestamp REAL NOT NULL,
+                        raw_json TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_dex_market_symbol_time ON dex_market_snapshots(symbol, timestamp);
+                    """
+                )
+        for spec in self.data_sources.values():
+            self.update_source_health(spec.name)
+
+    def update_source_health(self, source_name: str, success: bool | None = None, error: str | None = None) -> None:
+        spec = self.data_sources.get(source_name)
+        if not spec:
+            return
+        now = time.time()
+        if success is True:
+            spec.last_success = now
+            spec.last_error = ""
+        elif success is False:
+            spec.last_error = truncate_text(str(error or "unknown error"), 300)
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO source_health (
+                        source, category, enabled, is_real_onchain, requires_api_key, ttl_seconds,
+                        priority, confidence, last_success, last_error, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source) DO UPDATE SET
+                        category=excluded.category,
+                        enabled=excluded.enabled,
+                        is_real_onchain=excluded.is_real_onchain,
+                        requires_api_key=excluded.requires_api_key,
+                        ttl_seconds=excluded.ttl_seconds,
+                        priority=excluded.priority,
+                        confidence=excluded.confidence,
+                        last_success=excluded.last_success,
+                        last_error=excluded.last_error,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        spec.name,
+                        spec.category,
+                        int(spec.enabled),
+                        int(spec.is_real_onchain),
+                        int(spec.requires_api_key),
+                        spec.ttl_seconds,
+                        spec.priority,
+                        spec.confidence,
+                        spec.last_success,
+                        spec.last_error,
+                        now,
+                    ),
+                )
+
+    def write_external_data_points(self, points: list[ExternalDataPoint]) -> None:
+        if not points:
+            return
+        now = time.time()
+        rows = [
+            (
+                point.source,
+                point.symbol,
+                point.asset,
+                point.metric,
+                "" if point.value is None else str(point.value),
+                point.timestamp,
+                json.dumps(point.raw_json, ensure_ascii=False) if point.raw_json is not None else None,
+                point.confidence,
+                int(point.is_real_onchain),
+                now,
+            )
+            for point in points
+        ]
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO external_data_points (
+                        source, symbol, asset, metric, value, timestamp, raw_json,
+                        confidence, is_real_onchain, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+    def write_exchange_balance_rows(self, asset: str, balance_ranges: dict[str, Any], source: str = "CoinGlass aggregation") -> None:
+        if not balance_ranges:
+            return
+        now = time.time()
+        db_rows = []
+        points: list[ExternalDataPoint] = []
+        for range_label, balance in balance_ranges.items():
+            if not isinstance(balance, dict):
+                continue
+            raw_json = json.dumps(balance, ensure_ascii=False)
+            db_rows.append(
+                (
+                    source,
+                    asset,
+                    str(range_label),
+                    parse_float(balance.get("balance")),
+                    parse_float(balance.get("balance_usd")),
+                    parse_float(balance.get("change")),
+                    parse_float(balance.get("change_percent")),
+                    now,
+                    raw_json,
+                    now,
+                )
+            )
+            points.append(
+                ExternalDataPoint(
+                    source=source,
+                    symbol=None,
+                    asset=asset,
+                    metric=f"exchange_balance_change_percent_{range_label}",
+                    value=parse_float(balance.get("change_percent")),
+                    timestamp=now,
+                    raw_json=balance,
+                    confidence="medium",
+                    is_real_onchain=False,
+                )
+            )
+        if not db_rows:
+            return
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO exchange_balances (
+                        source, asset, range_label, balance, balance_usd, change_value,
+                        change_percent, timestamp, raw_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    db_rows,
+                )
+        self.write_external_data_points(points)
+
+    def persist_coinglass_market_context(self, symbol: str, context: dict[str, Any] | None) -> None:
+        if not context:
+            self.update_source_health("CoinGlass aggregation", False, "no usable context")
+            return
+        now = time.time()
+        base = str(context.get("base") or (symbol[:-4] if symbol.endswith("USDT") else symbol))
+        points: list[ExternalDataPoint] = []
+
+        def add(metric: str, value: Any, raw: Any) -> None:
+            points.append(
+                ExternalDataPoint(
+                    source="CoinGlass aggregation",
+                    symbol=symbol,
+                    asset=base,
+                    metric=metric,
+                    value=value,
+                    timestamp=now,
+                    raw_json=raw,
+                    confidence="medium",
+                    is_real_onchain=False,
+                )
+            )
+
+        oi = context.get("open_interest") if isinstance(context.get("open_interest"), dict) else {}
+        for key, value in oi.items():
+            add(f"open_interest_{key}", value, oi)
+        if "funding_oi_weight" in context:
+            add("funding_oi_weight", context.get("funding_oi_weight"), {"value": context.get("funding_oi_weight")})
+        taker = context.get("taker_flow") if isinstance(context.get("taker_flow"), dict) else {}
+        for key, value in taker.items():
+            add(f"taker_flow_{key}", value, taker)
+        orderbook = context.get("orderbook") if isinstance(context.get("orderbook"), dict) else {}
+        for key, value in orderbook.items():
+            add(f"orderbook_{key}", value, orderbook)
+        major_long = context.get("major_long") if isinstance(context.get("major_long"), dict) else {}
+        taker_ranges = major_long.get("taker_ranges") if isinstance(major_long.get("taker_ranges"), dict) else {}
+        for range_label, values in taker_ranges.items():
+            if isinstance(values, dict):
+                for key, value in values.items():
+                    add(f"taker_flow_{range_label}_{key}", value, values)
+        funding_ranges = (
+            major_long.get("funding_accumulated_ranges")
+            if isinstance(major_long.get("funding_accumulated_ranges"), dict)
+            else {}
+        )
+        for range_label, values in funding_ranges.items():
+            if isinstance(values, dict):
+                add(f"funding_accumulated_{range_label}", values.get("rate"), values)
+        balance_ranges = major_long.get("balance_ranges") if isinstance(major_long.get("balance_ranges"), dict) else {}
+        self.write_exchange_balance_rows(base, balance_ranges)
+        self.write_external_data_points(points)
+        self.update_source_health("CoinGlass aggregation", True)
+
+    def persist_dexscreener_cached_snapshot(self, symbol: str) -> None:
+        pair = _DEXSCREENER_PAIR_CACHE.get(str(symbol or "").upper())
+        if not isinstance(pair, dict):
+            return
+        now = time.time()
+        price_change = pair.get("priceChange") or {}
+        volume = pair.get("volume") or {}
+        liquidity = pair.get("liquidity") or {}
+        base_token = pair.get("baseToken") or {}
+        quote_token = pair.get("quoteToken") or {}
+        row = (
+            "DexScreener",
+            str(symbol or "").upper(),
+            str(base_token.get("symbol") or normalize_dex_symbol(symbol) or ""),
+            str(pair.get("chainId") or ""),
+            str(pair.get("dexId") or ""),
+            str(quote_token.get("symbol") or ""),
+            safe_float(price_change.get("h1")),
+            safe_float(price_change.get("h24")),
+            safe_float(volume.get("h1")),
+            safe_float(volume.get("h24")),
+            safe_float(liquidity.get("usd")),
+            now,
+            json.dumps(pair, ensure_ascii=False),
+            now,
+        )
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO dex_market_snapshots (
+                        source, symbol, asset, chain, dex, quote_symbol, price_change_1h,
+                        price_change_24h, volume_1h_usd, volume_24h_usd, liquidity_usd,
+                        timestamp, raw_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    row,
+                )
+        self.write_external_data_points(
+            [
+                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_price_change_1h", row[6], now, pair, "medium", False),
+                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_volume_24h_usd", row[9], now, pair, "medium", False),
+                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_liquidity_usd", row[10], now, pair, "medium", False),
+            ]
+        )
+        self.update_source_health("DexScreener", True)
+
+    def collect_defillama_stablecoin_supply_if_due(self, force: bool = False) -> None:
+        now = time.time()
+        spec = self.data_sources.get("DefiLlama stablecoin supply")
+        if not spec or not spec.enabled:
+            return
+        if not force and now - self.last_external_stablecoin_collect_at < spec.ttl_seconds:
+            return
+        self.last_external_stablecoin_collect_at = now
+        try:
+            response = self.session.get(DEFILLAMA_STABLECOINS_URL, params={"includePrices": "true"}, timeout=12)
+            response.raise_for_status()
+            payload = response.json()
+            assets = payload.get("peggedAssets") if isinstance(payload, dict) else None
+            if not isinstance(assets, list):
+                self.update_source_health(spec.name, False, "unexpected DefiLlama response")
+                return
+            rows = []
+            points: list[ExternalDataPoint] = []
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    continue
+                symbol = str(asset.get("symbol") or "").upper()
+                if symbol not in {"USDT", "USDC"}:
+                    continue
+                circulating = asset.get("circulating") if isinstance(asset.get("circulating"), dict) else {}
+                supply_usd = parse_float(circulating.get("peggedUSD")) or parse_float(asset.get("circulatingUSD"))
+                supply_native = parse_float(circulating.get("peggedUSD"))
+                raw_json = json.dumps(asset, ensure_ascii=False)
+                rows.append((spec.name, symbol, supply_usd, supply_native, now, raw_json, now))
+                points.append(
+                    ExternalDataPoint(
+                        source=spec.name,
+                        symbol=None,
+                        asset=symbol,
+                        metric="stablecoin_supply_usd",
+                        value=supply_usd,
+                        timestamp=now,
+                        raw_json=asset,
+                        confidence=spec.confidence,
+                        is_real_onchain=False,
+                    )
+                )
+            if not rows:
+                self.update_source_health(spec.name, False, "USDT/USDC not found")
+                return
+            with self.external_data_lock:
+                with self.external_db_connection() as conn:
+                    conn.executemany(
+                        """
+                        INSERT INTO stablecoin_supply (
+                            source, asset, supply_usd, supply_native, timestamp, raw_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows,
+                    )
+            self.write_external_data_points(points)
+            self.update_source_health(spec.name, True)
+        except Exception as exc:
+            logging.debug("DefiLlama stablecoin supply fetch failed", exc_info=True)
+            self.update_source_health(spec.name, False, f"{type(exc).__name__}: {exc}")
+
+    def collect_external_data_if_due(self) -> None:
+        self.collect_defillama_stablecoin_supply_if_due()
+
+    def persist_external_confirmation_metrics(
+        self,
+        snapshot: MarketSnapshot,
+        signal: Signal | None = None,
+        spot_text: str | None = None,
+        coinglass_text: str | None = None,
+    ) -> None:
+        resolved_spot_text = spot_text if spot_text is not None else cached_spot_alpha_confirmation(snapshot.symbol)
+        spot_score, spot_label, spot_reason = spot_onchain_score_from_text(snapshot, signal, resolved_spot_text)
+        div_label, div_score, div_reason = contract_spot_divergence_from_text(snapshot, signal, resolved_spot_text)
+        major_score, major_label, major_reason = major_flow_score_from_text(snapshot, signal, coinglass_text)
+        now = time.time()
+        self.write_external_data_points(
+            [
+                ExternalDataPoint(
+                    "Derived spot/DEX confirmation",
+                    snapshot.symbol,
+                    snapshot.symbol[:-4] if snapshot.symbol.endswith("USDT") else snapshot.symbol,
+                    "spot_external_score",
+                    spot_score,
+                    now,
+                    {"label": spot_label, "reason": spot_reason, "source_text": resolved_spot_text},
+                    "low",
+                    False,
+                ),
+                ExternalDataPoint(
+                    "Derived spot/DEX confirmation",
+                    snapshot.symbol,
+                    snapshot.symbol[:-4] if snapshot.symbol.endswith("USDT") else snapshot.symbol,
+                    "contract_spot_divergence_score",
+                    div_score,
+                    now,
+                    {"label": div_label, "reason": div_reason},
+                    "low",
+                    False,
+                ),
+                ExternalDataPoint(
+                    "Derived spot/DEX confirmation",
+                    snapshot.symbol,
+                    snapshot.symbol[:-4] if snapshot.symbol.endswith("USDT") else snapshot.symbol,
+                    "major_external_flow_score",
+                    major_score,
+                    now,
+                    {"label": major_label, "reason": major_reason},
+                    "low",
+                    False,
+                ),
+            ]
+        )
+        self.update_source_health("Derived spot/DEX confirmation", True)
+
+    def external_source_recent_counts(self, since_seconds: int = 86400) -> dict[str, int]:
+        cutoff = time.time() - since_seconds
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    "SELECT source, COUNT(*) FROM external_data_points WHERE timestamp >= ? GROUP BY source",
+                    (cutoff,),
+                ).fetchall()
+        return {str(source): int(count) for source, count in rows}
+
+    def format_external_source_health(self, only_available: bool = False) -> str:
+        self.collect_defillama_stablecoin_supply_if_due()
+        counts = self.external_source_recent_counts()
+        lines = [
+            "数据源健康检查",
+            "说明: 现阶段不把外部数据接入交易信号加减分；真实链上=是仅代表钱包/交易级链上事件。",
+        ]
+        for spec in sorted(self.data_sources.values(), key=lambda item: item.priority):
+            count = counts.get(spec.name, 0)
+            if only_available and not (spec.enabled and (spec.last_success or count > 0)):
+                continue
+            success_text = format_ts_short(spec.last_success) if spec.last_success else "-"
+            error_text = spec.last_error or "-"
+            lines.append(
+                f"- {spec.name} | {spec.category} | enabled={yes_no(spec.enabled)} | "
+                f"真实链上={yes_no(spec.is_real_onchain)} | key={yes_no(spec.requires_api_key)} | "
+                f"confidence={spec.confidence} | last_success={success_text} | "
+                f"last_error={truncate_text(error_text, 80)} | 24h数据={count}"
+            )
+            if spec.name == "DefiLlama stablecoin supply":
+                lines.append("  说明: 稳定币供应聚合，不等同钱包流/交易所净流")
+        if len(lines) <= 2:
+            lines.append("当前没有确认可用的外部资金数据源。")
+        return "\n".join(lines)
+
+    def format_stablecoin_external_funds(self, asset: str) -> str:
+        normalized = str(asset or "").strip().upper()
+        if normalized not in {"USDT", "USDC"}:
+            return "暂无该资产外部资金数据"
+        self.collect_defillama_stablecoin_supply_if_due()
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT supply_usd, supply_native, timestamp, raw_json
+                    FROM stablecoin_supply
+                    WHERE asset = ?
+                    ORDER BY timestamp DESC
+                    LIMIT 200
+                    """,
+                    (normalized,),
+                ).fetchall()
+        if not rows:
+            return (
+                f"资产: {normalized}\n"
+                "数据源: DefiLlama 稳定币供应聚合，不代表交易所买盘或钱包净流\n"
+                "稳定币供应数据暂不可用\n"
+                "结论: 稳定币供应变化仅代表潜在流动性，不等同交易所买盘"
+            )
+        latest_supply, latest_native, latest_ts, _raw = rows[0]
+        changes = stablecoin_supply_changes(rows)
+        lines = [
+            f"资产: {normalized}",
+            "数据源: DefiLlama 稳定币供应聚合，不代表交易所买盘或钱包净流",
+            f"当前供应/市值: {format_usd(parse_float(latest_supply))}",
+        ]
+        native_value = parse_float(latest_native)
+        if native_value is not None and native_value != parse_float(latest_supply):
+            lines.append(f"当前供应: {format_optional_value(native_value)}")
+        lines.append(f"更新时间: {format_ts_short(parse_float(latest_ts))}")
+        lines.append(
+            "变化: "
+            f"24h {format_percent_optional(changes.get('24h'))} / "
+            f"7d {format_percent_optional(changes.get('7d'))} / "
+            f"30d {format_percent_optional(changes.get('30d'))}"
+        )
+        lines.append("结论: 稳定币供应变化仅代表潜在流动性，不等同交易所买盘")
+        return "\n".join(lines)
+
+    def discord_external_funds_command_response(self, target: str) -> DiscordOutboundMessage:
+        normalized = str(target or "").strip().upper()
+        try:
+            if normalized in {"USDT", "USDC"}:
+                return discord_onchain_embed_v2(
+                    f"{normalized} 外部资金确认",
+                    self.format_stablecoin_external_funds(normalized),
+                    "onchain",
+                )
+            symbol = normalize_usdt_symbol(normalized)
+            if symbol in {"USDT", "USDC"} or not is_valid_binance_usdt_symbol(symbol):
+                return discord_onchain_embed_v2("外部资金确认", "暂无该资产外部资金数据", "onchain")
+            snapshot, data_source_text, degradation_text = self.telegram_command_snapshot(symbol)
+            coinglass_text = self.format_coinglass_market_context(symbol)
+            spot_text = cached_spot_alpha_confirmation(symbol) or spot_alpha_confirmation(symbol)
+            self.persist_dexscreener_cached_snapshot(symbol)
+            self.persist_external_confirmation_metrics(snapshot, None, spot_text, coinglass_text)
+            response_parts = [data_source_text]
+            if degradation_text:
+                response_parts.append(degradation_text)
+            response_parts.append(format_onchain_brief(snapshot, coinglass_text, spot_text))
+            return discord_onchain_embed_v2(f"{symbol} 外部资金确认", "\n".join(response_parts), "onchain")
+        except Exception:
+            logging.exception("Discord external funds command failed: target=%s", normalized)
+            return discord_onchain_embed_v2("外部资金确认", "暂无该资产外部资金数据", "onchain")
+
+
     def run_forever(self) -> None:
         self.start_liquidation_stream_worker()
         self.start_telegram_command_worker()
@@ -429,11 +1127,13 @@ class DerivativesMonitor:
             try:
                 self.refresh_symbols_if_due()
                 self.run_cycle()
+                self.collect_external_data_if_due()
                 self.flush_pending_telegram_signals()
                 self.send_summary_if_due()
                 self.send_onchain_summary_if_due()
                 self.flush_telegram_signal_digest_if_due()
                 self.flush_discord_alt_watch_digest_if_due()
+                self.flush_discord_suppressed_digest_if_due()
             except Exception:
                 logging.exception("Derivatives monitor cycle failed")
 
@@ -447,6 +1147,7 @@ class DerivativesMonitor:
                 try:
                     self.flush_pending_telegram_signals()
                     self.flush_discord_alt_watch_digest_if_due()
+                    self.flush_discord_suppressed_digest_if_due()
                 except Exception:
                     logging.exception("Failed to flush pending Telegram signals")
 
@@ -902,7 +1603,9 @@ class DerivativesMonitor:
             text = "CoinGlass聚合: n/a"
             if is_major_asset_tier(symbol):
                 text = f"{text}\nCoinGlass订单簿: n/a"
+            self.update_source_health("CoinGlass aggregation", False, "context n/a")
         else:
+            self.persist_coinglass_market_context(symbol, context)
             text = format_coinglass_market_context_text(context)
         self.coinglass_market_context_cache[cache_key] = (now, text)
         _COINGLASS_TEXT_CACHE[symbol] = (now, text)
@@ -1985,6 +2688,7 @@ class DerivativesMonitor:
             suppressed, suppressed_reason = self.telegram_signal_suppression(signal, priority, quality_score)
             self.update_signal_quality_stats(signal, priority, suppressed)
             if suppressed:
+                conviction, _action_text, reason_context = self.telegram_realtime_filter_inputs(signal, signal.snapshot)
                 logging.info(
                     "Realtime signal suppressed: %s %s priority=%s quality=%s reason=%s",
                     signal.symbol,
@@ -1992,6 +2696,14 @@ class DerivativesMonitor:
                     priority,
                     quality_score,
                     suppressed_reason or quality_reason,
+                )
+                self.enqueue_discord_suppressed_digest(
+                    signal,
+                    priority,
+                    quality_score,
+                    int(conviction),
+                    suppressed_reason or quality_reason,
+                    reason_context,
                 )
                 delivery, _delivery_reason = self.telegram_signal_delivery(signal)
                 if (
@@ -2407,6 +3119,15 @@ class DerivativesMonitor:
                             "Telegram signal suppressed: %s main_momentum_watch reason=weak momentum",
                             signal.symbol,
                         )
+                    conviction, _action_text, reason_context = self.telegram_realtime_filter_inputs(signal, signal.snapshot)
+                    self.enqueue_discord_suppressed_digest(
+                        signal,
+                        priority,
+                        quality_score,
+                        int(conviction),
+                        reason,
+                        reason_context,
+                    )
                     self.enqueue_discord_alt_watch_signal(signal, priority, quality_score, quality_reason)
                     suppressed_rows.append((signal, priority, quality_score, reason))
 
@@ -2510,6 +3231,50 @@ class DerivativesMonitor:
         with self.telegram_signal_digest_lock:
             self.telegram_signal_digest_queue.append(item)
 
+    def enqueue_discord_suppressed_digest(
+        self,
+        signal: Signal,
+        priority: str,
+        quality_score: int,
+        conviction: int,
+        reason: str,
+        reason_context: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.discord_config.enabled or not self.discord_config.bot_token:
+            return
+        snapshot = signal.snapshot
+        symbol = str(signal.symbol or "").strip().upper()
+        if not snapshot or not is_valid_binance_usdt_symbol(symbol):
+            return
+        _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+        evidence_summary = ""
+        if reason_context:
+            evidence_summary = str(reason_context.get("evidence_summary") or reason_context.get("summary") or "")
+        if not evidence_summary:
+            _ev_score, _ev_direction, evidence_summary, _ev_items = evidence_score(snapshot, signal)
+        item = DiscordSuppressedDigestItem(
+            timestamp=time.time(),
+            symbol=symbol,
+            kind=signal.kind,
+            priority=str(priority or "-").upper(),
+            quality=int(quality_score or 0),
+            conviction=int(conviction or 0),
+            reason=str(reason or "-"),
+            price_change=snapshot.price_change_percent,
+            oi_change=snapshot.oi_change_percent,
+            flow_label=flow_label,
+            evidence_summary=truncate_text(evidence_summary, 120),
+        )
+        with self.discord_suppressed_digest_lock:
+            self.discord_suppressed_digest_queue.append(item)
+            self.discord_suppressed_digest_recent.append(item.timestamp)
+        logging.info(
+            "Discord suppressed digest queued: %s kind=%s reason=%s",
+            item.symbol,
+            item.kind,
+            item.reason,
+        )
+
     def enqueue_discord_alt_watch_signal(
         self,
         signal: Signal,
@@ -2575,17 +3340,18 @@ class DerivativesMonitor:
     def format_discord_alt_watch_digest(self, items: list[DiscordAltWatchItem]) -> str:
         lines: list[str] = []
         for item in items:
+            price_action = cached_multi_timeframe_price_action(item.symbol)
             lines.append(
                 (
-                    f"{item.symbol} {signal_kind_label(item.kind)} | 把握{item.conviction_score} | "
-                    f"质量{item.quality_score} | 领先{item.leading_score} | 证据{item.evidence_score}"
+                    f"{item.symbol} {signal_kind_label(item.kind)} | 把握{item.conviction_score} 质量{item.quality_score} | "
+                    f"领先{item.leading_score} 证据{item.evidence_score} 风险{item.trap_score}"
                 )
             )
             lines.append(
                 (
-                    f"涨跌{format_percent_optional(item.price_change_percent)} / "
-                    f"OI{format_percent_optional(item.oi_change_percent)} / "
-                    f"{item.flow_label} / {item.reason}"
+                    f"价格 {format_percent_optional(item.price_change_percent)} | "
+                    f"OI {format_percent_optional(item.oi_change_percent)} | {item.flow_label} | "
+                    f"{alt_watch_price_action_line(price_action)} | 结论：{item.reason}"
                 )
             )
         return "\n".join(lines) or "暂无山寨观察候选。"
@@ -2653,7 +3419,7 @@ class DerivativesMonitor:
         items = self.merged_discord_alt_watch_top(10)
         if not items:
             return "当前暂无山寨观察候选。"
-        return discord_alt_watch_embed_v2(items, self.discord_alt_watch_channel_key(), "山寨观察")
+        return discord_alt_watch_embed_v2(items, self.discord_alt_watch_channel_key(), "山寨观察", self.latest_snapshots)
 
     def flush_discord_alt_watch_digest_if_due(self, now: float | None = None) -> None:
         if not self.discord_config.enabled or not self.discord_config.bot_token:
@@ -2680,9 +3446,28 @@ class DerivativesMonitor:
             for item in selected:
                 self.discord_alt_watch_symbol_sent_at[item.symbol] = current_time
         self.enqueue_discord_message(
-            discord_alt_watch_embed_v2(selected, self.discord_alt_watch_channel_key(), "山寨观察摘要")
+            discord_alt_watch_embed_v2(selected, self.discord_alt_watch_channel_key(), "山寨观察摘要", self.latest_snapshots)
         )
         logging.info("Discord alt watch digest sent: count=%s", len(selected))
+
+    def flush_discord_suppressed_digest_if_due(self, now: float | None = None) -> None:
+        current_time = time.time() if now is None else now
+        if current_time - self.last_discord_suppressed_digest_flush_at < DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS:
+            return
+        self.last_discord_suppressed_digest_flush_at = current_time
+        with self.discord_suppressed_digest_lock:
+            items = self.discord_suppressed_digest_queue
+            self.discord_suppressed_digest_queue = []
+        if not items:
+            logging.info("Discord suppressed digest flush skipped: empty")
+            return
+        channel_key = "digest" if self.discord_config.channel_ids.get("digest") else "main"
+        try:
+            self.enqueue_discord_message(discord_suppressed_digest_embed_v2(items, channel_key))
+            self.last_discord_suppressed_digest_sent_at = current_time
+            logging.info("Discord suppressed digest sent: count=%s channel=%s", len(items), channel_key)
+        except Exception:
+            logging.exception("Discord suppressed digest send failed: count=%s channel=%s", len(items), channel_key)
 
     def flush_telegram_signal_digest_if_due(self) -> None:
         _realtime_priorities, digest_priorities, digest_interval_minutes, digest_max_per_priority = (
@@ -2800,7 +3585,7 @@ class DerivativesMonitor:
         self.last_onchain_summary_hour_key = hour_key
         self.save_state()
         self.enqueue_discord_message(
-            discord_onchain_embed_v2("链上资金摘要", message, "onchain")
+            discord_onchain_embed_v2("外部资金确认摘要", message, "onchain")
         )
 
     def format_onchain_summary_from_cache(self) -> str:
@@ -2815,8 +3600,8 @@ class DerivativesMonitor:
             if onchain_brief_has_confirmation_data(line):
                 lines.append(line)
         if not lines:
-            return "链上数据不足，等待缓存"
-        return "链上资金摘要\n" + "\n".join(lines)
+            return "数据不足，等待外部资金缓存"
+        return "外部资金确认摘要\n" + "\n".join(lines)
 
     def refresh_market_summary_cache_from_latest(self, source: str = "scan") -> str:
         if not self.latest_snapshots:
@@ -2897,14 +3682,18 @@ class DerivativesMonitor:
             return channel
 
         def build_embed(item: DiscordOutboundMessage) -> Any:
-            description = discord_embed_description_text(item)
+            description = discord_external_data_text(discord_embed_description_text(item))
             embed = discord.Embed(
-                title=item.title or "Crypto Monitor",
+                title=discord_external_data_text(item.title or "Crypto Monitor"),
                 description=truncate_text(description, 900) if description else None,
                 color=item.color if item.color is not None else DISCORD_COLOR_WATCH,
             )
             for name, value, inline in item.fields or []:
-                embed.add_field(name=name, value=truncate_text(str(value), 1024) or "-", inline=inline)
+                embed.add_field(
+                    name=discord_external_data_text(name),
+                    value=truncate_text(discord_external_data_text(str(value)), 900) or "-",
+                    inline=inline,
+                )
             return embed
 
         async def send_discord_payload(channel: Any, payload: str | DiscordOutboundMessage) -> None:
@@ -2912,7 +3701,7 @@ class DerivativesMonitor:
                 await channel.send(embed=build_embed(payload))
                 logging.info("Discord sent: channel=command title=%s", payload.title or payload.kind or payload.symbol or "-")
                 return
-            await channel.send(truncate_text(str(payload or ""), 1900))
+            await channel.send(truncate_text(discord_external_data_text(str(payload or "")), 1900))
 
         async def send_outbound(item: DiscordOutboundMessage) -> None:
             try:
@@ -2927,7 +3716,7 @@ class DerivativesMonitor:
                         item.title or item.kind or item.symbol or "-",
                     )
                     return
-                await channel.send(truncate_text(item.content or "", 1900))
+                await channel.send(truncate_text(discord_external_data_text(item.content or ""), 1900))
                 logging.info("Discord sent: channel=%s title=%s", item.channel_key, item.title or item.kind or item.symbol or "-")
             except Exception:
                 logging.exception(
@@ -2945,7 +3734,7 @@ class DerivativesMonitor:
                 ("summary", "市场摘要频道", "测试 市场摘要"),
                 ("digest", "静默摘要频道", "测试 静默摘要"),
                 ("debug", "机器人调试频道", "测试 调试"),
-                ("onchain", "链上资金频道", "测试 链上资金"),
+                ("onchain", "外部资金频道", "测试 外部资金确认"),
             ]
             failures: list[str] = []
             for channel_key, label, test_text in test_targets:
@@ -3062,23 +3851,19 @@ class DerivativesMonitor:
                 return discord_summary_embed_v2("市场摘要", summary_text, "summary")
             return "当前暂无市场摘要缓存，请等待下一轮扫描完成后重试。"
         if command == "!候选":
-            return discord_summary_embed_v2("把握候选TOP10", self.format_topq_response(discord_view=True), "digest")
+            return discord_topq_embed_v2(self.format_topq_response(discord_view=True), "digest")
         if command == "!山寨":
             return self.discord_alt_watch_command_response()
-        if command == "!链上摘要":
-            return discord_onchain_embed_v2("链上资金摘要", self.format_onchain_summary_from_cache(), "onchain")
-        if command == "!链上":
+        if command == "!数据源":
+            return discord_summary_embed_v2("数据源健康检查", self.format_external_source_health(), "debug")
+        if command == "!外部资金来源":
+            return discord_onchain_embed_v2("外部资金来源", self.format_external_source_health(only_available=True), "onchain")
+        if command in ("!链上摘要", "!外部资金摘要"):
+            return discord_onchain_embed_v2("外部资金确认摘要", self.format_onchain_summary_from_cache(), "onchain")
+        if command in ("!链上", "!链上资金", "!外部资金"):
             if len(parts) < 2:
-                return "用法: !链上 BTCUSDT"
-            symbol = normalize_usdt_symbol(parts[1])
-            snapshot, data_source_text, degradation_text = self.telegram_command_snapshot(symbol)
-            coinglass_text = self.format_coinglass_market_context(symbol)
-            spot_text = cached_spot_alpha_confirmation(symbol) or spot_alpha_confirmation(symbol)
-            response_parts = [data_source_text]
-            if degradation_text:
-                response_parts.append(degradation_text)
-            response_parts.append(format_onchain_brief(snapshot, coinglass_text, spot_text))
-            return discord_onchain_embed_v2(f"{symbol} 链上确认", "\n".join(response_parts), "onchain")
+                return discord_onchain_embed_v2("外部资金确认摘要", self.format_onchain_summary_from_cache(), "onchain")
+            return self.discord_external_funds_command_response(parts[1])
         if command == "!质量":
             return discord_summary_embed_v2("信号质量统计", self.format_signal_quality_stats(), "debug")
         if command == "!静默":
@@ -3365,6 +4150,13 @@ class DerivativesMonitor:
         )
         _current_realtime, override_enabled = self.runtime_realtime_priorities_status()
         realtime_threshold, watch_threshold, risk_realtime_threshold = self.telegram_conviction_thresholds()
+        with self.discord_suppressed_digest_lock:
+            suppressed_pending = len(self.discord_suppressed_digest_queue)
+            cutoff = time.time() - DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS
+            recent_suppressed = sum(1 for timestamp in self.discord_suppressed_digest_recent if timestamp >= cutoff)
+        with self.discord_alt_watch_lock:
+            alt_watch_pending = len(self.discord_alt_watch_queue)
+        digest_channel_configured = bool(self.discord_config.channel_ids.get("digest"))
         return "\n".join(
             [
                 "Telegram 临时静音等级",
@@ -3374,6 +4166,14 @@ class DerivativesMonitor:
                 f"摘要把握阈值: {watch_threshold}",
                 f"风控实时阈值: {risk_realtime_threshold}",
                 f"override: {'on' if override_enabled else 'off'}",
+                "",
+                "Discord 静默摘要",
+                f"digest channel id configured: {'yes' if digest_channel_configured else 'no'}",
+                f"suppressed digest pending: {suppressed_pending}",
+                f"last suppressed digest sent: {format_ts_short(self.last_discord_suppressed_digest_sent_at)}",
+                f"interval seconds: {DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS}",
+                f"recent suppressed count: {recent_suppressed}",
+                f"alt_watch pending: {alt_watch_pending}",
             ]
         )
 
@@ -4160,6 +4960,14 @@ class DerivativesMonitor:
             risk_row = topq_is_risk_candidate(kind)
             momentum_downgraded = topq_kind_normalized(kind) == "main_momentum_watch" and topq_main_momentum_hard_downgrade(row)
             discord_downgraded = discord_view and topq_discord_bullish_display_downgrade(row)
+            price_action = safe_multi_timeframe_price_action(row.get("symbol") or "", log_result=True) if discord_view else None
+            price_action_downgraded = discord_view and price_action_discord_downgrade(price_action)
+            price_action_blocks_high_buy = (
+                discord_view
+                and direction == "看多"
+                and not price_action_allows_discord_high_buy(price_action)
+            )
+            discord_downgraded = discord_downgraded or price_action_downgraded or price_action_blocks_high_buy
             position_label = row.get("position_behavior_label") or ""
             action, _action_reason = structural_action_override(
                 kind,
@@ -4216,14 +5024,37 @@ class DerivativesMonitor:
                 topq_kind_normalized(kind) == "main_momentum_watch"
                 or kind_label == "主流异动观察"
             )
+            evidence_direction = discord_infer_evidence_direction(
+                evidence_summary,
+                str(row.get("evidence_direction") or direction),
+            )
+            conflict_summary = ""
+            if discord_view:
+                conflict_summary = discord_conflict_aware_summary(
+                    kind,
+                    direction,
+                    evidence_direction,
+                    int(evidence_score_value or 0),
+                    evidence_summary,
+                    str(row.get("leading_direction") or ""),
+                    flow_label,
+                    int(parse_float(row.get("trap_risk_score")) or 0),
+                    price_action,
+                )
             if main_momentum_observation:
                 conclusion = (
                     MAIN_MOMENTUM_TOPQ_TEXT
                     if momentum_downgraded
                     else "短线拉盘，等确认"
                 )
+                if discord_view and discord_summary_is_conflict_override(conflict_summary, evidence_summary):
+                    conclusion = conflict_summary
             elif discord_downgraded:
                 conclusion = "等待确认，不追高"
+                if price_action:
+                    conclusion = f"K线{price_action.score}/10 {price_action.label}"
+                if discord_view and discord_summary_is_conflict_override(conflict_summary, evidence_summary):
+                    conclusion = conflict_summary
             else:
                 conclusion = topq_conclusion_text(
                     direction,
@@ -4232,12 +5063,17 @@ class DerivativesMonitor:
                     intent,
                     flow_label,
                 )
+                if discord_view and discord_summary_is_conflict_override(conflict_summary, evidence_summary):
+                    conclusion = conflict_summary
             lines.append(
                 f"{index}. {status_icon}{status} {direction_icon_text} {symbol} {kind_label} | "
                 f"把握{conviction_score_value:.0f} {leading_part}"
             )
+            kline_part = ""
+            if discord_view and price_action:
+                kline_part = f" | K线 短{price_action.short_score} 中{price_action.mid_score} 长{price_action.long_score} {price_action.label}"
             lines.append(
-                f"   {price_change}% OI{oi_change}% | 短{short_flow} 中{mid_flow} 长{long_flow} | {conclusion}"
+                f"   {price_change}% OI{oi_change}% | 短{short_flow} 中{mid_flow} 长{long_flow}{kline_part} | {conclusion}"
             )
         return "\n".join(lines)
 
@@ -4478,6 +5314,452 @@ def price_change_periods_from_klines(klines: list[Any], interval: str) -> dict[s
     return result
 
 
+def price_action_cache_ttl(interval: str) -> int:
+    if interval in {"5m", "15m"}:
+        return 180
+    if interval in {"1h", "4h"}:
+        return 600
+    return 3600
+
+
+def fetch_price_action_klines(symbol: str, interval: str, limit: int = 120) -> list[Any]:
+    normalized = str(symbol or "").strip().upper()
+    key = (normalized, interval)
+    now = time.time()
+    cached = _PRICE_ACTION_KLINE_CACHE.get(key)
+    if cached and now - cached[0] < price_action_cache_ttl(interval):
+        return cached[1]
+    response = requests.get(
+        f"{BINANCE_FAPI_BASE}/fapi/v1/klines",
+        params={"symbol": normalized, "interval": interval, "limit": limit},
+        timeout=8,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list):
+        rows = []
+    _PRICE_ACTION_KLINE_CACHE[key] = (now, rows)
+    return rows
+
+
+def cached_price_action_klines(symbol: str, interval: str) -> list[Any]:
+    normalized = str(symbol or "").strip().upper()
+    cached = _PRICE_ACTION_KLINE_CACHE.get((normalized, interval))
+    if not cached or time.time() - cached[0] >= price_action_cache_ttl(interval):
+        return []
+    return cached[1]
+
+
+def kline_float(row: Any, index: int) -> float | None:
+    try:
+        return float(row[index])
+    except Exception:
+        return None
+
+
+def kline_values(rows: list[Any], index: int) -> list[float]:
+    return [value for value in (kline_float(row, index) for row in rows) if value is not None]
+
+
+def ema_value(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+    alpha = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    for value in values[period:]:
+        ema = value * alpha + ema * (1 - alpha)
+    return ema
+
+
+def price_action_trend_label(score: int) -> str:
+    if score >= 7:
+        return "偏多确认"
+    if score <= 3:
+        return "偏空/未确认"
+    return "震荡分歧"
+
+
+def analyze_short_price_action(rows_5m: list[Any], rows_15m: list[Any]) -> tuple[int, str, list[str], list[str], list[str]]:
+    rows = rows_15m or rows_5m
+    closes = kline_values(rows, 4)
+    highs = kline_values(rows, 2)
+    lows = kline_values(rows, 3)
+    volumes = kline_values(rows, 5)
+    if len(closes) < 25:
+        return 5, "短线数据不足", [], ["短线K线数据不足"], []
+    score = 5
+    items: list[str] = []
+    risks: list[str] = []
+    patterns: list[str] = []
+    last_close = closes[-1]
+    prev_high = max(highs[-21:-1]) if len(highs) >= 21 else max(highs[:-1])
+    avg_volume = sum(volumes[-21:-1]) / max(1, len(volumes[-21:-1]))
+    last_volume = volumes[-1] if volumes else 0
+    if last_close > prev_high and last_volume >= avg_volume * 1.2:
+        score += 2
+        items.append("5m/15m 放量突破近20根高点")
+        patterns.append("15m 突破近20根高点")
+    if len(closes) >= 4 and closes[-1] > closes[-2] > closes[-3]:
+        score += 1
+        items.append("短线连续收盘抬高")
+    ema20 = ema_value(closes, 20)
+    range_mid = (max(highs[-20:]) + min(lows[-20:])) / 2 if len(highs) >= 20 and len(lows) >= 20 else None
+    if ema20 is not None and last_close >= ema20 and (range_mid is None or last_close >= range_mid):
+        score += 1
+        items.append("回踩不破短均线/区间中位")
+    last_open = kline_float(rows[-1], 1) or last_close
+    last_high = highs[-1]
+    last_low = lows[-1]
+    body = abs(last_close - last_open)
+    upper_shadow = last_high - max(last_close, last_open)
+    lower_shadow = min(last_close, last_open) - last_low
+    if upper_shadow > max(body * 1.8, last_close * 0.002):
+        score -= 2
+        risks.append("短线长上影，追高风险")
+        patterns.append("15m 长上影")
+    if lower_shadow > max(body * 1.8, last_close * 0.002):
+        score += 1
+        items.append("短线长下影承接")
+    if last_close > prev_high * 1.015 and last_volume < avg_volume:
+        score -= 1
+        risks.append("突破量能不足，追高风险")
+    if len(rows) >= 2:
+        prev_open = kline_float(rows[-2], 1) or closes[-2]
+        prev_close = closes[-2]
+        if last_close > last_open and prev_close < prev_open and last_close >= prev_open and last_open <= prev_close:
+            score += 1
+            patterns.append("15m 阳包阴")
+        if last_close < last_open and prev_close > prev_open and last_open >= prev_close and last_close <= prev_open:
+            score -= 1
+            patterns.append("15m 阴包阳")
+    if last_close > last_open and last_volume >= avg_volume * 1.5:
+        patterns.append("15m 放量阳线")
+    score = clamp_int(score, 0, 10)
+    return score, price_action_trend_label(score), items, risks, list(dict.fromkeys(patterns))
+
+
+def analyze_mid_price_action(rows_1h: list[Any], rows_4h: list[Any]) -> tuple[int, str, list[str], list[str], list[str]]:
+    score = 5
+    items: list[str] = []
+    risks: list[str] = []
+    patterns: list[str] = []
+    directions: list[str] = []
+    for label, rows in (("1h", rows_1h), ("4h", rows_4h)):
+        closes = kline_values(rows, 4)
+        highs = kline_values(rows, 2)
+        lows = kline_values(rows, 3)
+        volumes = kline_values(rows, 5)
+        if len(closes) < 65:
+            risks.append(f"{label} K线数据不足")
+            continue
+        last_close = closes[-1]
+        ema20 = ema_value(closes, 20)
+        ema60 = ema_value(closes, 60)
+        if ema20 is not None and ema60 is not None and last_close > ema20 > ema60:
+            score += 2
+            directions.append("bullish")
+            items.append(f"{label} 位于 EMA20/EMA60 上方")
+        elif ema20 is not None and ema60 is not None and last_close < ema20 < ema60:
+            score -= 2
+            directions.append("bearish")
+            risks.append(f"{label} 位于 EMA20/EMA60 下方")
+        box_high = max(highs[-51:-1])
+        box_low = min(lows[-51:-1])
+        if last_close > box_high:
+            score += 1
+            items.append(f"{label} 突破近50根箱体")
+        elif last_close < box_low:
+            score -= 1
+            risks.append(f"{label} 跌破近50根箱体")
+        if label == "1h" and len(lows) >= 21 and last_close < min(lows[-21:-1]):
+            patterns.append("1h 跌破近20根低点")
+        avg_volume = sum(volumes[-21:-1]) / max(1, len(volumes[-21:-1]))
+        if last_close >= box_high * 0.985 and volumes[-1] >= avg_volume * 1.3 and closes[-1] <= closes[-2] * 1.003:
+            score -= 2
+            risks.append(f"{label} 高位放量滞涨")
+            if label == "1h":
+                patterns.append("1h 放量滞涨")
+        if label == "1h" and len(closes) >= 4 and closes[-1] > closes[-2] > closes[-3]:
+            patterns.append("1h 连续收盘抬高")
+        if label == "4h" and ema20 is not None and lows[-1] <= ema20 <= last_close:
+            patterns.append("4h 回踩不破短均线")
+        if label == "4h" and last_close <= box_high and last_close >= box_high * 0.96:
+            patterns.append("4h 箱体未突破")
+    if "bullish" in directions and "bearish" in directions:
+        score -= 1
+        risks.append("1h/4h 趋势不同向")
+    if "bullish" not in directions:
+        risks.append("4h结构还没确认")
+        patterns.append("4h 箱体未突破")
+    score = clamp_int(score, 0, 10)
+    return score, price_action_trend_label(score), items, risks, list(dict.fromkeys(patterns))
+
+
+def analyze_long_price_action(rows_1d: list[Any], rows_3d: list[Any], rows_1w: list[Any]) -> tuple[int, str, list[str], list[str], list[str]]:
+    score = 5
+    items: list[str] = []
+    risks: list[str] = []
+    patterns: list[str] = []
+    long_downtrend = False
+    long_uptrend = False
+    for label, rows in (("1d", rows_1d), ("3d", rows_3d), ("1w", rows_1w)):
+        closes = kline_values(rows, 4)
+        highs = kline_values(rows, 2)
+        lows = kline_values(rows, 3)
+        if len(closes) < 65:
+            risks.append(f"{label} K线数据不足")
+            continue
+        last_close = closes[-1]
+        ema20 = ema_value(closes, 20)
+        ema60 = ema_value(closes, 60)
+        if ema20 is not None and ema60 is not None and last_close > ema20 > ema60:
+            score += 1
+            long_uptrend = True
+            items.append(f"{label} 大周期位于 EMA20/EMA60 上方")
+        elif ema20 is not None and ema60 is not None and last_close < ema20 < ema60:
+            score -= 1
+            long_downtrend = True
+            risks.append(f"{label} 大周期下跌趋势反弹")
+        high_90 = max(highs[-91:-1]) if len(highs) >= 91 else max(highs[:-1])
+        low_90 = min(lows[-91:-1]) if len(lows) >= 91 else min(lows[:-1])
+        if high_90 and last_close >= high_90 * 0.97:
+            score -= 1
+            risks.append("大周期压力位附近")
+            if label == "1w":
+                patterns.append("1w 接近周线压力")
+            elif label == "1d":
+                patterns.append("1d 接近日线压力")
+        if low_90 and last_close <= low_90 * 1.05:
+            score += 1
+            items.append("大周期支撑承接观察")
+            if label == "1d":
+                patterns.append("1d 大周期支撑承接")
+    if long_downtrend and not long_uptrend:
+        risks.append("处在大周期下跌趋势中的反弹")
+    if long_uptrend and score <= 6:
+        items.append("大周期上升趋势中的回踩")
+    score = clamp_int(score, 0, 10)
+    return score, price_action_trend_label(score), items, risks, list(dict.fromkeys(patterns))
+
+
+def multi_timeframe_price_action_confirmation(symbol: str, log_result: bool = True) -> MultiTimeframePriceAction:
+    klines = {interval: fetch_price_action_klines(symbol, interval) for interval in PRICE_ACTION_INTERVALS}
+    short_score, short_label, short_items, short_risks, short_patterns = analyze_short_price_action(klines["5m"], klines["15m"])
+    mid_score, mid_label, mid_items, mid_risks, mid_patterns = analyze_mid_price_action(klines["1h"], klines["4h"])
+    long_score, long_label, long_items, long_risks, long_patterns = analyze_long_price_action(klines["1d"], klines["3d"], klines["1w"])
+    score = clamp_int(short_score * 0.3 + mid_score * 0.4 + long_score * 0.3, 0, 10)
+    risk_items = list(dict.fromkeys(short_risks + mid_risks + long_risks))
+    items = list(dict.fromkeys(short_items + mid_items + long_items))
+    patterns = list(dict.fromkeys(short_patterns + mid_patterns + long_patterns))
+    if mid_score <= 3 and long_score <= 4:
+        direction = "bearish"
+    elif short_score >= 7 and mid_score >= 6 and long_score >= 5:
+        direction = "bullish"
+    elif abs(short_score - long_score) >= 4 or risk_items:
+        direction = "mixed"
+    else:
+        direction = "neutral"
+    if short_score >= 7 and long_score <= 3:
+        label = "短线强，大周期未确认"
+    elif short_score >= 7 and mid_score >= 6 and long_score >= 5:
+        label = "多周期偏多确认"
+    elif mid_score <= 3 or long_score <= 3:
+        label = "中长周期偏弱"
+    elif risk_items and any("压力位附近" in item or "追高风险" in item for item in risk_items):
+        label = "压力位附近/追高风险"
+    else:
+        label = "多周期震荡分歧" if direction in ("mixed", "neutral") else "多周期偏空"
+    if long_score <= 3 or "大周期未确认" in label:
+        recommendation = "短线异动增强，等待中长周期确认，不追高"
+    elif any("压力位附近" in item or "追高风险" in item for item in risk_items):
+        recommendation = "压力位附近，等待回踩/放量确认"
+    elif score >= 6 and mid_score >= 6 and long_score >= 5:
+        recommendation = "K线结构支持，仍需结合资金确认"
+    else:
+        recommendation = "结构分歧，观察为主"
+    result = MultiTimeframePriceAction(
+        score=score,
+        label=label,
+        direction=direction,
+        short_score=short_score,
+        mid_score=mid_score,
+        long_score=long_score,
+        short_label=short_label,
+        mid_label=mid_label,
+        long_label=long_label,
+        items=items[:10],
+        risk_items=risk_items[:10],
+        patterns=patterns[:12],
+        recommendation=recommendation,
+    )
+    if log_result:
+        logging.info(
+            "Price action confirmation: %s score=%s short=%s mid=%s long=%s label=%s",
+            symbol,
+            result.score,
+            result.short_score,
+            result.mid_score,
+            result.long_score,
+            result.label,
+        )
+    return result
+
+
+def safe_multi_timeframe_price_action(symbol: str, log_result: bool = True) -> MultiTimeframePriceAction | None:
+    try:
+        return multi_timeframe_price_action_confirmation(symbol, log_result=log_result)
+    except Exception:
+        logging.debug("Failed to build multi-timeframe price action for %s", symbol, exc_info=True)
+        return MultiTimeframePriceAction(
+            score=5,
+            label="K线数据不足",
+            direction="neutral",
+            short_score=5,
+            mid_score=5,
+            long_score=5,
+            short_label="短线数据不足",
+            mid_label="中线数据不足",
+            long_label="大周期数据不足",
+            items=[],
+            risk_items=["K线数据不足"],
+            patterns=[],
+            recommendation="K线数据不足，观察为主",
+        )
+
+
+def insufficient_price_action() -> MultiTimeframePriceAction:
+    return MultiTimeframePriceAction(
+        score=5,
+        label="K线数据不足",
+        direction="neutral",
+        short_score=5,
+        mid_score=5,
+        long_score=5,
+        short_label="短线数据不足",
+        mid_label="中线数据不足",
+        long_label="大周期数据不足",
+        items=[],
+        risk_items=["K线数据不足"],
+        patterns=[],
+        recommendation="K线数据不足，观察为主",
+    )
+
+
+def cached_multi_timeframe_price_action(symbol: str) -> MultiTimeframePriceAction:
+    normalized = str(symbol or "").strip().upper()
+    now = time.time()
+    klines: dict[str, list[Any]] = {}
+    for interval in PRICE_ACTION_INTERVALS:
+        cached = _PRICE_ACTION_KLINE_CACHE.get((normalized, interval))
+        if interval in {"3d", "1w"} and (not cached or now - cached[0] >= price_action_cache_ttl(interval)):
+            klines[interval] = []
+            continue
+        if not cached or now - cached[0] >= price_action_cache_ttl(interval):
+            return insufficient_price_action()
+        klines[interval] = cached[1]
+    try:
+        short_score, short_label, short_items, short_risks, short_patterns = analyze_short_price_action(klines["5m"], klines["15m"])
+        mid_score, mid_label, mid_items, mid_risks, mid_patterns = analyze_mid_price_action(klines["1h"], klines["4h"])
+        long_score, long_label, long_items, long_risks, long_patterns = analyze_long_price_action(klines["1d"], klines["3d"], klines["1w"])
+    except Exception:
+        return insufficient_price_action()
+    score = clamp_int(short_score * 0.3 + mid_score * 0.4 + long_score * 0.3, 0, 10)
+    items = list(dict.fromkeys(short_items + mid_items + long_items))
+    risk_items = list(dict.fromkeys(short_risks + mid_risks + long_risks))
+    patterns = list(dict.fromkeys(short_patterns + mid_patterns + long_patterns))
+    if short_score >= 7 and long_score <= 3:
+        label = "短线强，大周期未确认"
+    elif short_score >= 7 and mid_score >= 6 and long_score >= 5:
+        label = "多周期偏多确认"
+    elif risk_items and any("压力位附近" in item or "追高风险" in item for item in risk_items):
+        label = "压力位附近/追高风险"
+    elif mid_score <= 3 or long_score <= 3:
+        label = "中长周期偏弱"
+    else:
+        label = "多周期震荡分歧"
+    direction = "bullish" if score >= 7 else "bearish" if score <= 3 else "mixed"
+    if long_score <= 3 or "大周期未确认" in label:
+        recommendation = "不追高，等待中长周期确认"
+    elif any("压力位附近" in item or "追高风险" in item for item in risk_items):
+        recommendation = "等回踩/放量确认，不追高"
+    elif score >= 6:
+        recommendation = "观察"
+    else:
+        recommendation = "风险观察"
+    return MultiTimeframePriceAction(
+        score=score,
+        label=label,
+        direction=direction,
+        short_score=short_score,
+        mid_score=mid_score,
+        long_score=long_score,
+        short_label=short_label,
+        mid_label=mid_label,
+        long_label=long_label,
+        items=items[:10],
+        risk_items=risk_items[:10],
+        patterns=patterns[:12],
+        recommendation=recommendation,
+    )
+
+
+def light_multi_timeframe_price_action(symbol: str) -> MultiTimeframePriceAction:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return insufficient_price_action()
+    try:
+        klines = {
+            "5m": fetch_price_action_klines(normalized, "5m"),
+            "15m": fetch_price_action_klines(normalized, "15m"),
+            "1h": fetch_price_action_klines(normalized, "1h"),
+            "4h": fetch_price_action_klines(normalized, "4h"),
+            "1d": fetch_price_action_klines(normalized, "1d"),
+            "3d": cached_price_action_klines(normalized, "3d"),
+            "1w": cached_price_action_klines(normalized, "1w"),
+        }
+        short_score, short_label, short_items, short_risks, short_patterns = analyze_short_price_action(klines["5m"], klines["15m"])
+        mid_score, mid_label, mid_items, mid_risks, mid_patterns = analyze_mid_price_action(klines["1h"], klines["4h"])
+        long_score, long_label, long_items, long_risks, long_patterns = analyze_long_price_action(klines["1d"], klines["3d"], klines["1w"])
+    except Exception:
+        logging.debug("Failed to build light multi-timeframe price action for %s", normalized, exc_info=True)
+        return cached_multi_timeframe_price_action(normalized)
+    score = clamp_int(short_score * 0.3 + mid_score * 0.4 + long_score * 0.3, 0, 10)
+    items = list(dict.fromkeys(short_items + mid_items + long_items))
+    risk_items = list(dict.fromkeys(short_risks + mid_risks + long_risks))
+    patterns = list(dict.fromkeys(short_patterns + mid_patterns + long_patterns))
+    if short_score >= 7 and long_score <= 3:
+        label = "短线强，大周期未确认"
+    elif short_score >= 7 and mid_score >= 6 and long_score >= 5:
+        label = "多周期偏多确认"
+    elif risk_items and any("压力位附近" in item or "追高风险" in item for item in risk_items):
+        label = "压力位附近/追高风险"
+    elif mid_score <= 3 or long_score <= 3:
+        label = "中长周期偏弱"
+    else:
+        label = "多周期震荡分歧"
+    direction = "bullish" if score >= 7 else "bearish" if score <= 3 else "mixed"
+    recommendation = (
+        DISCORD_BULLISH_DOWNGRADE_TEXT
+        if long_score <= 3 or text_has_any(label, ("大周期未确认", "压力位附近", "追高风险"))
+        else "结构分歧，观察为主"
+    )
+    return MultiTimeframePriceAction(
+        score=score,
+        label=label,
+        direction=direction,
+        short_score=short_score,
+        mid_score=mid_score,
+        long_score=long_score,
+        short_label=short_label,
+        mid_label=mid_label,
+        long_label=long_label,
+        items=items[:10],
+        risk_items=risk_items[:10],
+        patterns=patterns[:12],
+        recommendation=recommendation,
+    )
+
+
 def flow_cache_ttl_seconds(period: str) -> int:
     if period in FLOW_SHORT_PERIODS:
         return FLOW_SHORT_CACHE_TTL_SECONDS
@@ -4642,19 +5924,25 @@ def discord_channel_for_pending_signal(pending: PendingTelegramSignalMerge) -> s
 
 def discord_signal_title(signal: Signal, priority: str) -> str:
     normalized_kind = str(signal.kind or "").strip().lower().replace("-", "_").replace(" ", "_")
+    price_action = safe_multi_timeframe_price_action(signal.symbol, log_result=False) if signal.snapshot else None
+    pair = discord_symbol_pair(signal.symbol)
     if normalized_kind == "main_momentum_watch":
-        if signal.snapshot and main_momentum_hard_downgrade(signal.snapshot):
-            return "🟡 主流异动观察"
-        return "🟡 主流异动雷达"
+        if signal.snapshot and (main_momentum_hard_downgrade(signal.snapshot) or price_action_discord_downgrade(price_action)):
+            return f"🟡 主流异动观察 {pair}"
+        return f"🟡 主流异动雷达 {pair}"
     if normalized_kind == "main_trend_watch":
-        return "🟢 主流趋势雷达"
+        return f"🟢 主流趋势雷达 {pair}"
     if normalized_kind in {"main_risk_watch", "top_risk", "top_exhaustion", "distribution"} or is_risk_structure_kind(signal.kind):
-        return "🔴 主流风险雷达"
-    if signal.snapshot and discord_bullish_display_downgrade(signal):
-        return "🟡 观察信号"
+        if price_action_structure_risk_confirmed(price_action):
+            return f"🔴 结构风险确认 {pair}"
+        return f"🔴 风险雷达 {pair}"
+    if signal.snapshot and discord_bullish_display_downgrade(signal, price_action=price_action):
+        return f"🟡 观察信号 {pair}"
+    if signal.snapshot and signal_direction_label(signal.kind) == "看多" and not price_action_allows_discord_high_buy(price_action):
+        return f"🟡 观察信号 {pair}"
     if str(priority or "").strip().upper() in {"S", "A", "B"}:
-        return "🟢 高把握信号"
-    return signal_kind_label(signal.kind)
+        return f"🟢 高把握信号 {pair}"
+    return f"{signal_kind_label(signal.kind)} {pair}"
 
 
 def discord_symbol_pair(symbol: str | None) -> str:
@@ -4665,13 +5953,14 @@ def discord_symbol_pair(symbol: str | None) -> str:
 
 
 def discord_signal_content_title(signal: Signal, priority: str) -> str:
-    return f"{discord_signal_title(signal, priority)} {discord_symbol_pair(signal.symbol)}"
+    return discord_signal_title(signal, priority)
 
 
 def discord_signal_color(signal: Signal) -> int:
     if is_risk_structure_kind(signal.kind):
         return DISCORD_COLOR_RISK
-    if signal.snapshot and discord_bullish_display_downgrade(signal):
+    price_action = safe_multi_timeframe_price_action(signal.symbol, log_result=False) if signal.snapshot else None
+    if signal.snapshot and discord_bullish_display_downgrade(signal, price_action=price_action):
         return DISCORD_COLOR_WATCH
     if signal_direction_label(signal.kind) == "看多":
         return DISCORD_COLOR_BULLISH
@@ -4754,6 +6043,233 @@ def discord_flow_field_value(snapshot: MarketSnapshot) -> str:
     return f"{short_line}\n{mid_line}\n{structure}"
 
 
+def discord_field_value(text: str) -> str:
+    return truncate_text(str(text or ""), 900)
+
+
+def discord_price_oi_field_value(snapshot: MarketSnapshot) -> str:
+    confirm_parts = []
+    if snapshot.confirm_price_change_percent is not None:
+        confirm_parts.append(f"确认价 {snapshot.confirm_price_change_percent:+.2f}%")
+    if snapshot.confirm_oi_change_percent is not None:
+        confirm_parts.append(f"确认OI {snapshot.confirm_oi_change_percent:+.2f}%")
+    confirm_text = " | " + " / ".join(confirm_parts) if confirm_parts else ""
+    return discord_field_value(
+        f"价格 {snapshot.close_price:.8g} | 涨跌 {snapshot.price_change_percent:+.2f}% | "
+        f"OI {snapshot.oi_change_percent:+.2f}%{confirm_text}"
+    )
+
+
+def discord_derivatives_field_value(snapshot: MarketSnapshot) -> str:
+    basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    basis_text = f"{basis_pct:+.2f}% {basis_label}" if basis_pct is not None else basis_label
+    return discord_field_value(
+        f"Funding {format_optional_value(snapshot.funding_rate_percent)}% | 基差 {basis_text}\n"
+        f"全局多空 {format_optional_value(snapshot.global_long_short_ratio)} | "
+        f"大户持仓 {format_optional_value(snapshot.top_position_ratio)} | "
+        f"大户账户 {format_optional_value(snapshot.top_account_ratio)}\n"
+        f"主动买卖 {format_optional_value(snapshot.taker_buy_sell_ratio)}"
+    )
+
+
+def discord_leading_field_value(snapshot: MarketSnapshot, signal: Signal | None) -> str:
+    leading = leading_signal_score(snapshot, signal)
+    if leading.leading_score <= 0 and not leading.leading_items:
+        return "暂无明显领先信号"
+    items = [f"- {item}" for item in leading.leading_items[:5] if item]
+    if not items:
+        items = ["- 暂无明显领先信号"]
+    return discord_field_value(
+        f"{leading.leading_score}/10 | {leading.leading_direction} | {leading.leading_label}\n"
+        + "\n".join(items)
+    )
+
+
+def discord_evidence_field_value(snapshot: MarketSnapshot, signal: Signal | None) -> str:
+    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
+    positive_items = [
+        item for item in ev_items
+        if item.polarity == "positive" and item.source in {"OI", "FLOW", "FUNDING", "BASIS", "LSR", "WHALE", "SPOT", "ONCHAIN", "LIQ"}
+    ][:6]
+    prefix = "资金证据" if signal and topq_kind_normalized(signal.kind) in DISCORD_RISK_KINDS else "证据"
+    lines = [f"{ev_score}/10 | {ev_direction} | {prefix}: {ev_summary or '暂无明确证据'}"]
+    lines.extend(f"- {item.label} +{item.points}" for item in positive_items)
+    return discord_field_value("\n".join(lines))
+
+
+def discord_conflict_aware_summary(
+    kind: str | None,
+    direction: str,
+    evidence_direction: str,
+    evidence_score: int,
+    evidence_summary: str | None,
+    leading_direction: str,
+    flow_label: str,
+    risk_score: int,
+    price_action: MultiTimeframePriceAction | None,
+) -> str:
+    normalized_kind = topq_kind_normalized(kind)
+    summary = str(evidence_summary or "")
+    bullish_evidence = (
+        evidence_direction == "看多"
+        or text_has_any(summary, ("主力建仓", "现货确认", "资金回流", "承接", "空头拥挤"))
+        or leading_direction == "long"
+    )
+    risk_evidence = text_has_any(summary, ("高位拥挤", "注意出货", "不宜追", "谨慎追", "中长线资金不支持", "出货", "派发"))
+    pa_direction = price_action.direction if price_action else "neutral"
+    pa_bearish_score = 10 - price_action.score if price_action else 0
+
+    if normalized_kind in DISCORD_RISK_KINDS and bullish_evidence:
+        if pa_direction == "mixed":
+            return "多空证据冲突，风险观察"
+        if pa_bearish_score >= 6 or risk_score >= 5:
+            return "顶部风险增强，等待跌破确认"
+        return "风险触发，但资金/现货仍有支撑，等待K线确认"
+    if normalized_kind in DISCORD_BULLISH_KINDS and risk_evidence:
+        return "看多触发，但风险证据冲突，等待回踩确认"
+    if normalized_kind in DISCORD_RISK_KINDS:
+        return "风险观察" if abs(risk_score) < 5 else "顶部风险增强，等待跌破确认"
+    if direction == "看多" and flow_label in TOPQ_WEAK_FLOW_LABELS:
+        return "看多触发，但资金周期未共振，等待回踩确认"
+    return summary or "观察，等待确认"
+
+
+def discord_summary_is_conflict_override(summary: str | None, evidence_summary: str | None) -> bool:
+    value = str(summary or "")
+    raw = str(evidence_summary or "")
+    return bool(value) and value != raw and text_has_any(
+        value,
+        (
+            "风险触发",
+            "顶部风险增强",
+            "多空证据冲突",
+            "看多触发",
+        ),
+    )
+
+
+def discord_infer_evidence_direction(summary: str | None, fallback: str = "") -> str:
+    value = str(summary or "")
+    if text_has_any(value, ("主力建仓", "现货确认", "资金回流", "承接", "空头拥挤", "多周期共振流入")):
+        return "看多"
+    if text_has_any(value, ("高位拥挤", "注意出货", "顶部风险", "出货", "派发", "多头过热")):
+        return "看空"
+    return fallback or "中性"
+
+
+def discord_risk_field_value(
+    snapshot: MarketSnapshot,
+    signal: Signal | None,
+    price_action: MultiTimeframePriceAction | None,
+) -> str:
+    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
+    squeeze_label, squeeze_score, squeeze_reason = squeeze_state(snapshot)
+    _basis_pct, basis_label, basis_reason = basis_state(snapshot)
+    _ev_score, _ev_direction, _ev_summary, ev_items = evidence_score(snapshot, signal)
+    risk_items = [item.label for item in ev_items if item.polarity == "risk"]
+    if price_action:
+        risk_items.extend(price_action.risk_items)
+    risk_items = list(dict.fromkeys(risk_items))[:6]
+    risk_header = f"风险 {trap_score}/10 {trap_label} | 挤压 {squeeze_label} {squeeze_score}/10 | 基差 {basis_label}"
+    if is_risk_structure_kind(signal.kind if signal else None):
+        bearish_score = (10 - (price_action.score if price_action else 5)) if price_action else 0
+        if bearish_score >= 6 or len(risk_items) >= 4 or price_action_structure_risk_confirmed(price_action):
+            risk_header = f"结构风险确认 | {risk_header}"
+        elif abs(snapshot.price_change_percent) < 1 and abs(snapshot.oi_change_percent) < 2:
+            risk_header = f"风险观察 | {risk_header}"
+    if not risk_items:
+        risk_items = ["暂无明显结构风险"]
+    lines = [risk_header, f"{trap_reason}; {squeeze_reason}; {basis_reason}"]
+    lines.extend(f"- {item}" for item in risk_items)
+    return discord_field_value("\n".join(lines))
+
+
+def discord_signal_action(
+    snapshot: MarketSnapshot,
+    signal: Signal | None,
+    ev_summary: str,
+    price_action: MultiTimeframePriceAction | None,
+) -> tuple[str, str, bool]:
+    action, action_reason = action_label(snapshot, signal)
+    risk_signal = is_risk_structure_kind(signal.kind if signal else None)
+    if price_action and not risk_signal and (
+        price_action.long_score <= 3
+        or text_has_any(price_action.label, ("大周期未确认", "压力位附近", "追高风险"))
+        or any(text_has_any(item, ("压力位附近", "追高风险")) for item in price_action.risk_items)
+    ):
+        return MAIN_MOMENTUM_DOWNGRADE_TEXT, "展示降级：K线结构未确认，观察为主", True
+    if signal and discord_bullish_display_downgrade(signal, ev_summary, price_action):
+        return DISCORD_BULLISH_DOWNGRADE_TEXT, "展示降级：资金/结构未共振，观察为主", True
+    if (
+        signal
+        and signal_direction_label(signal.kind) == "看多"
+        and action.startswith("强烈建议关注买入")
+        and not price_action_allows_discord_high_buy(price_action)
+    ):
+        return DISCORD_BULLISH_DOWNGRADE_TEXT, "展示降级：资金/结构未共振，观察为主", True
+    return action, action_reason, False
+
+
+def discord_price_action_field_value(price_action: MultiTimeframePriceAction | None) -> str:
+    if price_action is None:
+        price_action = MultiTimeframePriceAction(
+            score=5,
+            label="K线数据不足",
+            direction="neutral",
+            short_score=5,
+            mid_score=5,
+            long_score=5,
+            short_label="短线数据不足",
+            mid_label="中线数据不足",
+            long_label="大周期数据不足",
+            items=[],
+            risk_items=["K线数据不足"],
+            patterns=[],
+            recommendation="K线数据不足，观察为主",
+        )
+    if price_action.label == "K线数据不足":
+        return "暂无多周期K线确认\n仅资金/OI观察，不能按K线确认交易"
+    lines = [
+        f"K线 {price_action.score}/10 | {price_action.label}",
+        f"结构：短{price_action.short_score} 中{price_action.mid_score} 长{price_action.long_score}",
+    ]
+    if price_action.patterns:
+        lines.append("形态：")
+        lines.extend(f"- {pattern}" for pattern in price_action.patterns[:5])
+    else:
+        for item in price_action.items[:3] + price_action.risk_items[:2]:
+            lines.append(f"- {item}")
+    return truncate_text("\n".join(lines), 900)
+
+
+def discord_full_price_action_fields(price_action: MultiTimeframePriceAction | None) -> list[tuple[str, str, bool]]:
+    if price_action is None:
+        price_action = MultiTimeframePriceAction(
+            score=5,
+            label="K线数据不足",
+            direction="neutral",
+            short_score=5,
+            mid_score=5,
+            long_score=5,
+            short_label="短线数据不足",
+            mid_label="中线数据不足",
+            long_label="大周期数据不足",
+            items=[],
+            risk_items=["K线数据不足"],
+            patterns=[],
+            recommendation="K线数据不足，观察为主",
+        )
+    summary = discord_price_action_field_value(price_action)
+    pattern_text = "\n".join(f"- {pattern}" for pattern in price_action.patterns[:8]) if price_action.patterns else "暂无多周期K线确认"
+    return [
+        ("K线结构", summary, False),
+        ("K线形态", truncate_text(pattern_text, 900), False),
+        ("短线层", truncate_text("\n".join(price_action.items[:4] or [price_action.short_label]), 900), False),
+        ("中线层", truncate_text("\n".join((price_action.items + price_action.risk_items)[4:8] or [price_action.mid_label]), 900), False),
+        ("大周期层", truncate_text("\n".join(price_action.risk_items[:3] or [price_action.long_label]), 900), False),
+    ]
+
+
 def discord_signal_fields(
     signal: Signal,
     priority: str,
@@ -4772,29 +6288,52 @@ def discord_signal_fields(
         ]
 
     conviction, conviction_label, _conviction_reason = conviction_score(snapshot, signal)
-    action, action_reason = action_label(snapshot, signal)
     ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
     ev_display = evidence_display_score(ev_direction, ev_items, ev_score)
-    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
-    display_downgraded = discord_bullish_display_downgrade(signal, ev_summary)
+    price_action = safe_multi_timeframe_price_action(signal.symbol, log_result=True)
+    action, action_reason, display_downgraded = discord_signal_action(snapshot, signal, ev_summary, price_action)
+    leading = leading_signal_score(snapshot, signal)
+    _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+    conflict_summary = discord_conflict_aware_summary(
+        signal.kind,
+        direction,
+        ev_direction,
+        ev_score,
+        ev_summary,
+        leading.leading_direction,
+        flow_label,
+        trap_score,
+        price_action,
+    )
+    conflict_override = discord_summary_is_conflict_override(conflict_summary, ev_summary)
+    if conflict_override:
+        normalized_kind = topq_kind_normalized(signal.kind)
+        if normalized_kind in DISCORD_RISK_KINDS or normalized_kind in DISCORD_BULLISH_KINDS:
+            action = conflict_summary
+            action_reason = "Discord冲突口径"
+            if normalized_kind in DISCORD_BULLISH_KINDS:
+                display_downgraded = True
+    if topq_kind_normalized(signal.kind) in DISCORD_RISK_KINDS and text_has_any(action, ("强烈建议关注买入", "启动把握高", "买入")):
+        action = conflict_summary if conflict_summary else "风险观察，不追多"
+        action_reason = "Discord风险口径"
     level_text = f"{priority} / 质量 {quality_score} / 把握 {conviction} {conviction_label}"
     if display_downgraded:
-        level_text = f"{level_text}\n{DISCORD_BULLISH_DOWNGRADE_NOTE}"
-        action = DISCORD_BULLISH_DOWNGRADE_TEXT
-        action_reason = "Discord展示降级"
+        level_text = f"{level_text}\n展示降级：资金/结构未共振，观察为主"
     fields = [
-        ("币种", signal.symbol, True),
-        ("方向", direction, True),
-        ("等级/把握", level_text, True),
-        ("价格/OI", f"价格 {snapshot.close_price:.8g} | 涨跌 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}%", False),
-        ("资金流", discord_flow_field_value(snapshot), False),
+        ("币种/方向", discord_field_value(f"{signal.symbol} / {direction}"), True),
+        ("等级/把握", discord_field_value(level_text), True),
+        ("价格/OI", discord_price_oi_field_value(snapshot), False),
+        ("衍生品状态", discord_derivatives_field_value(snapshot), False),
+        ("资金流", discord_field_value(discord_flow_field_value(snapshot)), False),
+        ("领先信号", discord_leading_field_value(snapshot, signal), False),
+        ("证据", discord_evidence_field_value(snapshot, signal), False),
+        ("风险提示", discord_risk_field_value(snapshot, signal, price_action), False),
+        ("K线结构", discord_price_action_field_value(price_action), False),
+        ("结论", discord_field_value(conflict_summary), False),
+        ("操作建议", discord_field_value(f"{action}。{action_reason}"), False),
     ]
-    fields.append(discord_evidence_field(signal, ev_direction, ev_display, ev_summary, quality_reason or signal.message))
-    risk_tip = discord_risk_tip_field(signal, trap_score, trap_label, trap_reason)
-    if risk_tip:
-        fields.append(risk_tip)
-    fields.append(("操作建议", f"{action}。{action_reason}", False))
-    return fields[:8]
+    return fields[:12]
 
 
 def discord_signal_embed_v2(
@@ -4863,25 +6402,108 @@ def discord_realtime_signal_embed_v2(
     )
 
 
+def alt_watch_price_action_line(price_action: MultiTimeframePriceAction | None) -> str:
+    if price_action is None or price_action.label == "K线数据不足":
+        return "K线：暂无多周期确认"
+    patterns = [compact_price_action_pattern(pattern) for pattern in price_action.patterns[:2] if pattern]
+    if patterns:
+        return "K线：" + "；".join(patterns)
+    if price_action.short_score >= 7 and price_action.long_score <= 3:
+        return "K线：短线强，4h/日线未确认"
+    if price_action.short_score >= 7 and price_action.mid_score < 6:
+        return "K线：短线强，中线未确认"
+    if price_action.mid_score <= 4 or price_action.long_score <= 4:
+        return "K线：短线异动，中长周期未确认"
+    if text_has_any(price_action.label, ("震荡", "分歧")):
+        return "K线：箱体震荡，方向未确认"
+    return f"K线：{price_action.label}"
+
+
+def compact_price_action_pattern(pattern: str) -> str:
+    value = str(pattern or "").strip()
+    replacements = {
+        "连续收盘抬高": "连续抬高",
+        "突破近20根高点": "突破20根高点",
+        "跌破近20根低点": "跌破20根低点",
+        "接近日线压力": "日线压力",
+        "接近周线压力": "周线压力",
+    }
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    return value.replace(" ", "")
+
+
 def discord_alt_watch_embed_v2(
     items: list[DiscordAltWatchItem],
     channel_key: str,
     title: str = "山寨观察",
+    snapshots: dict[str, MarketSnapshot] | None = None,
 ) -> DiscordOutboundMessage:
     fields: list[tuple[str, str, bool]] = []
+    snapshots = snapshots or {}
     for item in items[:10]:
+        snapshot = snapshots.get(item.symbol)
+        price_action = light_multi_timeframe_price_action(item.symbol)
+        if snapshot:
+            basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+            basis_text = f"{basis_pct:+.2f}% {basis_label}" if basis_pct is not None else basis_label
+            funding_text = format_realtime_funding(snapshot.funding_rate_percent)
+            flow_15m = format_usd(summary_flow_value(snapshot, "15m"))
+            flow_1h = format_usd(summary_flow_value(snapshot, "1h"))
+            flow_4h = format_usd(summary_flow_value(snapshot, "4h"))
+            short_flow, mid_flow, long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+        else:
+            basis_text = "n/a"
+            funding_text = "n/a"
+            flow_15m = flow_1h = flow_4h = "n/a"
+            short_flow = mid_flow = long_flow = "n/a"
+            flow_label = item.flow_label
+        direction = signal_direction_label(item.kind)
+        evidence_direction = discord_infer_evidence_direction(item.reason, direction)
+        leading_direction = "long" if evidence_direction == "看多" and item.leading_score > 0 else ""
+        conflict_summary = discord_conflict_aware_summary(
+            item.kind,
+            direction,
+            evidence_direction,
+            item.evidence_score,
+            item.reason,
+            leading_direction,
+            flow_label,
+            item.trap_score,
+            price_action,
+        )
+        conclusion = conflict_summary
+        if price_action.long_score <= 3 or text_has_any(price_action.label, ("大周期未确认", "追高风险", "压力位附近")):
+            if not discord_summary_is_conflict_override(conflict_summary, item.reason):
+                conclusion = "不追高，等待回踩/放量确认"
+        elif item.trap_score >= 6 or text_has_any(item.reason, ("风险", "出货", "顶部", "派发")):
+            if not discord_summary_is_conflict_override(conflict_summary, item.reason):
+                conclusion = "风险观察"
+        elif item.flow_label in TOPQ_WEAK_FLOW_LABELS:
+            if not discord_summary_is_conflict_override(conflict_summary, item.reason):
+                conclusion = "等回踩，观察"
+        kline_line = alt_watch_price_action_line(price_action)
         fields.append(
             (
-                item.symbol,
-                (
-                    f"{signal_kind_label(item.kind)} | 把握 {item.conviction_score} | 质量 {item.quality_score}\n"
-                    f"领先 {item.leading_score} | 证据 {item.evidence_score} | 风险 {item.trap_score}\n"
-                    f"价格 {format_percent_optional(item.price_change_percent)} | OI {format_percent_optional(item.oi_change_percent)} | {item.flow_label}\n"
-                    f"{item.reason}"
+                f"🟡 山寨观察 {discord_symbol_pair(item.symbol)}",
+                discord_field_value(
+                    f"{item.symbol} {signal_kind_label(item.kind)} | 把握{item.conviction_score} 质量{item.quality_score} | "
+                    f"领先{item.leading_score} 证据{item.evidence_score} 风险{item.trap_score}\n"
+                    f"价格 {format_percent_optional(item.price_change_percent)} | OI {format_percent_optional(item.oi_change_percent)} | 费率 {funding_text} | 基差 {basis_text}\n"
+                    f"资金 15m {flow_15m} / 1h {flow_1h} / 4h {flow_4h} | 短{short_flow}/中{mid_flow}/长{long_flow} | {flow_label}\n"
+                    f"{kline_line}\n"
+                    f"结论：{conclusion}"
                 ),
                 False,
             )
         )
+    fields.append(
+        (
+            "说明",
+            "山寨观察仅作预警，需等待资金、K线和风控共振。",
+            False,
+        )
+    )
     return DiscordOutboundMessage(
         channel_key=channel_key,
         title=f"🟡 {title}",
@@ -4907,6 +6529,67 @@ def discord_chunk_fields(text: str, field_prefix: str = "内容", chunk_size: in
     return [(f"{field_prefix}{index}", chunk, False) for index, chunk in enumerate(chunks[:6], start=1)]
 
 
+def discord_external_data_text(text: str | None) -> str:
+    value = str(text or "")
+    replacements = (
+        ("链上资金摘要", "外部资金确认摘要"),
+        ("链上资金", "外部资金确认"),
+        ("链上雷达", "外部资金雷达"),
+        ("现货/链上确认", "现货/DEX/外部确认"),
+        ("现货/链上同步确认", "现货/DEX/外部同步确认"),
+        ("现货/链上出货", "现货/DEX/外部转弱"),
+        ("现货/链上转弱", "现货/DEX/外部转弱"),
+        ("现货/链上承接", "现货/DEX/外部承接"),
+        ("现货/链上未充分确认", "现货/DEX/外部确认不足"),
+        ("现货/链上与合约", "现货/DEX与合约"),
+        ("现货/链上", "现货/DEX/外部确认"),
+        ("链上承接", "现货/DEX承接"),
+        ("链上出货", "现货/DEX出货"),
+        ("链上数据不足", "外部资金数据不足"),
+        ("链上有支撑", "现货/DEX有支撑"),
+        ("链上流动性", "DEX流动性"),
+        ("链上DEX", "DEX确认"),
+    )
+    for old, new in replacements:
+        value = value.replace(old, new)
+    return value
+
+
+def yes_no(value: bool) -> str:
+    return "是" if value else "否"
+
+
+def format_ts_short(timestamp: float | None) -> str:
+    if not timestamp:
+        return "-"
+    return dt.datetime.fromtimestamp(float(timestamp)).strftime("%m-%d %H:%M")
+
+
+def stablecoin_supply_changes(rows: list[Any]) -> dict[str, float | None]:
+    if not rows:
+        return {"24h": None, "7d": None, "30d": None}
+    latest_supply = parse_float(rows[0][0])
+    latest_ts = parse_float(rows[0][2])
+    changes: dict[str, float | None] = {}
+    for label, seconds in (("24h", 86400), ("7d", 7 * 86400), ("30d", 30 * 86400)):
+        changes[label] = None
+        if latest_supply is None or latest_ts is None:
+            continue
+        target_ts = latest_ts - seconds
+        older = None
+        for row in rows:
+            row_supply = parse_float(row[0])
+            row_ts = parse_float(row[2])
+            if row_supply is None or row_ts is None:
+                continue
+            if row_ts <= target_ts:
+                older = row_supply
+                break
+        if older is not None:
+            changes[label] = percent_change(older, latest_supply) if older else None
+    return changes
+
+
 def discord_summary_embed_v2(title: str, message: str, channel_key: str = "summary") -> DiscordOutboundMessage:
     text = discord_clean_summary_text(message, title=title, remove_title=True)
     fields = discord_chunk_fields(text, "摘要")
@@ -4919,14 +6602,53 @@ def discord_summary_embed_v2(title: str, message: str, channel_key: str = "summa
     )
 
 
-def discord_onchain_embed_v2(title: str, message: str, channel_key: str = "onchain") -> DiscordOutboundMessage:
-    text = discord_clean_summary_text(message, title=title, remove_title=True)
-    fields = discord_chunk_fields(text, "链上")
+def discord_topq_embed_v2(message: str, channel_key: str = "digest") -> DiscordOutboundMessage:
+    fields = discord_chunk_fields(message, "候选")
+    kline_lines = [line for line in str(message or "").splitlines() if "K线" in line][:6]
+    kline_text = "\n".join(kline_lines) if kline_lines else "候选已接入多周期K线结构确认；K线弱或大周期未确认时只显示观察。"
+    fields.append(("K线结构", truncate_text(kline_text, 900), False))
     return DiscordOutboundMessage(
         channel_key=channel_key,
-        title=title,
+        title="把握候选TOP10",
         color=DISCORD_COLOR_SUMMARY,
-        fields=fields or [("状态", "链上数据不足，等待缓存", False)],
+        fields=fields[:10],
+        kind="topq",
+    )
+
+
+def discord_suppressed_digest_embed_v2(
+    items: list[DiscordSuppressedDigestItem],
+    channel_key: str = "digest",
+) -> DiscordOutboundMessage:
+    display_items = items[:12]
+    lines = ["过去15分钟被实时过滤的信号"]
+    for item in display_items:
+        lines.append(
+            f"{item.symbol} {signal_kind_label(item.kind)} | q={item.priority}/{item.quality} | "
+            f"把握{item.conviction} | reason={item.reason}"
+        )
+        lines.append(
+            f"{format_percent_optional(item.price_change)} / OI{format_percent_optional(item.oi_change)} | "
+            f"{item.flow_label} | {item.evidence_summary or '-'}"
+        )
+    lines.append(f"共 {len(items)} 条，展示前 {len(display_items)} 条。")
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title="🧾 静默信号摘要",
+        color=DISCORD_COLOR_SUMMARY,
+        fields=discord_chunk_fields("\n".join(lines), "静默"),
+        kind="suppressed_digest",
+    )
+
+
+def discord_onchain_embed_v2(title: str, message: str, channel_key: str = "onchain") -> DiscordOutboundMessage:
+    text = discord_clean_summary_text(discord_external_data_text(message), title=title, remove_title=True)
+    fields = discord_chunk_fields(text, "外部资金")
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=discord_external_data_text(title),
+        color=DISCORD_COLOR_SUMMARY,
+        fields=fields or [("状态", "数据不足，等待外部资金缓存", False)],
         kind="onchain",
     )
 
@@ -4940,29 +6662,24 @@ def discord_diagnosis_embed_v2(
     response_parts: list[str],
 ) -> DiscordOutboundMessage:
     signal = signals[0] if signals else None
-    action, action_reason = action_label(snapshot, signal)
-    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
-    ev_display = evidence_display_score(ev_direction, ev_items, ev_score)
-    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
-    fields = [
-        ("币种/方向", f"{symbol} / {signal_direction_label(signal.kind if signal else '')}", True),
-        ("等级/把握", f"把握 {conviction_score(snapshot, signal)[0]}/100", True),
-        ("价格/OI", f"价格 {snapshot.close_price:.8g} | 涨跌 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}%", False),
-        ("资金流", discord_flow_field_value(snapshot), False),
-        ("证据", f"{ev_direction} {ev_display}分 - {ev_summary or '暂无明确证据'}", False),
-        ("风险", f"{trap_label} {trap_score}/10 - {trap_reason}\n{compact_coinglass_market_context(coinglass_text or 'CoinGlass聚合: n/a')}", False),
-        ("操作建议", f"{action}。{action_reason}", False),
-    ]
+    if signal is None:
+        signal = Signal(symbol=symbol, kind="diagnosis", score=0, title=f"{symbol} 单币诊断", message="", key=f"{symbol}:diagnosis", snapshot=snapshot)
+    fields = discord_signal_fields(signal, "-", 0, "诊断")
+    diagnosis_price_action = safe_multi_timeframe_price_action(symbol, log_result=True)
+    if diagnosis_price_action:
+        fields.extend(discord_full_price_action_fields(diagnosis_price_action)[1:])
     source = response_parts[0] if response_parts else ""
     if source:
         fields.append(("数据来源", source, False))
     if liquidation_text:
         fields.append(("强平", truncate_text(liquidation_text, 500), False))
+    if coinglass_text:
+        fields.append(("CoinGlass", truncate_text(compact_coinglass_market_context(coinglass_text), 900), False))
     return DiscordOutboundMessage(
         channel_key="debug",
-        title=f"{symbol} 单币诊断",
+        title=f"🟡 诊断 {discord_symbol_pair(symbol)}",
         color=DISCORD_COLOR_WATCH,
-        fields=fields[:8],
+        fields=fields[:20],
         symbol=symbol,
         kind="diagnosis",
     )
@@ -4974,8 +6691,12 @@ def discord_help_text() -> str:
         "!摘要 - 返回缓存市场摘要，不触发全市场实时生成\n"
         "!候选 - 等同 /topq，把握候选排行\n"
         "!山寨 - 查看最近山寨观察队列 Top10\n"
-        "!链上 BTCUSDT - 单币链上/现货确认简报\n"
-        "!链上摘要 - BTC/ETH/SOL/BNB/DOGE 链上资金摘要\n"
+        "!数据源 - 查看采集层数据源健康状态\n"
+        "!外部资金来源 - 查看当前真实可用外部资金来源\n"
+        "!外部资金 - 查看 BTC/ETH/SOL/BNB/DOGE 现货/DEX/CoinGlass 外部资金确认\n"
+        "!外部资金 BTCUSDT - 单币现货/DEX/CoinGlass 外部资金确认\n"
+        "!链上 BTCUSDT - 旧别名，当前不代表真实钱包流\n"
+        "!链上摘要 - 旧别名，当前不代表真实钱包流\n"
         "!诊断 BTCUSDT - 单币诊断简版\n"
         "!质量 - 信号质量统计\n"
         "!静默 - 等同 /quiet status\n"
@@ -5545,7 +7266,7 @@ def format_coinglass_major_long_suffix(major_long: Any) -> str:
         if isinstance(major_long.get("funding_accumulated_ranges"), dict)
         else {}
     )
-    balance_label = "交易所余额"
+    balance_label = "CoinGlass交易所余额"
     balance_source = coinglass_balance_ranges_source(balance_ranges)
     if balance_source:
         balance_label = f"{balance_label}({balance_source})"
@@ -5566,7 +7287,9 @@ def format_major_long_cycle_context(snapshot: MarketSnapshot, coinglass_text: st
     taker_24h = extract_labeled_segment(coinglass_text, "主动买卖 24h", "；")
     taker_7d = extract_labeled_segment(coinglass_text, "CoinGlass主动买卖 7d", "；")
     taker_text = " / ".join(part for part in (taker_24h, taker_7d) if part) or "n/a"
-    balance_text = extract_labeled_segment(coinglass_text, "交易所余额", "；") or "交易所余额 n/a"
+    balance_text = extract_labeled_segment(coinglass_text, "交易所余额", "；") or "CoinGlass交易所余额 n/a"
+    if balance_text.startswith("交易所余额"):
+        balance_text = f"CoinGlass{balance_text}"
     funding_text = extract_labeled_segment(coinglass_text, "Funding累计", "；") or "Funding累计 n/a"
     return (
         "主流币长周期确认:\n"
@@ -5586,7 +7309,9 @@ def format_major_long_cycle_one_line(snapshot: MarketSnapshot, coinglass_text: s
     if not is_major_asset_tier(snapshot.symbol):
         return ""
     oi_text = extract_labeled_segment(coinglass_text, "OI ", "；") or "OI n/a"
-    balance_text = extract_labeled_segment(coinglass_text, "交易所余额", "；") or "交易所余额 n/a"
+    balance_text = extract_labeled_segment(coinglass_text, "交易所余额", "；") or "CoinGlass交易所余额 n/a"
+    if balance_text.startswith("交易所余额"):
+        balance_text = f"CoinGlass{balance_text}"
     return f"主流长周期: {oi_text}; {balance_text}; 资金共振 {long_flow_alignment_score(snapshot)}/9"
 
 
@@ -5615,53 +7340,111 @@ def format_onchain_brief(
     spot_score, spot_label, spot_reason = spot_onchain_score_from_text(snapshot, None, resolved_spot_text)
     div_label, div_score, div_reason = contract_spot_divergence_from_text(snapshot, None, resolved_spot_text)
     cg_text = str(coinglass_text or "")
-    balance_text = extract_labeled_segment(cg_text, "交易所余额", "；") or "交易所余额: 1d n/a / 7d n/a / 30d n/a"
+    balance_text = extract_labeled_segment(cg_text, "交易所余额", "；") or "CoinGlass交易所余额: 1d n/a / 7d n/a / 30d n/a"
+    if balance_text.startswith("交易所余额"):
+        balance_text = f"CoinGlass{balance_text}"
     taker_24h = extract_labeled_segment(cg_text, "主动买卖 24h", "；")
     taker_7d = extract_labeled_segment(cg_text, "CoinGlass主动买卖 7d", "；")
     orderbook_text = extract_labeled_segment(cg_text, "CoinGlass订单簿: ", "\n")
     conclusion = onchain_conclusion(snapshot, spot_score, div_score, cg_text)
+    source_text = external_confirmation_source_text(resolved_spot_text, cg_text)
 
     if compact:
         coinglass_parts = "；".join(part for part in (balance_text, taker_24h, taker_7d, orderbook_text) if part)
-        return (
-            f"{snapshot.symbol}: {balance_text} | 现货{spot_score}/10 {spot_label} | "
+        return discord_external_data_text(
+            f"{snapshot.symbol}: {balance_text} | 现货/DEX确认{spot_score}/10 {spot_label} | "
             f"{div_label} | {coinglass_parts or 'CoinGlass: n/a'} | 结论: {conclusion}"
         )
 
     lines = [
         f"币种: {snapshot.symbol}",
+        "当前无钱包级净流数据，以下为 CoinGlass聚合/现货DEX确认",
         f"{balance_text}",
-        f"现货确认: {spot_score}/10 {spot_label} - {spot_reason}",
+        f"现货/DEX确认: {spot_score}/10 {spot_label} - {spot_reason}",
         f"合约现货背离: {div_label} {div_score}/10 - {div_reason}",
         f"CoinGlass主动买卖: {' / '.join(part for part in (taker_24h, taker_7d) if part) or 'n/a'}",
         f"CoinGlass订单簿: {orderbook_text or 'n/a'}",
+        source_text,
         f"结论: {conclusion}",
     ]
-    return "\n".join(lines)
+    return discord_external_data_text("\n".join(lines))
+
+
+def external_confirmation_source_text(spot_text: str | None, coinglass_text: str | None) -> str:
+    sources: list[str] = []
+    text = str(spot_text or "")
+    cg_text = str(coinglass_text or "")
+    if "标准现货" in text:
+        sources.append("Binance现货")
+    if "链上DEX" in text or "DEX确认" in text:
+        sources.append("DexScreener")
+    if cg_text and "CoinGlass聚合: n/a" not in cg_text:
+        sources.append("CoinGlass聚合")
+    return "数据源：" + " / ".join(sources or ["数据不足"])
 
 
 def onchain_conclusion(snapshot: MarketSnapshot, spot_score: int, divergence_score: int, coinglass_text: str | None) -> str:
+    text = str(coinglass_text or "")
     balance_1d = extract_coinglass_balance_change(coinglass_text, "1d")
     balance_7d = extract_coinglass_balance_change(coinglass_text, "7d")
     balance_30d = extract_coinglass_balance_change(coinglass_text, "30d")
+    buy_ratio, sell_ratio = extract_coinglass_taker_ratios(coinglass_text)
+    orderbook_text = extract_labeled_segment(text, "CoinGlass订单簿: ", "\n") or ""
     balances = [value for value in (balance_1d, balance_7d, balance_30d) if value is not None]
-    if any(value > 0 for value in balances):
-        return "交易所入金风险"
-    if divergence_score >= 3 and spot_score <= 5:
-        return "合约拉动但现货未确认"
-    if spot_score >= 7 or (balances and all(value <= 0 for value in balances)):
-        return "现货承接"
-    if snapshot.price_change_percent > 0 and snapshot.oi_change_percent > 0 and spot_score <= 5:
-        return "合约拉动但现货未确认"
-    return "数据不足"
+    has_balance = bool(balances)
+    has_taker = buy_ratio is not None or sell_ratio is not None
+    has_orderbook = bool(orderbook_text and "n/a" not in orderbook_text)
+    has_spot = spot_score != 5
+    has_divergence = divergence_score > 0
+    valid_categories = sum([has_balance, has_taker, has_orderbook, has_spot, has_divergence])
+    if valid_categories < 2:
+        return "数据不足"
+
+    bullish: list[str] = []
+    risk: list[str] = []
+    neutral: list[str] = []
+
+    if balance_30d is not None and balance_30d < 0 and "下方承接偏强" in orderbook_text:
+        bullish.append("30d交易所余额下降、订单簿下方承接偏强")
+    if any(value is not None and value > 0 for value in (balance_1d, balance_7d)):
+        risk.append("1d/7d交易所余额回流")
+    if buy_ratio is not None and buy_ratio > 52:
+        bullish.append("主动买盘略占优")
+    elif sell_ratio is not None and sell_ratio > 52:
+        risk.append("主动卖压略占优")
+    elif has_taker:
+        neutral.append("主动买卖接近中性")
+    if spot_score >= 7:
+        bullish.append("现货/DEX确认较强")
+    elif spot_score <= 3:
+        risk.append("现货/DEX确认偏弱")
+    elif has_spot:
+        neutral.append("现货/DEX中性")
+    if divergence_score >= 5:
+        risk.append("合约现货存在背离，降低确认度")
+
+    if bullish and risk:
+        if balance_30d is not None and balance_30d < 0 and "下方承接偏强" in orderbook_text:
+            return "外部资金中性偏支撑；" + "、".join(bullish[:2]) + "，但" + "、".join(risk[:2]) + "，暂不构成强确认"
+        return "外部资金分歧，暂不构成强确认；" + "；".join((bullish + risk)[:4])
+    if risk:
+        if any("余额回流" in item for item in risk):
+            return "交易所余额回流，潜在抛压上升，追多需谨慎"
+        return "外部资金偏风险；" + "、".join(risk[:3])
+    if bullish:
+        if balance_30d is not None and balance_30d < 0 and "下方承接偏强" in orderbook_text:
+            return "外部资金中性偏支撑，交易所余额长期下降，短线承接较强"
+        return "外部资金中性偏支撑；" + "、".join(bullish[:3])
+    return "外部资金中性观察；" + "、".join(neutral[:3] or ["多类数据未形成方向确认"])
 
 
 def onchain_brief_has_confirmation_data(text: str) -> bool:
-    if "交易所余额: 1d n/a / 7d n/a / 30d n/a" not in text:
+    normalized = discord_external_data_text(text)
+    if "CoinGlass交易所余额: 1d n/a / 7d n/a / 30d n/a" not in normalized:
         return True
-    if "CoinGlass主动买卖" in text or "CoinGlass订单簿" in text or "近1h 买盘" in text:
+    if "CoinGlass主动买卖" in normalized or "CoinGlass订单簿" in normalized or "近1h 买盘" in normalized:
         return True
-    return "现货5/10 中性" not in text and "暂无明显现货/链上确认" not in text
+    return "现货/DEX确认5/10 中性" not in normalized and "暂无明显现货/DEX/外部确认" not in normalized
 
 
 def spot_onchain_score(snapshot: MarketSnapshot | None, signal: Signal | None = None) -> tuple[int, str, str]:
@@ -5703,9 +7486,9 @@ def spot_onchain_score_from_text(
     if spot_4h == "偏强":
         add(2, "标准现货4h偏强")
     if dex_1h == "偏强":
-        add(2, "链上1h偏强")
+        add(2, "DEX 1h偏强")
     if dex_24h == "偏强" and dex_volume_expanded(dex_vol_24h):
-        add(2, "链上24h偏强且成交放大")
+        add(2, "DEX 24h偏强且成交放大")
     if ((volume_ratio is not None and volume_ratio >= 1.2) or dex_volume_expanded(dex_vol_1h) or dex_volume_expanded(dex_vol_24h)) and price_not_weak:
         add(1, "现货/DEX成交放大")
     if liquidity is not None and liquidity >= 100000:
@@ -5716,15 +7499,15 @@ def spot_onchain_score_from_text(
     if spot_4h == "偏弱":
         add(-2, "标准现货4h偏弱")
     if dex_1h == "偏弱":
-        add(-2, "链上1h偏弱")
+        add(-2, "DEX 1h偏弱")
     if dex_24h_change is not None and dex_24h_change >= 15 and dex_1h_change is not None and dex_1h_change <= -1:
-        add(-2, "高位链上转弱")
+        add(-2, "高位DEX转弱")
     if "无标准现货/高流动性DEX数据" in text or (liquidity is not None and liquidity < 50000):
         add(-1, "流动性过低或缺失")
 
     score = max(0, min(10, int(round(score))))
     label = "弱" if score <= 3 else "强" if score >= 7 else "中性"
-    reason = "；".join(dict.fromkeys(reasons)) if reasons else "暂无明显现货/链上确认"
+    reason = "；".join(dict.fromkeys(reasons)) if reasons else "暂无明显现货/DEX/外部确认"
     return score, label, truncate_text(reason, 120)
 
 
@@ -5775,7 +7558,7 @@ def contract_spot_divergence_from_text(
         label = "轻微背离"
     else:
         label = "无背离"
-    reason = "；".join(dict.fromkeys(reasons)) if reasons else "现货/链上与合约暂无明显冲突"
+    reason = "；".join(dict.fromkeys(reasons)) if reasons else "现货/DEX与合约暂无明显冲突"
     return label, score, truncate_text(reason, 120)
 
 
@@ -5900,8 +7683,15 @@ def extract_coinglass_balance_change(text: str | None, period: str) -> float | N
     if not text:
         return None
     balance_segment = extract_labeled_segment(text, "交易所余额", "；") or ""
-    match = re.search(rf"{re.escape(period)}\s*([+\-]?\d+(?:\.\d+)?)%", balance_segment)
-    return parse_float(match.group(1)) if match else None
+    match = re.search(rf"{re.escape(period)}\s*([+\-]?\d+(?:\.\d+)?)([KMB%]?)", balance_segment, flags=re.IGNORECASE)
+    if not match:
+        return None
+    value = parse_float(match.group(1))
+    if value is None:
+        return None
+    unit = match.group(2).upper()
+    multiplier = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}.get(unit, 1)
+    return value * multiplier
 
 
 def extract_coinglass_funding_accumulated(text: str | None, period: str) -> float | None:
@@ -5929,7 +7719,7 @@ def format_rule_optimization_lines(
     div_label, div_score, div_reason = contract_spot_divergence_from_text(snapshot, signal, resolved_spot_text)
     major_score, major_label, major_reason = major_flow_score_from_text(snapshot, signal, coinglass_text)
     return [
-        f"现货确认: {spot_score}/10 {spot_label} - {spot_reason}",
+        f"现货/DEX确认: {spot_score}/10 {spot_label} - {spot_reason}",
         f"合约现货: {div_label} {div_score}/10 - {div_reason}",
         f"主力趋势: {major_score}/10 {major_label} - {major_reason}",
     ]
@@ -6778,6 +8568,7 @@ def trend_reading(snapshot: MarketSnapshot) -> str:
 
 _SPOT_CHAIN_CACHE: dict[str, tuple[float, str]] = {}
 _COINGLASS_TEXT_CACHE: dict[str, tuple[float, str]] = {}
+_DEXSCREENER_PAIR_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def spot_alpha_confirmation(symbol: str) -> str:
@@ -6888,6 +8679,7 @@ def fetch_dexscreener_confirmation(symbol: str) -> str | None:
         pair = best_dex_pair(base, pairs)
         if not pair:
             return None
+        _DEXSCREENER_PAIR_CACHE[str(symbol).upper()] = pair
 
         price_change = pair.get("priceChange") or {}
         volume = pair.get("volume") or {}
@@ -7726,6 +9518,11 @@ MAIN_MOMENTUM_DOWNGRADE_FLOW_KEYWORDS = ("资金分歧", "短强中弱", "短弱
 DISCORD_BULLISH_DOWNGRADE_TEXT = "短线信号较强，但中长周期未确认，等待回踩/放量确认，不追高"
 DISCORD_BULLISH_DOWNGRADE_NOTE = "展示降级：资金分歧，观察为主"
 DISCORD_BULLISH_DOWNGRADE_EVIDENCE_KEYWORDS = ("高位拥挤", "注意出货", "不宜追", "谨慎追")
+DISCORD_RISK_KINDS = {"top_exhaustion", "top_risk", "distribution", "main_risk_watch"}
+DISCORD_BULLISH_KINDS = {"discovery", "hot_breakout", "bottom_reversal", "main_momentum_watch", "main_trend_watch"}
+DISCORD_BEARISH_PRICE_ACTION_PATTERNS = ("长上影", "阴包阳", "放量滞涨", "日线压力", "周线压力", "跌破结构", "跌破近20根低点")
+PRICE_ACTION_INTERVALS = ("5m", "15m", "1h", "4h", "1d", "3d", "1w")
+_PRICE_ACTION_KLINE_CACHE: dict[tuple[str, str], tuple[float, list[Any]]] = {}
 
 
 def text_has_any(text: str | None, keywords: tuple[str, ...]) -> bool:
@@ -7764,7 +9561,42 @@ def main_momentum_strong_buy_allowed(snapshot: MarketSnapshot, signal: Signal | 
     )
 
 
-def discord_bullish_display_downgrade(signal: Signal, evidence_summary: str | None = None) -> bool:
+def price_action_discord_downgrade(price_action: MultiTimeframePriceAction | None) -> bool:
+    if price_action is None:
+        return False
+    return (
+        price_action.score <= 4
+        or price_action.long_score <= 3
+        or any(text_has_any(pattern, DISCORD_BEARISH_PRICE_ACTION_PATTERNS) for pattern in price_action.patterns)
+        or text_has_any(price_action.label, ("大周期未确认", "压力位附近", "追高风险"))
+        or any(text_has_any(item, ("压力位附近", "追高风险")) for item in price_action.risk_items)
+    )
+
+
+def price_action_structure_risk_confirmed(price_action: MultiTimeframePriceAction | None) -> bool:
+    if price_action is None:
+        return False
+    return (
+        any(text_has_any(pattern, DISCORD_BEARISH_PRICE_ACTION_PATTERNS) for pattern in price_action.patterns)
+        or (price_action.direction == "bearish" and (price_action.score >= 6 or 10 - price_action.score >= 6))
+    )
+
+
+def price_action_allows_discord_high_buy(price_action: MultiTimeframePriceAction | None) -> bool:
+    return (
+        price_action is not None
+        and price_action.score >= 6
+        and price_action.mid_score >= 6
+        and price_action.long_score >= 5
+        and not any(text_has_any(pattern, DISCORD_BEARISH_PRICE_ACTION_PATTERNS) for pattern in price_action.patterns)
+    )
+
+
+def discord_bullish_display_downgrade(
+    signal: Signal,
+    evidence_summary: str | None = None,
+    price_action: MultiTimeframePriceAction | None = None,
+) -> bool:
     snapshot = signal.snapshot
     if snapshot is None:
         return False
@@ -7780,6 +9612,7 @@ def discord_bullish_display_downgrade(signal: Signal, evidence_summary: str | No
         or text_has_any(flow_label, MAIN_MOMENTUM_DOWNGRADE_FLOW_KEYWORDS)
         or positive_flow_count(snapshot, ("4h", "12h", "24h", "72h")) < 2
         or text_has_any(summary, DISCORD_BULLISH_DOWNGRADE_EVIDENCE_KEYWORDS)
+        or price_action_discord_downgrade(price_action)
     )
 
 

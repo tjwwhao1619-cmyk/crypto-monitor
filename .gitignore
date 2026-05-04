@@ -11,3 +11,9 @@ market_cap_cache.json
 signals.csv
 signals.old.csv
 signals.csv.schema_backup_*
+
+# Runtime external data cache
+external_data.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
