@@ -59,6 +59,7 @@ DEFAULT_CONVICTION_REALTIME_THRESHOLD = 75
 DEFAULT_CONVICTION_WATCH_THRESHOLD = 55
 DEFAULT_RISK_REALTIME_THRESHOLD = 70
 VALID_BINANCE_USDT_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}USDT$")
+CORE_MOMENTUM_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"}
 
 
 @dataclass(frozen=True)
@@ -295,6 +296,11 @@ class DerivativesMonitor:
         self.last_screened_at = 0.0
         self.summary_config = config.get("summary", {})
         self.last_summary_at = 0.0
+        self.last_hourly_summary_key: int | None = None
+        self.last_market_summary_text = ""
+        self.last_market_summary_ts = 0.0
+        self.last_market_summary_source = ""
+        self.market_summary_cache_lock = threading.Lock()
         self.latest_snapshots: dict[str, MarketSnapshot] = {}
         self.latest_snapshots_updated_at = 0.0
         self.alert_cooldown_seconds = int(config.get("alert_cooldown_seconds", 3600))
@@ -953,11 +959,13 @@ class DerivativesMonitor:
         self.last_screened_at = now
         logging.info("Screened %s symbols into monitor pool", len(self.symbol_configs))
         if added_symbols or removed_symbols:
-            self.notify_status(
-                "Crypto monitor pool updated",
-                f"Monitoring {len(self.symbol_configs)} symbols. "
-                f"Added: {', '.join(added_symbols) or '-'}; "
-                f"Removed: {', '.join(sorted(removed_symbols)) or '-'}."
+            logging.info(
+                "Crypto monitor pool updated. Monitoring %s symbols. Added %s: %s; Removed %s: %s.",
+                len(self.symbol_configs),
+                len(added_symbols),
+                compact_symbol_list_for_log(added_symbols),
+                len(removed_symbols),
+                compact_symbol_list_for_log(sorted(removed_symbols)),
             )
 
     def screen_symbols(self) -> list[str]:
@@ -1146,6 +1154,7 @@ class DerivativesMonitor:
                 signal_count += self.run_symbol_cycle(symbol, symbol_config)
                 processed += 1
             self.latest_snapshots_updated_at = time.time()
+            self.refresh_market_summary_cache_from_latest("scan")
             logging.info("Scan cycle completed: symbols=%s signals=%s elapsed=%.2fs", processed, signal_count, time.monotonic() - started)
             return
 
@@ -1164,6 +1173,7 @@ class DerivativesMonitor:
                 signal_count += self.process_snapshot(symbol, symbol_config, snapshot)
                 processed += 1
         self.latest_snapshots_updated_at = time.time()
+        self.refresh_market_summary_cache_from_latest("scan")
         logging.info("Scan cycle completed: symbols=%s signals=%s elapsed=%.2fs", processed, signal_count, time.monotonic() - started)
 
     def run_symbol_cycle(self, symbol: str, symbol_config: dict[str, Any]) -> int:
@@ -1358,6 +1368,13 @@ class DerivativesMonitor:
         taker_weak = snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio <= 1.02
         premium = basis_label in PREMIUM_BASIS_STATES or (basis_pct is not None and basis_pct >= 0.15)
         risk_text = text_has_any(ev_summary, ("高位拥挤", "出货", "派发", "追多风险"))
+        momentum_signal = main_momentum_watch_signal(snapshot)
+        extreme_high_risk = (
+            snapshot.price_change_percent >= 8.0
+            and (snapshot.funding_rate_percent is not None and snapshot.funding_rate_percent >= 0.08)
+            and (basis_label in PREMIUM_BASIS_STATES or (basis_pct is not None and basis_pct >= 0.25))
+            and (high_position or snapshot.oi_change_percent >= 8.0)
+        )
 
         crowded_risk = (
             high_position
@@ -1370,7 +1387,7 @@ class DerivativesMonitor:
             and (ev_direction == "看空/风险" or risk_text or ev_score <= -3)
         )
         weak_cycle_risk = price_oi_sync and weak_cycle and (premium or funding_hot or taker_weak or long_distribution)
-        if crowded_risk or leading_risk or weak_cycle_risk:
+        if (crowded_risk or leading_risk or weak_cycle_risk) and not (momentum_signal and not extreme_high_risk):
             score = min(
                 10,
                 5
@@ -1390,6 +1407,8 @@ class DerivativesMonitor:
                 key=f"{snapshot.symbol}:main_risk_watch",
                 snapshot=snapshot,
             )
+        if momentum_signal:
+            return momentum_signal
 
         trend_trigger = (
             leading.leading_score >= 5
@@ -1399,27 +1418,27 @@ class DerivativesMonitor:
             and flow_resonance
             and (price_oi_sync or oi_up_price_resilient)
         )
-        if not trend_trigger:
-            return None
+        if trend_trigger:
+            score = min(
+                10,
+                5
+                + int(flow_support_count >= 2)
+                + int(short_flow >= 7 and mid_flow >= 6)
+                + int(price_oi_sync)
+                + int(oi_up_price_resilient)
+                + int(ev_display >= 6),
+            )
+            return Signal(
+                symbol=snapshot.symbol,
+                kind="main_trend_watch",
+                score=score,
+                title=f"{snapshot.symbol} 主流趋势雷达",
+                message=self.describe(snapshot, "主流趋势雷达：领先信号偏多，多周期资金流入，价格/OI 配合，趋势观察。"),
+                key=f"{snapshot.symbol}:main_trend_watch",
+                snapshot=snapshot,
+            )
 
-        score = min(
-            10,
-            5
-            + int(flow_support_count >= 2)
-            + int(short_flow >= 7 and mid_flow >= 6)
-            + int(price_oi_sync)
-            + int(oi_up_price_resilient)
-            + int(ev_display >= 6),
-        )
-        return Signal(
-            symbol=snapshot.symbol,
-            kind="main_trend_watch",
-            score=score,
-            title=f"{snapshot.symbol} 主流趋势雷达",
-            message=self.describe(snapshot, "主流趋势雷达：领先信号偏多，多周期资金流入，价格/OI 配合，趋势观察。"),
-            key=f"{snapshot.symbol}:main_trend_watch",
-            snapshot=snapshot,
-        )
+        return None
 
     def refresh_benchmark_snapshot(self) -> None:
         if not self.market_filter_config.get("enabled", False):
@@ -1635,6 +1654,7 @@ class DerivativesMonitor:
             "bottom_reversal": 1800,
             "main_trend_watch": 1800,
             "main_risk_watch": 1800,
+            "main_momentum_watch": 1200,
             "discovery": 3600,
         }
         return int(self.alert_cooldowns.get(signal.kind, defaults.get(signal.kind, self.alert_cooldown_seconds)))
@@ -1839,12 +1859,17 @@ class DerivativesMonitor:
                 str(key): float(value)
                 for key, value in payload.get("last_alerted_at", {}).items()
             }
+            loaded_summary_key = payload.get("last_hourly_summary_key")
+            self.last_hourly_summary_key = int(loaded_summary_key) if loaded_summary_key is not None else None
         except Exception:
             logging.warning("Failed to load monitor state", exc_info=True)
 
     def save_state(self) -> None:
         path = Path(self.state_path)
-        payload = {"last_alerted_at": self.last_alerted_at}
+        payload = {
+            "last_alerted_at": self.last_alerted_at,
+            "last_hourly_summary_key": self.last_hourly_summary_key,
+        }
         try:
             with path.open("w", encoding="utf-8") as file:
                 json.dump(payload, file, separators=(",", ":"))
@@ -2075,16 +2100,24 @@ class DerivativesMonitor:
             return False, "invalid symbol"
         if snapshot is None:
             return False, "no snapshot"
+
+        realtime_threshold, _watch_threshold, risk_realtime_threshold = self.telegram_conviction_thresholds()
+        risk_signal = is_risk_structure_kind(signal.kind)
+        direction = signal_direction_label(signal.kind)
+        if signal.kind == "main_momentum_watch":
+            if not is_core_momentum_asset(signal.symbol):
+                return False, "main momentum only core symbols"
+            if quality < 40:
+                return False, f"main momentum quality {quality}<40"
+            if conviction >= 55 or signal.score >= 5:
+                return True, f"main momentum realtime conviction={conviction} score={signal.score}"
+            return False, f"main momentum conviction {conviction}<55 and score {signal.score}<5"
         if normalized_priority == "D":
             return False, "priority D"
         if quality < 40:
             return False, f"quality {quality}<40"
         if normalized_priority == "C":
             return False, "priority C digest only"
-
-        realtime_threshold, _watch_threshold, risk_realtime_threshold = self.telegram_conviction_thresholds()
-        risk_signal = is_risk_structure_kind(signal.kind)
-        direction = signal_direction_label(signal.kind)
         summary_text = " ".join(
             str(reason_context.get(key) or "")
             for key in ("summary", "evidence_summary")
@@ -2136,6 +2169,8 @@ class DerivativesMonitor:
         if last:
             last_pushed_at, last_quality_score = last
             age = time.time() - last_pushed_at
+            if signal.kind == "main_momentum_watch" and age < 1200:
+                return True, f"duplicate {key} within 20m"
             if age < 1800 and quality_score < 75:
                 return True, (
                     f"duplicate {key} within 30m quality={quality_score}<75 "
@@ -2405,17 +2440,63 @@ class DerivativesMonitor:
             return
         interval = int(self.summary_config.get("interval_seconds", 3600))
         now = time.time()
-        if now - self.last_summary_at < interval:
+        hourly_summary_key = int(now // 3600)
+        if self.last_hourly_summary_key == hourly_summary_key:
+            return
+        if now - self.last_summary_at < interval and self.last_hourly_summary_key is not None:
             return
         if not self.latest_snapshots:
             return
 
-        self.last_summary_at = now
-        message = format_summary_for_telegram(
+        message = self.refresh_market_summary_cache_from_latest("hourly") or format_summary_for_telegram(
             list(self.latest_snapshots.values()),
             int(self.summary_config.get("top_n", 5)),
         )
-        self.notify_status("📊 每小时市场简报", message)
+        self.last_summary_at = now
+        self.last_hourly_summary_key = hourly_summary_key
+        self.save_state()
+        try:
+            self.notify_status("📊 每小时市场简报", message)
+        except Exception:
+            logging.warning("Failed to send hourly summary for hour_key=%s; will not retry this hour", hourly_summary_key, exc_info=True)
+
+    def refresh_market_summary_cache_from_latest(self, source: str = "scan") -> str:
+        if not self.latest_snapshots:
+            return ""
+        try:
+            message = format_summary_for_telegram(
+                list(self.latest_snapshots.values()),
+                int(self.summary_config.get("top_n", 5)),
+            )
+        except Exception:
+            logging.warning("Failed to refresh market summary cache from %s", source, exc_info=True)
+            return ""
+        self.update_market_summary_cache(message, source)
+        return message
+
+    def update_market_summary_cache(self, text: str, source: str = "") -> None:
+        if not text:
+            return
+        with self.market_summary_cache_lock:
+            self.last_market_summary_text = text
+            self.last_market_summary_ts = time.time()
+            self.last_market_summary_source = source
+
+    def cached_market_summary(self) -> tuple[str, float, str]:
+        with self.market_summary_cache_lock:
+            return (
+                self.last_market_summary_text,
+                self.last_market_summary_ts,
+                self.last_market_summary_source,
+            )
+
+    def format_cached_market_summary_response(self, text: str, cached_at: float, stale: bool = False) -> str:
+        age_minutes = max(0, int((time.time() - cached_at) // 60))
+        if stale:
+            prefix = f"数据来源: 缓存 {age_minutes}分钟前，正在等待下轮刷新"
+        else:
+            prefix = f"数据来源: 缓存 {age_minutes}分钟前"
+        return f"{prefix}\n{text}"
 
     def start_telegram_command_worker(self) -> None:
         if self.telegram_command_thread_started:
@@ -3194,25 +3275,17 @@ class DerivativesMonitor:
         self.send_telegram_text(bot_token, chat_id, format_sectors_for_telegram(snapshots, detail=True))
 
     def handle_summary_command(self, bot_token: str, chat_id: str) -> None:
-        self.send_telegram_text(bot_token, chat_id, "正在生成市场摘要，请稍等...")
-        snapshots = []
-        symbols = list(self.symbol_configs)
-        if not symbols:
-            self.refresh_symbols_if_due(force=True)
-            symbols = list(self.symbol_configs)
-
-        for symbol in symbols:
-            try:
-                snapshots.append(self.fetch_snapshot(symbol))
-            except Exception:
-                logging.debug("Failed to fetch snapshot for summary command: %s", symbol, exc_info=True)
-
-        if not snapshots:
-            self.send_telegram_text(bot_token, chat_id, "暂无可用市场数据。")
+        cached_text, cached_at, _cache_source = self.cached_market_summary()
+        if cached_text:
+            self.send_telegram_text(
+                bot_token,
+                chat_id,
+                self.format_cached_market_summary_response(cached_text, cached_at),
+            )
             return
 
-        top_n = int(self.summary_config.get("top_n", 5))
-        self.send_telegram_text(bot_token, chat_id, format_summary_for_telegram(snapshots, top_n))
+        logging.info("Manual /summary cache miss")
+        self.send_telegram_text(bot_token, chat_id, "当前暂无市场摘要缓存，请等待下一轮扫描完成后重试。")
 
     def handle_hot_command(self, bot_token: str, chat_id: str) -> None:
         self.send_telegram_text(bot_token, chat_id, "正在生成强势过热候选，请稍等...")
@@ -3396,9 +3469,11 @@ class DerivativesMonitor:
             if not is_valid_binance_usdt_symbol(symbol):
                 continue
             conviction_score_value = parse_float(row.get("conviction_score"))
-            if conviction_score_value is None or conviction_score_value < 65:
-                continue
             kind = topq_kind_normalized(row.get("kind"))
+            score_value = parse_float(row.get("score")) or 0
+            min_conviction = 55 if kind == "main_momentum_watch" and score_value >= 5 else 65
+            if conviction_score_value is None or conviction_score_value < min_conviction:
+                continue
             intent = row.get("market_intent_label") or ""
             risk_row = topq_is_risk_candidate(kind)
             bullish_row = topq_is_bullish_candidate(kind)
@@ -3409,7 +3484,7 @@ class DerivativesMonitor:
             evidence_summary = str(row.get("evidence_summary") or "").strip()
             if leading_score_value <= 0 and conviction_score_value > 64:
                 continue
-            if bullish_row and leading_score_value < 3:
+            if bullish_row and kind != "main_momentum_watch" and leading_score_value < 3:
                 continue
             if (direction == "看多" or bullish_row) and text_has_any(evidence_summary, TOPQ_BAD_LONG_EVIDENCE_KEYWORDS):
                 continue
@@ -3420,27 +3495,49 @@ class DerivativesMonitor:
                 continue
             if direction == "看空" and leading_direction == "long" and leading_score_value >= 6:
                 conviction_score_value = min(conviction_score_value, 79)
+            price_change_value = parse_float(row.get("price_change_percent"))
+            oi_change_value = parse_float(row.get("oi_change_percent"))
+            if kind == "main_risk_watch" and (price_change_value or 0) < 1.5 and (oi_change_value or 0) < 3:
+                conviction_score_value = min(conviction_score_value, 79)
             if intent == "震荡分歧" and not (risk_row and conviction_score_value >= 65):
                 continue
             priority = str(row.get("signal_priority") or "").upper()
             priority_order = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
             kind_rank = topq_kind_tiebreak_rank(kind, direction)
-            scored_rows.append((conviction_score_value, priority_order.get(priority, -1), kind_rank, -recent_index, row))
+            scored_rows.append(
+                (
+                    conviction_score_value,
+                    priority_order.get(priority, -1),
+                    kind_rank,
+                    -recent_index,
+                    direction,
+                    row,
+                )
+            )
 
         if not scored_rows:
             self.send_telegram_text(bot_token, chat_id, "暂无高把握/观察候选。")
             return
 
         scored_rows.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
-        best_by_symbol_direction: dict[tuple[str, str], tuple[float, dict[str, str]]] = {}
-        for quality_score, _priority_rank, _kind_rank, _recent_rank, row in scored_rows:
+        best_by_symbol_direction: dict[tuple[str, str], tuple[tuple[int, float, int, int], float, dict[str, str]]] = {}
+        for quality_score, priority_rank, kind_rank, recent_rank, direction, row in scored_rows:
             symbol = str(row.get("symbol") or "-").upper()
-            direction = signal_direction_label(row.get("kind"))
             key = (symbol, direction)
-            if key in best_by_symbol_direction:
-                continue
-            best_by_symbol_direction[key] = (quality_score, row)
-        deduped_rows = list(best_by_symbol_direction.values())[:10]
+            selection_key = (kind_rank, quality_score, priority_rank, recent_rank)
+            current = best_by_symbol_direction.get(key)
+            if current is None or selection_key > current[0]:
+                best_by_symbol_direction[key] = (selection_key, quality_score, row)
+        priority_order = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+        deduped_rows = sorted(
+            ((quality_score, row) for _selection_key, quality_score, row in best_by_symbol_direction.values()),
+            key=lambda item: (
+                item[0],
+                priority_order.get(str(item[1].get("signal_priority") or "").upper(), -1),
+                topq_kind_tiebreak_rank(item[1].get("kind"), signal_direction_label(item[1].get("kind"))),
+            ),
+            reverse=True,
+        )[:10]
 
         lines = ["把握候选TOP10"]
         for index, (conviction_score_value, row) in enumerate(deduped_rows, start=1):
@@ -3473,6 +3570,8 @@ class DerivativesMonitor:
                 )
             if risk_row:
                 action = topq_risk_action(evidence_summary, row.get("basis_state") or "")
+            elif topq_kind_normalized(kind) == "main_momentum_watch":
+                action = "短线拉盘观察，等待确认，不追高"
             elif direction == "看多":
                 if (
                     action.startswith("强烈建议关注买入")
@@ -3494,18 +3593,35 @@ class DerivativesMonitor:
                 status = "观察"
             if direction == "看空" and str(row.get("leading_direction") or "") == "long" and leading_score_value >= 6:
                 status = "观察"
+            if topq_kind_normalized(kind) == "main_risk_watch":
+                price_change_value = parse_float(row.get("price_change_percent"))
+                oi_change_value = parse_float(row.get("oi_change_percent"))
+                if (price_change_value or 0) < 1.5 and (oi_change_value or 0) < 3:
+                    status = "观察"
             status_icon = "🔴" if status == "重点" and direction == "看空" else "🟢" if status == "重点" else "🟡"
             symbol = display_usdt_symbol(row.get("symbol"))
             leading_part = leading_topq_brief(row)
-            conclusion = topq_conclusion_text(
-                direction,
-                evidence_summary,
-                action,
-                intent,
-                flow_label,
+            kind_label = topq_signal_kind_label(row, action)
+            main_momentum_observation = (
+                topq_kind_normalized(kind) == "main_momentum_watch"
+                or kind_label == "主流异动观察"
             )
+            if main_momentum_observation:
+                conclusion = (
+                    "短线强，中线未确认"
+                    if flow_label in ("短强中弱", "中长线派发", "资金分歧")
+                    else "短线拉盘，等确认"
+                )
+            else:
+                conclusion = topq_conclusion_text(
+                    direction,
+                    evidence_summary,
+                    action,
+                    intent,
+                    flow_label,
+                )
             lines.append(
-                f"{index}. {status_icon}{status} {direction_icon_text} {symbol} {signal_kind_label(kind)} | "
+                f"{index}. {status_icon}{status} {direction_icon_text} {symbol} {kind_label} | "
                 f"把握{conviction_score_value:.0f} {leading_part}"
             )
             lines.append(
@@ -3567,6 +3683,20 @@ def base_symbol(symbol: str) -> str:
     return base
 
 
+def summary_symbol_label(symbol: str) -> str:
+    normalized = str(symbol or "").upper()
+    label = base_symbol(normalized)
+    return normalized if len(label) < 2 else label
+
+
+def is_summary_display_symbol(symbol: str | None) -> bool:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized.endswith("USDT"):
+        return False
+    base = normalized[:-4]
+    return bool(re.fullmatch(r"[A-Z0-9]{1,20}", base))
+
+
 def market_tier(symbol: str) -> str:
     base = base_symbol(symbol)
     core = {"BTC", "ETH", "SOL", "BNB"}
@@ -3584,6 +3714,90 @@ def market_tier(symbol: str) -> str:
 
 def is_major_asset_tier(symbol: str) -> bool:
     return market_tier(symbol) in ("core", "major", "large")
+
+
+def is_core_momentum_asset(symbol: str) -> bool:
+    return str(symbol or "").strip().upper() in CORE_MOMENTUM_SYMBOLS or market_tier(symbol) in ("core", "major")
+
+
+def snapshot_price_change(snapshot: MarketSnapshot, period: str) -> float | None:
+    if snapshot.price_change_periods:
+        value = snapshot.price_change_periods.get(period)
+        if value is not None:
+            return value
+    if period in ("5m", "15m"):
+        return snapshot.confirm_price_change_percent
+    if period == "1h":
+        return snapshot.price_change_percent
+    return None
+
+
+def main_momentum_watch_signal(snapshot: MarketSnapshot) -> Signal | None:
+    if not is_core_momentum_asset(snapshot.symbol):
+        return None
+
+    price_5m = snapshot_price_change(snapshot, "5m")
+    price_15m = snapshot_price_change(snapshot, "15m")
+    price_1h = snapshot_price_change(snapshot, "1h")
+    flow_15m = summary_flow_value(snapshot, "15m")
+    flow_1h = summary_flow_value(snapshot, "1h")
+    short_flow, mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    threshold_15m = 0.25 if snapshot.symbol in {"BTCUSDT", "ETHUSDT"} else 0.35
+    oi_15m_up = (snapshot.confirm_oi_change_percent or 0) > 0
+    oi_1h_up = snapshot.oi_change_percent > 0
+    ev_score, ev_direction, _ev_summary, _ev_items = evidence_score(snapshot, None)
+    spot_score, _spot_label, _spot_reason = spot_onchain_score(snapshot, None)
+    squeeze_label, _squeeze_score, _squeeze_reason = squeeze_state(snapshot)
+    absorption_label, _absorption_score, _absorption_reason = spot_absorption_state(snapshot, None)
+
+    reasons: list[str] = []
+    if price_15m is not None and price_15m >= threshold_15m and flow_15m > 0:
+        reasons.append(f"15m涨{price_15m:+.2f}%且资金流入")
+    if (
+        price_5m is not None
+        and price_15m is not None
+        and price_5m > 0
+        and price_15m >= threshold_15m
+        and (oi_15m_up or oi_1h_up)
+    ):
+        reasons.append("5m/15m连续走强且OI上升")
+    if (
+        price_15m is not None
+        and price_1h is not None
+        and price_15m > 0
+        and price_1h > 0
+        and (oi_15m_up or oi_1h_up)
+    ):
+        reasons.append("15m/1h价格与OI同步上升")
+    if ev_direction == "看多" and ev_score >= 8 and spot_score >= 7:
+        reasons.append("证据强多且现货/链上承接强")
+    if squeeze_label == "空头挤压" and absorption_label in ("现货承接", "链上承接"):
+        reasons.append("空头挤压+现货承接")
+
+    if not reasons:
+        return None
+
+    mid_unconfirmed = flow_1h < 0 or mid_flow <= 4 or flow_label in ("短强中弱", "中长线派发", "资金分歧")
+    conclusion = "短线强，中线未确认" if mid_unconfirmed else "短线拉盘观察"
+    score = min(
+        10,
+        5
+        + int(price_15m is not None and price_15m >= threshold_15m)
+        + int(flow_15m > 0)
+        + int(oi_15m_up or oi_1h_up)
+        + int(short_flow >= 6)
+        + int(ev_direction == "看多" and ev_score >= 8 and spot_score >= 7)
+        + int(squeeze_label == "空头挤压" and absorption_label in ("现货承接", "链上承接")),
+    )
+    return Signal(
+        symbol=snapshot.symbol,
+        kind="main_momentum_watch",
+        score=score,
+        title=f"{snapshot.symbol} 主流异动雷达",
+        message=f"主流异动雷达：{conclusion}；{'；'.join(reasons[:2])}。",
+        key=f"{snapshot.symbol}:main_momentum_watch",
+        snapshot=snapshot,
+    )
 
 
 def tier_threshold(symbol: str, rule: dict[str, Any], name: str, default: float) -> float:
@@ -3634,7 +3848,7 @@ def price_change_periods_from_klines(klines: list[Any], interval: str) -> dict[s
         return {}
     result: dict[str, float] = {}
     last_close = float(klines[-1][4])
-    for label in ("15m", "1h", "4h"):
+    for label in ("5m", "15m", "1h", "4h"):
         target_seconds = interval_seconds(label)
         if not target_seconds:
             continue
@@ -4873,14 +5087,20 @@ def format_csv_compact_number(value: Any, signed: bool = False) -> str:
 
 
 def topq_action_short(action: str) -> str:
+    if action.startswith("短线拉盘观察"):
+        return "短线拉盘，等确认"
+    if action.startswith("减仓/避险"):
+        return "减仓/避险，等回落确认"
+    if action.startswith("风险观察"):
+        return "风险观察，不追多"
     if action.startswith("建议减仓/避险"):
         return "建议减仓/避险"
     if action.startswith("强烈建议关注买入"):
         return "强烈建议关注买入"
     if action.startswith("建议观察"):
         return "建议观察，等确认入场"
-    if action.startswith("禁止追多"):
-        return "禁止追多，等回踩"
+    if action.startswith(("不追高", "禁止追多")):
+        return "短线拉盘，等确认"
     if action.startswith("禁止抄底"):
         return "禁止抄底，等待止跌"
     if action.startswith("关注反弹"):
@@ -4898,6 +5118,7 @@ def topq_kind_tiebreak_rank(kind: str | None, direction: str | None = None) -> i
     }
     bullish_order = {
         "main_trend_watch": 40,
+        "main_momentum_watch": 35,
         "hot_breakout": 30,
         "discovery": 20,
         "bottom_reversal": 10,
@@ -4927,9 +5148,10 @@ def topq_short_phrase(text: str | None, fallback: str = "观察") -> str:
         ("建议减仓/避险", "减仓/避险"),
         ("强烈建议关注买入", "强关注买入"),
         ("建议观察，等确认入场", "等确认入场"),
-        ("禁止追多，等回踩", "禁止追多"),
+        ("短线拉盘，等确认", "短线拉盘，等确认"),
         ("禁止抄底，等待止跌", "禁止抄底"),
         ("关注反弹机会", "关注反弹"),
+        ("短线拉盘观察，等待确认，不追高", "短线拉盘，等确认"),
         ("信号不足，继续盯盘", "继续盯盘"),
         ("真启动观察", "启动观察"),
         ("合约先行观察", "合约先行"),
@@ -4979,6 +5201,14 @@ def is_valid_binance_usdt_symbol(symbol: str | None) -> bool:
     return bool(VALID_BINANCE_USDT_SYMBOL_RE.fullmatch(str(symbol or "").strip().upper()))
 
 
+def compact_symbol_list_for_log(symbols: list[str], limit: int = 10) -> str:
+    if not symbols:
+        return "-"
+    visible = [str(symbol).upper() for symbol in symbols[:limit]]
+    suffix = f"...+{len(symbols) - limit}" if len(symbols) > limit else ""
+    return ", ".join([*visible, suffix] if suffix else visible)
+
+
 def display_usdt_symbol(symbol: str | None) -> str:
     normalized = str(symbol or "").strip().upper()
     return normalized[:-4] if normalized.endswith("USDT") else normalized
@@ -4997,6 +5227,7 @@ def signal_direction_label(kind: str | None) -> str:
         "discovery",
         "hot breakout",
         "main trend watch",
+        "main momentum watch",
         "bottom reversal",
         "early breakout",
         "possible early breakout",
@@ -5020,6 +5251,7 @@ def signal_kind_label(kind: str | None) -> str:
         "discovery": "启动发现",
         "hot_breakout": "热点突破",
         "main_trend_watch": "主流趋势雷达",
+        "main_momentum_watch": "主流异动雷达",
         "bottom_reversal": "底部反转",
         "top_risk": "顶部风险",
         "main_risk_watch": "主流风险雷达",
@@ -5033,6 +5265,16 @@ def signal_kind_label(kind: str | None) -> str:
     return labels.get(normalized, labels["unknown"])
 
 
+def topq_signal_kind_label(row: dict[str, str], action: str) -> str:
+    kind = topq_kind_normalized(row.get("kind"))
+    symbol = str(row.get("symbol") or "").strip().upper()
+    action_text = str(action or "")
+    cautious_action = text_has_any(action_text, ("禁止追多", "不追高", "观察"))
+    if kind in {"discovery", "hot_breakout"} and is_major_asset_tier(symbol) and cautious_action:
+        return "主流异动观察"
+    return signal_kind_label(kind)
+
+
 def entry_timing_direction(kind: str | None) -> str:
     raw = str(kind or "").strip().lower()
     normalized = raw.replace("_", " ").replace("-", " ")
@@ -5040,6 +5282,7 @@ def entry_timing_direction(kind: str | None) -> str:
         "discovery",
         "hot breakout",
         "main trend watch",
+        "main momentum watch",
         "bottom reversal",
         "early breakout",
         "possible early breakout",
@@ -5850,6 +6093,32 @@ def leading_direction_cn(direction: str) -> str:
     return "中性"
 
 
+def is_telegram_risk_signal(signal: Signal | None) -> bool:
+    if signal is None:
+        return False
+    normalized = str(signal.kind or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized in {"main_risk_watch", "top_risk", "top_exhaustion", "distribution", "crowded_top_risk"}
+
+
+def risk_signal_action_label(
+    conviction: int,
+    intent_label: str,
+    evidence_summary: str,
+    ev_display: int,
+    basis_label: str,
+) -> tuple[str, str]:
+    strong_risk = (
+        ev_display >= 5
+        or conviction >= 80
+        or intent_label in ("高位出货", "多杀多风险", "下跌中继")
+        or basis_label in PREMIUM_BASIS_STATES
+        or text_has_any(evidence_summary, TOPQ_RISK_EVIDENCE_KEYWORDS)
+    )
+    if strong_risk:
+        return "减仓/避险，等回落确认", "风险类信号禁止切换为买入口径"
+    return "风险观察，不追多", "风险证据未充分确认"
+
+
 def leading_signal_score(snapshot: MarketSnapshot, signal: Signal | None = None) -> LeadingSignalScore:
     bull_score = 0
     bear_score = 0
@@ -5908,8 +6177,22 @@ def leading_signal_score(snapshot: MarketSnapshot, signal: Signal | None = None)
     volume_hot = snapshot.volume_ratio_24h is not None and snapshot.volume_ratio_24h >= 2
     taker = snapshot.taker_buy_sell_ratio
     short_flow_score, mid_flow_score, _long_flow_score, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    short_avg = period_avg(("5m", "15m"))
+    mid_avg = period_avg(("1h", "4h"))
+    long_avg = period_avg(("12h", "24h", "72h"))
+    flow_cycle_divergence = False
+    if short_avg is not None and mid_avg is not None and long_avg is not None:
+        signs = {1 if value > 0 else -1 if value < 0 else 0 for value in (short_avg, mid_avg, long_avg)}
+        flow_cycle_divergence = 1 in signs and -1 in signs
+    bear_flow_reversal = long_avg is not None and short_avg is not None and long_avg > 0 and short_avg < 0
+    bull_flow_reversal = long_avg is not None and short_avg is not None and long_avg < 0 and short_avg > 0
     if volume_hot:
-        if one_hour_price >= -0.3 and (short_flow_score >= 6 or (taker is not None and taker >= 1.05)):
+        if (
+            one_hour_price >= -0.3
+            and (short_flow_score >= 6 or (taker is not None and taker >= 1.05))
+            and not bear_flow_reversal
+            and not flow_cycle_divergence
+        ):
             add("long", 2, "爆量不跌，多头承接吸筹")
         elif one_hour_price <= 0.3 and (short_flow_score <= 4 or (taker is not None and taker <= 0.95)):
             add("short", 2, "爆量不涨，顶部出货迹象")
@@ -5925,26 +6208,19 @@ def leading_signal_score(snapshot: MarketSnapshot, signal: Signal | None = None)
         elif funding >= 0.08 and snapshot.oi_change_percent > 0:
             add("short", 2, "费率极高+OI继续上升，多头过热，注意踩踏")
 
-    short_avg = period_avg(("5m", "15m"))
-    mid_avg = period_avg(("1h", "4h"))
-    long_avg = period_avg(("12h", "24h", "72h"))
     net_flow_reversal = "none"
-    flow_cycle_divergence = False
-    if long_avg is not None and short_avg is not None and long_avg < 0 and short_avg > 0:
+    if bull_flow_reversal:
         net_flow_reversal = "bull_reversal"
         add("long", 2, "长周期流出，短周期转正，资金开始回流")
         if mid_avg is not None and mid_avg > 0:
             add("long", 1, "1h/4h资金同步转正，回流确认增强")
-    elif long_avg is not None and short_avg is not None and long_avg > 0 and short_avg < 0:
+    elif bear_flow_reversal:
         net_flow_reversal = "bear_reversal"
         add("short", 2, "长周期流入，短周期转负，主力开始派发")
         if mid_avg is not None and mid_avg < 0:
             add("short", 1, "1h/4h资金同步转负，派发确认增强")
-    if net_flow_reversal == "none" and short_avg is not None and mid_avg is not None and long_avg is not None:
-        signs = {1 if value > 0 else -1 if value < 0 else 0 for value in (short_avg, mid_avg, long_avg)}
-        if 1 in signs and -1 in signs:
-            flow_cycle_divergence = True
-            items.append((1, "neutral", "资金周期分歧，暂不确认反转 +1"))
+    if flow_cycle_divergence:
+        items.append((1, "neutral", "资金周期分歧，暂不确认反转 +1"))
 
     short_net_negative = any(negative(period) for period in ("5m", "15m", "30m") if flow(period) is not None)
     short_net_positive = any(positive(period) for period in ("5m", "15m", "30m") if flow(period) is not None)
@@ -5983,7 +6259,7 @@ def leading_signal_score(snapshot: MarketSnapshot, signal: Signal | None = None)
     if flow_label == "短强中弱":
         label = "短线强，中线不支持"
     elif flow_label == "中长线派发":
-        label = "吸筹观察/中长线派发"
+        label = "资金分歧"
 
     ev_display: int | None = None
     has_flow_confirmation = short_flow_score >= 7 or mid_flow_score >= 7
@@ -5995,7 +6271,21 @@ def leading_signal_score(snapshot: MarketSnapshot, signal: Signal | None = None)
     if label == "主力建仓" and not strong_build_allowed:
         label = "资金回流观察"
 
-    sorted_items = [text for _points, _direction, text in sorted(items, key=lambda row: row[0], reverse=True)]
+    sorted_rows = sorted(items, key=lambda row: row[0], reverse=True)
+    if direction == "long":
+        primary_rows = [row for row in sorted_rows if row[1] != "short"]
+        opposite_rows = [row for row in sorted_rows if row[1] == "short"]
+        sorted_items = [text for _points, _direction, text in primary_rows]
+        if opposite_rows:
+            sorted_items.append(sanitize_opposite_leading_item(opposite_rows[0][2]))
+    elif direction == "short":
+        primary_rows = [row for row in sorted_rows if row[1] != "long"]
+        opposite_rows = [row for row in sorted_rows if row[1] == "long"]
+        sorted_items = [text for _points, _direction, text in primary_rows]
+        if opposite_rows:
+            sorted_items.append(sanitize_opposite_leading_item(opposite_rows[0][2]))
+    else:
+        sorted_items = [text for _points, _direction, text in sorted_rows]
     if not strong_build_allowed:
         sorted_items = [
             text.replace("主力悄悄建仓", "OI异动观察")
@@ -6060,14 +6350,17 @@ def leading_check_block(leading: LeadingSignalScore) -> str:
     items = leading_items_without_zero(leading, 6)
     if not items:
         return leading_summary_line(leading)
-    return "\n".join([leading_summary_line(leading)] + [f"- {item}" for item in items])
+    display_score = displayed_leading_items_score(items)
+    summary = f"领先信号: {display_score}分 {leading_direction_cn(leading.leading_direction)} {leading.leading_label}"
+    return "\n".join([summary] + [f"- {item}" for item in items])
 
 
 def leading_ask_brief(leading: LeadingSignalScore) -> str:
     items = leading_items_without_zero(leading, 2)
     suffix = "；".join(re.sub(r"\s*[+]\d+$", "", item) for item in items)
     detail = f" - {suffix}" if suffix else ""
-    return f"领先信号: {leading.leading_score}分 {leading.leading_label}{detail}"
+    display_score = displayed_leading_items_score(items) if items else leading.leading_score
+    return f"领先信号: {display_score}分 {leading.leading_label}{detail}"
 
 
 def leading_topq_brief(row: dict[str, str]) -> str:
@@ -6301,7 +6594,7 @@ def conviction_label(score: int) -> str:
     return "低"
 
 
-BULLISH_STRUCTURE_KINDS = {"discovery", "hot_breakout", "bottom_reversal", "main_trend_watch"}
+BULLISH_STRUCTURE_KINDS = {"discovery", "hot_breakout", "bottom_reversal", "main_trend_watch", "main_momentum_watch"}
 BREAKOUT_STRUCTURE_KINDS = {"discovery", "hot_breakout", "main_trend_watch"}
 RISK_STRUCTURE_KINDS = {"top_risk", "top_exhaustion", "distribution", "crowded_top_risk", "main_risk_watch"}
 TOPQ_BULLISH_KINDS = BULLISH_STRUCTURE_KINDS | {"main_trend_watch"}
@@ -6333,11 +6626,13 @@ def topq_is_risk_candidate(kind: str | None) -> bool:
 
 
 def topq_risk_action(evidence_summary: str, basis_label: str) -> str:
-    if "高位拥挤" in evidence_summary or basis_label in PREMIUM_BASIS_STATES:
-        return "高位拥挤，等回落确认"
-    if any(key in evidence_summary for key in ("出货", "多头过热", "顶部风险")):
-        return "建议减仓/避险"
-    return "关注顶部，不追空"
+    if (
+        "高位拥挤" in evidence_summary
+        or basis_label in PREMIUM_BASIS_STATES
+        or any(key in evidence_summary for key in ("出货", "多头过热", "顶部风险", "派发"))
+    ):
+        return "减仓/避险，等回落确认"
+    return "风险观察，不追多"
 
 
 def topq_strong_buy_allowed(row: dict[str, str], conviction: float, leading_score: float, evidence_score: float) -> bool:
@@ -6671,6 +6966,12 @@ def action_label(snapshot: MarketSnapshot, signal: Signal | None = None) -> tupl
     direction = signal_direction_label(signal.kind) if signal else None
     _basis_pct, basis_label, _basis_reason = basis_state(snapshot)
     squeeze_label, _squeeze_score, _squeeze_reason = squeeze_state(snapshot)
+    ev_total, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
+    ev_display = evidence_display_score(ev_direction, ev_items, ev_total)
+    if is_telegram_risk_signal(signal):
+        return risk_signal_action_label(conviction, intent_label, ev_summary, ev_display, basis_label)
+    if signal and signal.kind == "main_momentum_watch":
+        return "短线拉盘观察，等待确认，不追高", "主流异动雷达只做观察提醒"
     override, override_reason = structural_action_override(
         signal.kind if signal else None,
         basis_label,
@@ -6681,8 +6982,6 @@ def action_label(snapshot: MarketSnapshot, signal: Signal | None = None) -> tupl
     )
     if override:
         return override, override_reason or "结构限制"
-    ev_total, ev_direction, _ev_summary, ev_items = evidence_score(snapshot, signal)
-    ev_display = evidence_display_score(ev_direction, ev_items, ev_total)
     if intent_label == "短线逼空" and ev_display <= 2:
         return "短线逼空观察，不追", "证据不足"
     return action_from_trade_context(intent_label, conviction, direction, position_label)
@@ -7546,6 +7845,8 @@ def trader_panel_title(signal: Signal, intent_label: str, conviction: int) -> st
     kind = str(signal.kind or "").strip().lower()
     if kind == "main_trend_watch":
         return "🟢【主流趋势雷达】"
+    if kind == "main_momentum_watch":
+        return "🟡【主流异动雷达】"
     if kind == "main_risk_watch":
         return "🔴【主流风险雷达】"
     if intent_label in ("高位出货", "多杀多风险") or kind in ("top_risk", "top_exhaustion", "distribution", "crowded_top_risk"):
@@ -7635,7 +7936,7 @@ def panel_flow_source_title(snapshot: MarketSnapshot) -> str:
     return "✅ 主力净流（Binance）" if snapshot.net_flow_usd else "✅ 主力净流（Binance）"
 
 
-def panel_flow_judgement(snapshot: MarketSnapshot) -> str:
+def panel_flow_judgement(snapshot: MarketSnapshot, risk_panel: bool = False, kind: str | None = None) -> str:
     short_values = [snapshot.net_flow_usd.get(period) for period in ("5m", "15m", "1h")]
     mid_values = [snapshot.net_flow_usd.get(period) for period in ("4h", "12h", "24h")]
     long_values = [snapshot.net_flow_usd.get(period) for period in ("72h", "144h")]
@@ -7643,6 +7944,27 @@ def panel_flow_judgement(snapshot: MarketSnapshot) -> str:
     mid_sum = sum(value for value in mid_values if value is not None)
     long_sum = sum(value for value in long_values if value is not None)
     known_mid_values = [value for value in mid_values if value is not None]
+    long_crowded = any(
+        value is not None and value >= threshold
+        for value, threshold in (
+            (snapshot.global_long_short_ratio, 1.8),
+            (snapshot.top_account_ratio, 1.8),
+            (snapshot.top_position_ratio, 1.5),
+        )
+    )
+    short_price_down = any(
+        value is not None and value < 0
+        for value in (panel_price_change(snapshot, "15m"), panel_price_change(snapshot, "1h"))
+    )
+    if risk_panel:
+        short_flow_out = short_sum < 0 or summary_flow_value(snapshot, "15m") < 0
+        if long_crowded and short_flow_out:
+            return "多头拥挤 + 短线流出，追多风险高"
+        if short_flow_out or short_price_down:
+            return "多头拥挤 + 短线流出，追多风险高"
+        return "高位拥挤，等回落确认"
+    if topq_kind_normalized(kind) == "main_momentum_watch":
+        return "空头拥挤 + 短线急拉，异动观察；中周期资金仍需确认"
     if short_sum > 0 and mid_sum >= 0:
         return "短周期多头净流入，主力正在入场"
     if known_mid_values and all(value < 0 for value in known_mid_values):
@@ -7650,7 +7972,7 @@ def panel_flow_judgement(snapshot: MarketSnapshot) -> str:
     if long_sum > 0 and mid_sum >= 0:
         return "长周期资金承接，趋势基础较好"
     if short_sum > 0 and (snapshot.funding_rate_percent or 0) < 0:
-        return "空头过度/多头承接，关注反弹机会"
+        return "空头拥挤 + 短线急拉，等待中周期确认"
     if short_sum < 0 and mid_sum < 0 and (snapshot.funding_rate_percent or 0) > 0.08:
         return "多头过热/主力出货，注意获利了结"
     return "多周期资金分歧，方向待确认"
@@ -7659,7 +7981,7 @@ def panel_flow_judgement(snapshot: MarketSnapshot) -> str:
 def panel_action_icon(action: str) -> str:
     if action.startswith(("强烈建议关注买入", "关注反弹")):
         return "🟢"
-    if action.startswith(("建议减仓/避险", "禁止追多", "禁止抄底")):
+    if action.startswith(("减仓/避险", "建议减仓/避险", "禁止追多", "禁止抄底")):
         return "🔴"
     return "🟡"
 
@@ -7729,6 +8051,66 @@ def panel_evidence_category(item: EvidenceItem) -> tuple[int, str]:
     return 3, "🟡【观察】"
 
 
+def risk_panel_evidence_label(label: str, item: EvidenceItem) -> str:
+    text = normalize_evidence_label_for_panel(label, item)
+    replacements = {
+        "大户持仓偏多，疑似建仓": "大户持仓偏多",
+        "OI持续建仓": "OI增仓支撑",
+        "短线OI增，主力试盘": "短线OI增仓",
+        "中周期主力净流入": "中周期资金流入",
+        "长周期主力净流入": "长周期资金流入",
+        "短周期主力净流入": "短周期资金流入",
+        "现货/链上同步确认": "现货/链上有支撑",
+        "现货承接，买盘跟随": "现货承接",
+        "空头拥挤，关注反弹": "空头拥挤",
+        "空头过度拥挤，防逼空": "空头过度拥挤",
+    }
+    return replacements.get(text, text.replace("疑似建仓", "").replace("关注反弹", "").strip("， "))
+
+
+def momentum_panel_evidence_label(snapshot: MarketSnapshot, item: EvidenceItem) -> str:
+    raw_label = str(item.label or "").strip()
+    text = normalize_evidence_label_for_panel(raw_label, item)
+    if raw_label == "短线主力流入" and summary_flow_value(snapshot, "5m") > 0 and summary_flow_value(snapshot, "15m") <= 0:
+        return "5m突发流入，15m仍流出"
+    replacements = {
+        "短周期主力净流入": "短周期资金异动流入",
+        "中周期主力净流入": "中周期资金支撑",
+        "长周期主力净流入": "长周期资金支撑",
+        "散户空头拥挤，关注反弹": "空头拥挤可能反抽",
+        "空头拥挤，关注反弹": "空头拥挤可能反抽",
+        "空头过度拥挤，防逼空": "空头拥挤可能反抽",
+        "大户持仓偏多，疑似建仓": "大户持仓偏多，异动观察",
+        "现货承接，买盘跟随": "现货承接，观察确认",
+    }
+    return replacements.get(text, text)
+
+
+def is_momentum_evidence_item(item: EvidenceItem) -> bool:
+    label = str(item.label or "")
+    if item.polarity != "positive":
+        return False
+    if item.source in {"OI", "FLOW"}:
+        return True
+    return any(keyword in label for keyword in ("空头拥挤", "空头挤压", "现货承接", "链上承接"))
+
+
+def panel_evidence_category_for_signal(item: EvidenceItem, risk_panel: bool) -> tuple[int, str, bool]:
+    if item.polarity == "risk":
+        return 0, "🔴【风险】", True
+    if risk_panel and item.polarity == "positive":
+        return 2, "🟡【反向支撑】", False
+    rank, category = panel_evidence_category(item)
+    return rank, category, not risk_panel
+
+
+def main_momentum_panel_conclusion(snapshot: MarketSnapshot) -> str:
+    _short_flow, mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    if summary_flow_value(snapshot, "1h") < 0 or mid_flow <= 4 or flow_label in ("短强中弱", "中长线派发", "资金分歧"):
+        return "短线强，中线未确认"
+    return "短线拉盘观察"
+
+
 def normalize_trigger_phrase(text: str) -> str:
     phrase = str(text or "").strip()
     phrase = re.sub(r"^[+\-]?\d+\s*", "", phrase)
@@ -7760,19 +8142,95 @@ def normalize_trigger_phrase(text: str) -> str:
     return truncate_text(phrase, 14) if phrase else ""
 
 
-def trader_panel_triggers(snapshot: MarketSnapshot, signal: Signal, merged_kinds: list[str]) -> list[str]:
+def trader_panel_triggers(snapshot: MarketSnapshot, signal: Signal, merged_kinds: list[str]) -> tuple[int, list[str]]:
     _ev_score, _ev_direction, _ev_summary, evidence_items = evidence_score(snapshot, signal)
     trigger_items: list[tuple[int, int, str]] = []
+    display_score = 0
+    risk_panel = is_telegram_risk_signal(signal)
+    if signal.kind == "main_momentum_watch":
+        trigger_items.append((0, 0, f"🟡【观察】{main_momentum_panel_conclusion(snapshot)}"))
     if len(merged_kinds) > 1:
         trigger_items.append((3, 0, f"🟡【信号】{' + '.join(merged_kinds)}"))
     for item in evidence_items:
-        rank, category = panel_evidence_category(item)
+        rank, category, count_points = panel_evidence_category_for_signal(item, risk_panel)
         points = abs(item.points)
-        label = normalize_evidence_label_for_panel(item.label, item)
-        trigger_items.append((rank, -points, f"{category}{label} +{points}"))
+        if count_points:
+            display_score += points
+        label = risk_panel_evidence_label(item.label, item) if risk_panel and item.polarity == "positive" else normalize_evidence_label_for_panel(item.label, item)
+        suffix = f" +{points}" if count_points else ""
+        trigger_items.append((rank, -points, f"{category}{label}{suffix}"))
     trigger_items.sort(key=lambda row: (row[0], row[1]))
     triggers = [text for _rank, _points, text in trigger_items]
-    return list(dict.fromkeys(triggers))[:8]
+    return display_score, list(dict.fromkeys(triggers))[:8]
+
+
+def trader_panel_momentum_trigger_groups(snapshot: MarketSnapshot, signal: Signal) -> tuple[int, list[str], list[str]]:
+    _ev_score, _ev_direction, _ev_summary, evidence_items = evidence_score(snapshot, signal)
+    evidence_rows: list[tuple[int, str]] = []
+    risk_rows: list[tuple[int, str]] = []
+    display_score = 0
+    evidence_rows.append((0, main_momentum_panel_conclusion(snapshot)))
+    for item in evidence_items:
+        points = abs(item.points)
+        if item.polarity == "risk":
+            risk_rows.append((-points, normalize_evidence_label_for_panel(item.label, item)))
+            continue
+        if not is_momentum_evidence_item(item):
+            continue
+        display_score += points
+        evidence_rows.append((-points, f"{momentum_panel_evidence_label(snapshot, item)} +{points}"))
+    evidence = [text for _rank, text in sorted(evidence_rows, key=lambda row: row[0])]
+    risks = [text for _rank, text in sorted(risk_rows, key=lambda row: row[0])]
+    return display_score, list(dict.fromkeys(evidence))[:6], list(dict.fromkeys(risks))[:5]
+
+
+def classify_leading_panel_item(text: str) -> str:
+    risk_keywords = ("派发", "出货", "风险", "拥挤", "转负", "净卖出", "平仓", "顶部", "踩踏", "不支持")
+    long_keywords = ("建仓", "吸筹", "承接", "回流", "逼空", "转正", "推升")
+    if any(keyword in text for keyword in risk_keywords):
+        return "risk"
+    if any(keyword in text for keyword in long_keywords):
+        return "long"
+    return "neutral"
+
+
+def sanitize_opposite_leading_item(text: str, final_direction: str = "") -> str:
+    cleaned = text.replace("主力悄悄建仓", "OI异动观察")
+    cleaned = cleaned.replace("主力持续建仓", "OI持续增仓观察")
+    cleaned = cleaned.replace("中周期持续建仓", "中周期OI增仓观察")
+    prefix = "反向支撑：" if final_direction == "看空" else "反向风险提示："
+    return f"{prefix}{cleaned}"
+
+
+def displayed_leading_items_score(items: list[str]) -> int:
+    total = 0
+    for item in items:
+        match = re.search(r"\+(\d+)\s*$", item)
+        if match:
+            total += int(match.group(1))
+    return total
+
+
+def trader_panel_leading_items(leading: LeadingSignalScore, final_direction: str, limit: int = 6) -> tuple[int, list[str]]:
+    source_items = [item for item in leading.leading_items if not item.endswith("+0")]
+    if final_direction == "看空":
+        primary = [item for item in source_items if classify_leading_panel_item(item) != "long"]
+        opposite = [item for item in source_items if classify_leading_panel_item(item) == "long"]
+        result = primary[:limit]
+        if opposite and len(result) < limit:
+            result.append(sanitize_opposite_leading_item(opposite[0], final_direction))
+        display_items = list(dict.fromkeys(result))[:limit]
+        return displayed_leading_items_score(display_items), display_items
+    if final_direction == "看多":
+        primary = [item for item in source_items if classify_leading_panel_item(item) != "risk"]
+        opposite = [item for item in source_items if classify_leading_panel_item(item) == "risk"]
+        result = primary[:limit]
+        if opposite and len(result) < limit:
+            result.append(sanitize_opposite_leading_item(opposite[0], final_direction))
+        display_items = list(dict.fromkeys(result))[:limit]
+        return displayed_leading_items_score(display_items), display_items
+    display_items = source_items[:limit]
+    return displayed_leading_items_score(display_items), display_items
 
 
 def format_trader_panel(
@@ -7800,11 +8258,15 @@ def format_trader_panel(
     title = trader_panel_title(signal, intent_label, conviction)
     symbol_text = snapshot.symbol.replace("USDT", "/USDT")
     basis_text = "n/a" if basis_pct is None else f"{basis_pct:+.2f}%"
-    triggers = trader_panel_triggers(snapshot, signal, kinds)
+    risk_panel = is_telegram_risk_signal(signal)
+    trigger_display_score, triggers = trader_panel_triggers(snapshot, signal, kinds)
+    momentum_evidence: list[str] = []
+    momentum_risks: list[str] = []
+    if signal.kind == "main_momentum_watch":
+        trigger_display_score, momentum_evidence, momentum_risks = trader_panel_momentum_trigger_groups(snapshot, signal)
     leading = leading_signal_score(snapshot, signal)
-    leading_items = [item for item in leading.leading_items if not item.endswith("+0")][:6]
-    _ev_score, _ev_direction, _ev_summary, ev_items = evidence_score(snapshot, signal)
-    ev_display_score = sum(abs(item.points) for item in ev_items)
+    final_direction = "看空" if risk_panel else signal_direction_label(signal.kind)
+    leading_display_score, leading_items = trader_panel_leading_items(leading, final_direction, 6)
 
     lines = [
         title,
@@ -7838,17 +8300,25 @@ def format_trader_panel(
         flow_panel_value(snapshot, "24h"),
         flow_panel_value(snapshot, "72h"),
         flow_panel_value(snapshot, "144h"),
-        f"💬 {panel_flow_judgement(snapshot)}",
+        f"💬 {panel_flow_judgement(snapshot, risk_panel, signal.kind)}",
         "━━━━━━━━━━━━",
         f"💡 操作建议 {panel_action_icon(action)} {action} 置信度 {score_10}/10",
         "━━━━━━━━━━━━",
     ]
     if leading_items:
-        lines.append(f"🎯 领先信号（共{leading.leading_score}分）")
+        leading_title = "🎯 风险线索" if risk_panel else "🎯 领先信号"
+        lines.append(f"{leading_title}（共{leading_display_score}分）")
         lines.extend(f"- {item}" for item in leading_items)
         lines.append("━━━━━━━━━━━━")
-    lines.append(f"触发信号（共{ev_display_score}分）:")
-    lines.extend(f"• {trigger}" for trigger in triggers)
+    if signal.kind == "main_momentum_watch":
+        lines.append(f"✅ 异动证据（共{trigger_display_score}分）")
+        lines.extend(f"• {trigger}" for trigger in momentum_evidence)
+        if momentum_risks:
+            lines.append("⚠️ 风险提示")
+            lines.extend(f"• {trigger}" for trigger in momentum_risks)
+    else:
+        lines.append(f"触发信号（共{trigger_display_score}分）:")
+        lines.extend(f"• {trigger}" for trigger in triggers)
     lines.extend(
         [
             "━━━━━━━━━━━━",
@@ -8607,10 +9077,11 @@ def format_summary_for_telegram(snapshots: list[MarketSnapshot], top_n: int) -> 
     hot_funding_count = sum(1 for item in snapshots if (item.funding_rate_percent or 0) >= 0.03)
     flow_1h_positive = sum(1 for item in snapshots if summary_flow_value(item, "1h") > 0)
 
-    discovery_candidates = [item for item in snapshots if is_summary_discovery(item)]
-    hot_candidates = [item for item in snapshots if is_summary_hot(item)]
-    top_risk_candidates = [item for item in snapshots if is_summary_top_risk(item)]
-    distribution_candidates = [item for item in snapshots if is_summary_distribution(item)]
+    rankable_snapshots = [item for item in snapshots if is_summary_display_symbol(item.symbol)]
+    discovery_candidates = [item for item in rankable_snapshots if is_summary_discovery(item)]
+    hot_candidates = [item for item in rankable_snapshots if is_summary_hot(item)]
+    top_risk_candidates = [item for item in rankable_snapshots if is_summary_top_risk(item)]
+    distribution_candidates = [item for item in rankable_snapshots if is_summary_distribution(item)]
 
     temperature = market_temperature_score(snapshots)
 
@@ -8618,19 +9089,26 @@ def format_summary_for_telegram(snapshots: list[MarketSnapshot], top_n: int) -> 
     risk_set = {item.symbol for item in top_risk_candidates}
     distribution_set = {item.symbol for item in distribution_candidates}
 
-    discovery_leaders = sorted(
-        [
-            item for item in snapshots
-            if item.symbol not in hot_set
-            and item.symbol not in risk_set
-            and item.symbol not in distribution_set
-            and discovery_score(item) > 0
-        ],
-        key=discovery_score,
+    discovery_pool = [
+        item for item in rankable_snapshots
+        if item.symbol not in hot_set
+        and item.symbol not in risk_set
+        and item.symbol not in distribution_set
+        and discovery_score(item) > 0
+    ]
+    primary_discovery_leaders = sorted(
+        [item for item in discovery_pool if item.taker_buy_sell_ratio is not None and item.taker_buy_sell_ratio >= 1.0],
+        key=summary_discovery_display_score,
         reverse=True,
-    )[:3]
-    flow_leaders = [item for item in sorted(snapshots, key=lambda item: summary_flow_value(item, "15m"), reverse=True) if summary_flow_value(item, "15m") > 0][:3]
-    oi_leaders = [item for item in sorted(snapshots, key=lambda item: item.oi_change_percent, reverse=True) if item.oi_change_percent > 0][:3]
+    )
+    fallback_discovery_leaders = sorted(
+        [item for item in discovery_pool if item.taker_buy_sell_ratio is None or item.taker_buy_sell_ratio < 1.0],
+        key=summary_discovery_display_score,
+        reverse=True,
+    )
+    discovery_leaders = (primary_discovery_leaders + fallback_discovery_leaders)[:3]
+    flow_leaders = [item for item in sorted(rankable_snapshots, key=lambda item: summary_flow_value(item, "15m"), reverse=True) if summary_flow_value(item, "15m") > 0][:3]
+    oi_leaders = [item for item in sorted(rankable_snapshots, key=lambda item: item.oi_change_percent, reverse=True) if item.oi_change_percent > 0][:3]
     risk_leaders = sorted(
         top_risk_candidates,
         key=top_risk_score,
@@ -8724,23 +9202,39 @@ def format_summary_ranking(
 
 def format_summary_risk_item(snapshot: MarketSnapshot) -> str:
     return (
-        f"🔴 {base_symbol(snapshot.symbol)} {snapshot.price_change_percent:+.1f}% | "
+        f"🔴 {summary_symbol_label(snapshot.symbol)} {snapshot.price_change_percent:+.1f}% | "
         f"OI{snapshot.oi_change_percent:+.1f}% | 费率{format_realtime_funding(snapshot.funding_rate_percent)} | "
         f"风险{top_risk_score(snapshot):.0f}"
     )
 
 
+def summary_discovery_item_icon(snapshot: MarketSnapshot) -> str:
+    taker = snapshot.taker_buy_sell_ratio
+    if taker is not None and taker >= 1.05:
+        return "🟢"
+    return "🟡"
+
+
 def format_summary_discovery_item(snapshot: MarketSnapshot) -> str:
+    icon = summary_discovery_item_icon(snapshot)
     return (
-        f"🟢 {base_symbol(snapshot.symbol)} {snapshot.price_change_percent:+.2f}% | "
+        f"{icon} {summary_symbol_label(snapshot.symbol)} {snapshot.price_change_percent:+.2f}% | "
         f"OI{snapshot.oi_change_percent:+.2f}% | 主买{format_optional_value(snapshot.taker_buy_sell_ratio)} | "
         f"分{discovery_score(snapshot):.1f}"
     )
 
 
+def summary_flow_item_icon(snapshot: MarketSnapshot) -> str:
+    flow15 = summary_flow_value(snapshot, "15m")
+    flow1h = summary_flow_value(snapshot, "1h")
+    if flow15 > 0 and flow1h > 0:
+        return "🟢"
+    return "🟡"
+
+
 def format_summary_flow_item(snapshot: MarketSnapshot) -> str:
     return (
-        f"🟢 {base_symbol(snapshot.symbol)} {snapshot.price_change_percent:+.2f}% | "
+        f"{summary_flow_item_icon(snapshot)} {summary_symbol_label(snapshot.symbol)} {snapshot.price_change_percent:+.2f}% | "
         f"15m {format_usd(summary_flow_value(snapshot, '15m'))} | "
         f"1h {format_usd(summary_flow_value(snapshot, '1h'))}"
     )
@@ -8748,7 +9242,7 @@ def format_summary_flow_item(snapshot: MarketSnapshot) -> str:
 
 def format_summary_oi_item(snapshot: MarketSnapshot) -> str:
     return (
-        f"🟡 {base_symbol(snapshot.symbol)} {snapshot.price_change_percent:+.2f}% | "
+        f"🟡 {summary_symbol_label(snapshot.symbol)} {snapshot.price_change_percent:+.2f}% | "
         f"OI{snapshot.oi_change_percent:+.1f}% | 费率{format_realtime_funding(snapshot.funding_rate_percent)}"
     )
 
@@ -8875,6 +9369,18 @@ def discovery_score(snapshot: MarketSnapshot) -> float:
     if summary_flow_value(snapshot, "1h") > 0:
         flow_bonus += 2
     return snapshot.price_change_percent + snapshot.oi_change_percent + max(taker - 1, 0) * 2 + flow_bonus - crowd_penalty
+
+
+def summary_discovery_display_score(snapshot: MarketSnapshot) -> float:
+    score = discovery_score(snapshot)
+    taker = snapshot.taker_buy_sell_ratio
+    if taker is not None and taker < 0.9:
+        return score - 1_000
+    if taker is not None and taker < 1.0:
+        return score - 20
+    if taker is not None and taker < 1.05:
+        return score - 8
+    return score
 
 
 def top_risk_score(snapshot: MarketSnapshot) -> float:

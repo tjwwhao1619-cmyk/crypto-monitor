@@ -12,7 +12,7 @@ import requests
 import yaml
 
 BASE = "https://fapi.binance.com"
-BULL = {"discovery", "hot_breakout", "bottom_reversal", "main_trend_watch"}
+BULL = {"discovery", "hot_breakout", "bottom_reversal", "main_trend_watch", "main_momentum_watch"}
 BEAR = {"top_risk", "distribution", "top_exhaustion", "main_risk_watch"}
 HORIZONS = {"15m": 900, "1h": 3600, "4h": 14400, "12h": 43200, "24h": 86400}
 REPORT_HORIZONS = ["15m", "1h", "4h", "12h", "24h"]
@@ -931,7 +931,7 @@ def run_backtest(args):
         raise SystemExit("no backtestable signals")
 
     print("[BACKTEST] 最近信号回测")
-    print("说明: discovery/hot/main_trend_watch 按看多计算，top_risk/distribution/main_risk_watch 按看空/风险计算")
+    print("说明: discovery/hot/main_trend_watch/main_momentum_watch 按看多计算，top_risk/distribution/main_risk_watch 按看空/风险计算")
     print("")
 
     for kind in sorted(set(x["kind"] for x in results)):
