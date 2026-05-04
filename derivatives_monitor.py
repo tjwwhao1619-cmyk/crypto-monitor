@@ -52,6 +52,11 @@ DEFILLAMA_STABLECOIN_TTL_SECONDS = 2700
 DEFILLAMA_EXTENDED_TTL_SECONDS = 3600
 DEXSCREENER_MARKET_TTL_SECONDS = 900
 DEXSCREENER_COLLECT_LIMIT = 30
+FUTURES_ONLY_LIQUIDITY_SCAN_INTERVAL_SECONDS = 600
+FUTURES_ONLY_LIQUIDITY_COOLDOWN_SECONDS = 1800
+FUTURES_ONLY_LIQUIDITY_DEX_LIMIT = 50
+FUTURES_ONLY_MIN_OI_NOTIONAL = 5_000_000
+FUTURES_ONLY_MIN_DEX_LIQUIDITY = 100_000
 ONCHAIN_SCAN_INTERVAL_SECONDS = 900
 ONCHAIN_SCAN_ADDRESS_TTL_SECONDS = 900
 ONCHAIN_SCAN_ADDRESS_LIMIT = 20
@@ -332,6 +337,26 @@ class OnchainTransferEvent:
 
 
 @dataclass(frozen=True)
+class FuturesOnlyLiquidityWatchItem:
+    timestamp: float
+    symbol: str
+    base_asset: str
+    oi_notional: float
+    liquidity_usd: float
+    liquidity_change_15m_pct: float | None
+    liquidity_change_1h_pct: float | None
+    liquidity_change_15m_abs: float | None
+    liquidity_change_1h_abs: float | None
+    dex_chain: str
+    dex_id: str
+    pair_address: str
+    volume_24h: float | None
+    spot_listed_exchanges: str
+    reason: str
+    raw_json: dict[str, Any] | list[Any] | str | None
+
+
+@dataclass(frozen=True)
 class MainAssetScore:
     total_score: int
     label: str
@@ -528,6 +553,10 @@ class DerivativesMonitor:
         self.last_defillama_extended_collect_at = 0.0
         self.last_dexscreener_collect_at = 0.0
         self.dexscreener_symbol_collect_cache: dict[str, float] = {}
+        self.last_futures_only_liquidity_scan_at = 0.0
+        self.futures_only_liquidity_alerted_at: dict[str, float] = {}
+        self.spot_listing_cache_at = 0.0
+        self.spot_listing_cache: dict[str, set[str]] = {}
         self.last_onchain_scan_collect_at = 0.0
         self.onchain_scan_address_cache: dict[tuple[str, str], float] = {}
         self.init_external_data_store()
@@ -597,6 +626,16 @@ class DerivativesMonitor:
                 requires_api_key=False,
                 ttl_seconds=300,
                 priority=30,
+                enabled=True,
+                confidence="medium",
+            ),
+            "Futures-only liquidity watch": DataSourceSpec(
+                name="Futures-only liquidity watch",
+                category="external",
+                is_real_onchain=False,
+                requires_api_key=False,
+                ttl_seconds=FUTURES_ONLY_LIQUIDITY_SCAN_INTERVAL_SECONDS,
+                priority=31,
                 enabled=True,
                 confidence="medium",
             ),
@@ -807,6 +846,25 @@ class DerivativesMonitor:
                     CREATE INDEX IF NOT EXISTS idx_onchain_transfer_events_source_time ON onchain_transfer_events(source, timestamp);
                     CREATE UNIQUE INDEX IF NOT EXISTS idx_onchain_transfer_events_unique_basic
                         ON onchain_transfer_events(chain, tx_hash, asset, from_address, to_address);
+                    CREATE TABLE IF NOT EXISTS futures_only_liquidity_watch (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp REAL NOT NULL,
+                        symbol TEXT NOT NULL,
+                        base_asset TEXT,
+                        oi_notional REAL,
+                        liquidity_usd REAL,
+                        liquidity_change_15m_pct REAL,
+                        liquidity_change_1h_pct REAL,
+                        dex_chain TEXT,
+                        dex_id TEXT,
+                        pair_address TEXT,
+                        spot_listed_exchanges TEXT,
+                        reason TEXT,
+                        raw_json TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_futures_only_liquidity_symbol_time
+                        ON futures_only_liquidity_watch(symbol, timestamp);
                     """
                 )
                 self.ensure_source_health_scan_columns(conn)
@@ -1695,6 +1753,305 @@ class DerivativesMonitor:
             self.update_source_health("DexScreener", True if written else False, error, fetched_count=fetched, written_count=written)
             logging.info("DexScreener market snapshots collected: fetched=%s written=%s no_pair=%s", fetched, written, no_pair)
 
+    def fetch_major_spot_listing_sets(self, force: bool = False) -> dict[str, set[str]]:
+        now = time.time()
+        if not force and self.spot_listing_cache and now - self.spot_listing_cache_at < 3600:
+            return self.spot_listing_cache
+        listings: dict[str, set[str]] = {"Binance": set(), "OKX": set(), "Bybit": set()}
+        errors: list[str] = []
+        try:
+            response = self.session.get("https://api.binance.com/api/v3/exchangeInfo", timeout=15)
+            response.raise_for_status()
+            payload = response.json()
+            for row in payload.get("symbols", []) if isinstance(payload, dict) else []:
+                if not isinstance(row, dict) or row.get("status") != "TRADING":
+                    continue
+                base = str(row.get("baseAsset") or "").upper()
+                quote = str(row.get("quoteAsset") or "").upper()
+                if base and quote in {"USDT", "USDC"}:
+                    listings["Binance"].add(base)
+        except Exception as exc:
+            errors.append(f"Binance spot {type(exc).__name__}")
+        try:
+            response = self.session.get(
+                "https://www.okx.com/api/v5/public/instruments",
+                params={"instType": "SPOT"},
+                timeout=15,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            for row in payload.get("data", []) if isinstance(payload, dict) else []:
+                if not isinstance(row, dict) or row.get("state") not in {None, "live"}:
+                    continue
+                base = str(row.get("baseCcy") or "").upper()
+                quote = str(row.get("quoteCcy") or "").upper()
+                inst_id = str(row.get("instId") or "").upper()
+                if not base and "-" in inst_id:
+                    base, quote = inst_id.split("-", 1)[:2]
+                if base and quote in {"USDT", "USDC"}:
+                    listings["OKX"].add(base)
+        except Exception as exc:
+            errors.append(f"OKX spot {type(exc).__name__}")
+        try:
+            cursor = None
+            for _page in range(4):
+                params = {"category": "spot", "limit": 1000}
+                if cursor:
+                    params["cursor"] = cursor
+                response = self.session.get("https://api.bybit.com/v5/market/instruments-info", params=params, timeout=15)
+                response.raise_for_status()
+                payload = response.json()
+                result = payload.get("result") if isinstance(payload, dict) else {}
+                rows = result.get("list") if isinstance(result, dict) else []
+                for row in rows if isinstance(rows, list) else []:
+                    if not isinstance(row, dict) or row.get("status") not in {None, "Trading"}:
+                        continue
+                    base = str(row.get("baseCoin") or "").upper()
+                    quote = str(row.get("quoteCoin") or "").upper()
+                    if base and quote in {"USDT", "USDC"}:
+                        listings["Bybit"].add(base)
+                cursor = str(result.get("nextPageCursor") or "") if isinstance(result, dict) else ""
+                if not cursor:
+                    break
+        except Exception as exc:
+            errors.append(f"Bybit spot {type(exc).__name__}")
+        self.spot_listing_cache = listings
+        self.spot_listing_cache_at = now
+        error_text = "; ".join(errors)
+        self.update_source_health("Binance spot", False if len(errors) >= 3 else True, error_text or None, fetched_count=sum(len(v) for v in listings.values()))
+        logging.info(
+            "spot listing cache refreshed: Binance=%s OKX=%s Bybit=%s errors=%s",
+            len(listings["Binance"]),
+            len(listings["OKX"]),
+            len(listings["Bybit"]),
+            error_text or "-",
+        )
+        return listings
+
+    def major_spot_listing_status(self, base_asset: str) -> tuple[bool, list[str]]:
+        base = str(base_asset or "").upper()
+        listings = self.fetch_major_spot_listing_sets()
+        exchanges = [name for name, assets in listings.items() if base in assets]
+        return bool(exchanges), exchanges
+
+    def fetch_futures_oi_notional_details(self, symbol: str) -> tuple[float, float | None, float | None]:
+        try:
+            oi_row = self.get("/fapi/v1/openInterest", {"symbol": symbol})
+            price_row = self.get("/fapi/v1/ticker/price", {"symbol": symbol})
+            oi = parse_float(oi_row.get("openInterest")) if isinstance(oi_row, dict) else None
+            price = parse_float(price_row.get("price")) if isinstance(price_row, dict) else None
+            notional = (oi or 0.0) * (price or 0.0)
+            return notional, oi, price
+        except Exception:
+            logging.debug("Failed to fetch futures OI notional details for %s", symbol, exc_info=True)
+            return 0.0, None, None
+
+    def dex_liquidity_history_changes(self, symbol: str, now: float) -> tuple[float | None, float | None, float | None, float | None]:
+        cutoff = now - 5 * 3600
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, liquidity_usd
+                    FROM dex_market_snapshots
+                    WHERE source = 'DexScreener' AND symbol = ? AND timestamp >= ? AND liquidity_usd IS NOT NULL
+                    ORDER BY timestamp ASC
+                    """,
+                    (symbol, cutoff),
+                ).fetchall()
+        parsed = [(parse_float(ts) or 0.0, parse_float(liq)) for ts, liq in rows if parse_float(liq) is not None]
+
+        def previous_liquidity(seconds: int) -> float | None:
+            target = now - seconds
+            candidates = [liq for ts, liq in parsed if ts <= target and liq is not None]
+            return candidates[-1] if candidates else None
+
+        current_values = [liq for _ts, liq in parsed if liq is not None]
+        current = current_values[-1] if current_values else None
+
+        def change(seconds: int) -> tuple[float | None, float | None]:
+            prev = previous_liquidity(seconds)
+            if current is None or prev is None or prev <= 0:
+                return None, None
+            return (current - prev) / prev * 100, current - prev
+
+        pct_15m, abs_15m = change(900)
+        pct_1h, abs_1h = change(3600)
+        return pct_15m, pct_1h, abs_15m, abs_1h
+
+    def futures_only_liquidity_trigger_reason(
+        self,
+        liquidity: float | None,
+        pct_15m: float | None,
+        pct_1h: float | None,
+        abs_15m: float | None,
+        abs_1h: float | None,
+    ) -> str | None:
+        if liquidity is None or liquidity < FUTURES_ONLY_MIN_DEX_LIQUIDITY:
+            return None
+        checks = (
+            ("15m", pct_15m, abs_15m, 10, 50_000),
+            ("1h", pct_1h, abs_1h, 20, 100_000),
+        )
+        for label, pct, absolute, pct_threshold, abs_threshold in checks:
+            if pct is None or absolute is None:
+                continue
+            if pct >= pct_threshold or absolute >= abs_threshold:
+                return f"DEX流动性增加: {label} {pct:+.1f}% / {format_usd(absolute)}"
+            if pct <= -pct_threshold or absolute <= -abs_threshold:
+                return f"DEX流动性减少: {label} {pct:+.1f}% / {format_usd(absolute)}"
+        return None
+
+    def write_futures_only_liquidity_watch_item(self, item: FuturesOnlyLiquidityWatchItem) -> None:
+        raw_json = json.dumps(item.raw_json, ensure_ascii=False) if item.raw_json is not None else None
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO futures_only_liquidity_watch (
+                        timestamp, symbol, base_asset, oi_notional, liquidity_usd,
+                        liquidity_change_15m_pct, liquidity_change_1h_pct, dex_chain,
+                        dex_id, pair_address, spot_listed_exchanges, reason, raw_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item.timestamp,
+                        item.symbol,
+                        item.base_asset,
+                        item.oi_notional,
+                        item.liquidity_usd,
+                        item.liquidity_change_15m_pct,
+                        item.liquidity_change_1h_pct,
+                        item.dex_chain,
+                        item.dex_id,
+                        item.pair_address,
+                        item.spot_listed_exchanges,
+                        item.reason,
+                        raw_json,
+                        time.time(),
+                    ),
+                )
+        self.write_external_data_points(
+            [
+                ExternalDataPoint("DexScreener", item.symbol, item.base_asset, "dex_liquidity_change_15m", item.liquidity_change_15m_pct, item.timestamp, item.raw_json, "medium", False),
+                ExternalDataPoint("DexScreener", item.symbol, item.base_asset, "dex_liquidity_change_1h", item.liquidity_change_1h_pct, item.timestamp, item.raw_json, "medium", False),
+                ExternalDataPoint("Binance futures", item.symbol, item.base_asset, "futures_oi_notional", item.oi_notional, item.timestamp, {"source": "Binance futures"}, "high", False),
+                ExternalDataPoint("Binance spot", item.symbol, item.base_asset, "major_spot_listing_status", 0, item.timestamp, {"listed_exchanges": item.spot_listed_exchanges}, "high", False),
+            ]
+        )
+
+    def futures_only_liquidity_embed(self, item: FuturesOnlyLiquidityWatchItem) -> DiscordOutboundMessage:
+        increasing = "增加" in item.reason
+        title = "🟢 DEX流动性增加" if increasing else "🔴 DEX流动性减少"
+        explanation = (
+            "合约热度较高，DEX流动性增加，可能有现货承接/做市增强；仍需确认主流现货未上。"
+            if increasing
+            else "合约热度较高但DEX流动性下降，注意流动性撤出/波动放大风险。"
+        )
+        fields = [
+            ("币种", f"{item.symbol} / {item.base_asset}", True),
+            ("上架状态", "Binance Futures: 已上\n主流现货: 未发现 Binance/OKX/Bybit 现货", False),
+            ("OI", f"OI notional: {format_usd(item.oi_notional)}", True),
+            (
+                "DEX流动性",
+                (
+                    f"{item.dex_chain} / {item.dex_id} / {short_address(item.pair_address)}\n"
+                    f"liquidity: {format_usd(item.liquidity_usd)}\n"
+                    f"15m {format_percent_optional(item.liquidity_change_15m_pct)} / "
+                    f"1h {format_percent_optional(item.liquidity_change_1h_pct)}\n"
+                    f"volume_24h: {format_usd(item.volume_24h)}"
+                ),
+                False,
+            ),
+            ("解释", explanation, False),
+            ("说明", "DEX流动性变化不等同交易所买盘或钱包净流。", False),
+        ]
+        channel_key = "onchain" if self.discord_config.channel_ids.get("onchain") else "alerts"
+        return DiscordOutboundMessage(channel_key=channel_key, title=title, color=DISCORD_COLOR_WATCH, fields=fields, symbol=item.symbol, kind="futures_only_liquidity")
+
+    def collect_futures_only_liquidity_watch_if_due(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_futures_only_liquidity_scan_at < FUTURES_ONLY_LIQUIDITY_SCAN_INTERVAL_SECONDS:
+            return
+        self.last_futures_only_liquidity_scan_at = now
+        fetched = written = alerts = no_pair = 0
+        try:
+            exchange_symbols = self.fetch_usdt_perpetual_symbols()
+            candidates = []
+            for row in exchange_symbols:
+                symbol = str(row.get("symbol") or "").upper()
+                base = str(row.get("baseAsset") or "").upper()
+                if not symbol or not base:
+                    continue
+                spot_listed, exchanges = self.major_spot_listing_status(base)
+                if spot_listed:
+                    continue
+                candidates.append((symbol, base, exchanges))
+            oi_values = self.fetch_open_interest_values([symbol for symbol, _base, _exchanges in candidates])
+            ranked = sorted(
+                ((symbol, base, exchanges, oi_values.get(symbol, 0.0)) for symbol, base, exchanges in candidates),
+                key=lambda row: row[3],
+                reverse=True,
+            )
+            for symbol, base, exchanges, oi_notional in ranked:
+                if fetched >= FUTURES_ONLY_LIQUIDITY_DEX_LIMIT:
+                    break
+                if oi_notional < FUTURES_ONLY_MIN_OI_NOTIONAL:
+                    continue
+                fetched += 1
+                try:
+                    pair = self.fetch_dexscreener_pair_for_symbol(symbol)
+                    if not pair:
+                        no_pair += 1
+                        continue
+                    self.persist_dexscreener_pair_snapshot(symbol, pair)
+                    liquidity = safe_float((pair.get("liquidity") or {}).get("usd"))
+                    pct_15m, pct_1h, abs_15m, abs_1h = self.dex_liquidity_history_changes(symbol, now)
+                    reason = self.futures_only_liquidity_trigger_reason(liquidity, pct_15m, pct_1h, abs_15m, abs_1h)
+                    self.write_external_data_points(
+                        [
+                            ExternalDataPoint("Binance futures", symbol, base, "futures_oi_notional", oi_notional, now, {"source": "Binance futures"}, "high", False),
+                            ExternalDataPoint("Binance spot", symbol, base, "major_spot_listing_status", 0, now, {"listed_exchanges": exchanges}, "high", False),
+                        ]
+                    )
+                    if not reason:
+                        continue
+                    last_alert = self.futures_only_liquidity_alerted_at.get(symbol, 0.0)
+                    if not force and now - last_alert < FUTURES_ONLY_LIQUIDITY_COOLDOWN_SECONDS:
+                        continue
+                    item = FuturesOnlyLiquidityWatchItem(
+                        timestamp=now,
+                        symbol=symbol,
+                        base_asset=base,
+                        oi_notional=oi_notional,
+                        liquidity_usd=liquidity or 0.0,
+                        liquidity_change_15m_pct=pct_15m,
+                        liquidity_change_1h_pct=pct_1h,
+                        liquidity_change_15m_abs=abs_15m,
+                        liquidity_change_1h_abs=abs_1h,
+                        dex_chain=str(pair.get("chainId") or "-"),
+                        dex_id=str(pair.get("dexId") or "-"),
+                        pair_address=str(pair.get("pairAddress") or ""),
+                        volume_24h=safe_float((pair.get("volume") or {}).get("h24")),
+                        spot_listed_exchanges=",".join(exchanges),
+                        reason=reason,
+                        raw_json=pair,
+                    )
+                    self.write_futures_only_liquidity_watch_item(item)
+                    written += 1
+                    self.futures_only_liquidity_alerted_at[symbol] = now
+                    if self.discord_config.enabled and self.discord_config.bot_token:
+                        self.enqueue_discord_message(self.futures_only_liquidity_embed(item))
+                        alerts += 1
+                except Exception as exc:
+                    logging.debug("futures-only liquidity watch symbol failed: symbol=%s", symbol, exc_info=True)
+                    self.update_source_health("Futures-only liquidity watch", False, f"{type(exc).__name__}: {exc}", fetched_count=fetched, written_count=written)
+            self.update_source_health("Futures-only liquidity watch", True, fetched_count=fetched, written_count=written)
+            logging.info("futures-only liquidity watch scan: fetched=%s written=%s alerts=%s no_pair=%s", fetched, written, alerts, no_pair)
+        except Exception as exc:
+            logging.debug("futures-only liquidity watch scan failed", exc_info=True)
+            self.update_source_health("Futures-only liquidity watch", False, f"{type(exc).__name__}: {exc}", fetched_count=fetched, written_count=written)
+
     def collect_defillama_stablecoin_supply_if_due(self, force: bool = False) -> None:
         now = time.time()
         spec = self.data_sources.get("DefiLlama stablecoin supply")
@@ -2200,6 +2557,7 @@ class DerivativesMonitor:
         self.collect_defillama_stablecoin_supply_if_due()
         self.collect_defillama_extended_metrics_if_due()
         self.collect_dexscreener_market_snapshots_if_due()
+        self.collect_futures_only_liquidity_watch_if_due()
         self.collect_onchain_scan_transfers_if_due()
 
     def persist_external_confirmation_metrics(
@@ -2281,6 +2639,7 @@ class DerivativesMonitor:
             ("exchange_balances", "timestamp"),
             ("dex_market_snapshots", "timestamp"),
             ("onchain_transfer_events", "timestamp"),
+            ("futures_only_liquidity_watch", "timestamp"),
         )
         counts: dict[str, int] = {}
         with self.external_data_lock:
@@ -2307,6 +2666,8 @@ class DerivativesMonitor:
                         SELECT source, timestamp FROM dex_market_snapshots
                         UNION ALL
                         SELECT source, timestamp FROM onchain_transfer_events
+                        UNION ALL
+                        SELECT 'Futures-only liquidity watch' AS source, timestamp FROM futures_only_liquidity_watch
                     )
                     WHERE timestamp >= ?
                     GROUP BY source
@@ -2345,6 +2706,7 @@ class DerivativesMonitor:
             "exchange_balances",
             "dex_market_snapshots",
             "onchain_transfer_events",
+            "futures_only_liquidity_watch",
         ):
             lines.append(f"- {table}: {table_counts.get(table, 0)}")
         lines.append("")
@@ -2353,6 +2715,60 @@ class DerivativesMonitor:
             lines.extend(f"- {source}: {count}" for source, count in source_top)
         else:
             lines.append("- 暂无最近24h采集数据")
+        return "\n".join(lines)
+
+    def recent_futures_only_liquidity_watch_rows(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, symbol, base_asset, oi_notional, liquidity_usd,
+                           liquidity_change_15m_pct, liquidity_change_1h_pct, dex_chain,
+                           dex_id, pair_address, spot_listed_exchanges, reason
+                    FROM futures_only_liquidity_watch
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        keys = (
+            "timestamp",
+            "symbol",
+            "base_asset",
+            "oi_notional",
+            "liquidity_usd",
+            "liquidity_change_15m_pct",
+            "liquidity_change_1h_pct",
+            "dex_chain",
+            "dex_id",
+            "pair_address",
+            "spot_listed_exchanges",
+            "reason",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def format_futures_only_liquidity_watch(self) -> str:
+        self.collect_futures_only_liquidity_watch_if_due()
+        rows = self.recent_futures_only_liquidity_watch_rows(20)
+        lines = [
+            "合约先行流动性雷达",
+            "口径: Binance Futures 已上，未发现 Binance/OKX/Bybit 主流现货，且观察 DexScreener 流动性变化。",
+            "说明: DEX流动性变化不等同交易所买盘或钱包净流。",
+        ]
+        if not rows:
+            spec = self.data_sources.get("Futures-only liquidity watch")
+            last_success = format_ts_short(spec.last_success if spec else None)
+            error_text = truncate_text(spec.last_error if spec else "-", 120)
+            lines.append(f"当前暂无触发项。last_success={last_success} error={error_text or '-'}")
+            return "\n".join(lines)
+        for row in rows:
+            lines.append(
+                f"{row.get('symbol')} | OI {format_usd(parse_float(row.get('oi_notional')))} | "
+                f"liq {format_usd(parse_float(row.get('liquidity_usd')))} | "
+                f"15m {format_percent_optional(parse_float(row.get('liquidity_change_15m_pct')))} / "
+                f"1h {format_percent_optional(parse_float(row.get('liquidity_change_1h_pct')))} | "
+                f"{row.get('dex_chain')}/{row.get('dex_id')} | 主流现货未发现 | {row.get('reason')}"
+            )
         return "\n".join(lines)
 
     def format_external_source_health(self, only_available: bool = False) -> str:
@@ -5673,6 +6089,8 @@ class DerivativesMonitor:
             return discord_summary_embed_v2("数据源健康检查", self.format_external_source_health(), "debug")
         if command == "!采集统计":
             return discord_summary_embed_v2("外部数据采集统计", self.format_external_collection_stats(), "debug")
+        if command in ("!合约先行", "!合约先行流动性", "!未上现货"):
+            return discord_onchain_embed_v2("🟣 合约先行流动性雷达", self.format_futures_only_liquidity_watch(), "onchain")
         if command == "!外部资金来源":
             return discord_onchain_embed_v2("外部资金来源", self.format_external_source_health(only_available=False), "onchain")
         if command in ("!外部资金总览", "!资金面", "!资金驾驶舱"):
@@ -8716,6 +9134,7 @@ def discord_help_text() -> str:
         "!山寨 - 查看最近山寨观察队列 Top10\n"
         "!数据源 - 查看采集层数据源健康状态\n"
         "!采集统计 - 查看外部数据最近24h采集数量\n"
+        "!合约先行 - 查看合约先上、主流现货未上、DEX流动性变化观察\n"
         "!外部资金来源 - 查看当前真实可用外部资金来源\n"
         "!外部资金总览 / !资金面 - 查看外部资金驾驶舱\n"
         "!地址源 - 查看自建链上地址标签库状态\n"
