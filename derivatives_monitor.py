@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import base64
 import concurrent.futures
 import csv
@@ -7,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -60,6 +62,31 @@ DEFAULT_CONVICTION_WATCH_THRESHOLD = 55
 DEFAULT_RISK_REALTIME_THRESHOLD = 70
 VALID_BINANCE_USDT_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}USDT$")
 CORE_MOMENTUM_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"}
+MAINSTREAM_WATCH_SYMBOLS = {
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "XRPUSDT",
+    "TONUSDT",
+    "OPUSDT",
+    "ARBUSDT",
+}
+DISCORD_CHANNEL_ENV_KEYS = {
+    "main": "DISCORD_MAIN_CHANNEL_ID",
+    "alerts": "DISCORD_ALERTS_CHANNEL_ID",
+    "risk": "DISCORD_RISK_CHANNEL_ID",
+    "summary": "DISCORD_SUMMARY_CHANNEL_ID",
+    "digest": "DISCORD_DIGEST_CHANNEL_ID",
+    "debug": "DISCORD_DEBUG_CHANNEL_ID",
+    "alt_watch": "DISCORD_ALT_WATCH_CHANNEL_ID",
+}
+DISCORD_COLOR_BULLISH = 0x2ECC71
+DISCORD_COLOR_RISK = 0xE74C3C
+DISCORD_COLOR_WATCH = 0xF1C40F
+DISCORD_COLOR_SUMMARY = 0x95A5A6
 
 
 @dataclass(frozen=True)
@@ -142,6 +169,41 @@ class PendingTelegramSignalMerge:
     priorities: list[str]
     quality_scores: list[int]
     quality_reasons: list[str]
+
+
+@dataclass(frozen=True)
+class DiscordConfig:
+    enabled: bool
+    bot_token: str
+    channel_ids: dict[str, str]
+
+
+@dataclass(frozen=True)
+class DiscordOutboundMessage:
+    channel_key: str
+    content: str | None = None
+    title: str | None = None
+    color: int | None = None
+    fields: list[tuple[str, str, bool]] | None = None
+    symbol: str | None = None
+    kind: str | None = None
+
+
+@dataclass(frozen=True)
+class DiscordAltWatchItem:
+    created_at: float
+    symbol: str
+    kind: str
+    conviction_score: int
+    quality_score: int
+    leading_score: int
+    evidence_score: int
+    trap_score: int
+    price_change_percent: float | None
+    oi_change_percent: float | None
+    flow_label: str
+    reason: str
+    sort_score: int
 
 
 @dataclass(frozen=True)
@@ -312,6 +374,9 @@ class DerivativesMonitor:
         self.telegram_commands_config = config.get("telegram_commands", {})
         self.telegram_command_thread_started = False
         self.telegram_update_offset = self.load_telegram_update_offset()
+        self.discord_config = resolve_discord_config()
+        self.discord_worker_started = False
+        self.discord_outbound_queue: queue.Queue[DiscordOutboundMessage] = queue.Queue(maxsize=500)
         self.pending_dev_confirmations: dict[str, tuple[str, str, float]] = {}
         self.liquidation_events: deque[LiquidationEvent] = deque()
         self.liquidation_lock = threading.Lock()
@@ -332,6 +397,10 @@ class DerivativesMonitor:
         self.telegram_signal_digest_queue: list[TelegramSignalDigestItem] = []
         self.telegram_signal_digest_lock = threading.Lock()
         self.last_telegram_signal_digest_at = time.time()
+        self.discord_alt_watch_queue: list[DiscordAltWatchItem] = []
+        self.discord_alt_watch_lock = threading.Lock()
+        self.last_discord_alt_watch_digest_at = time.time()
+        self.discord_alt_watch_symbol_sent_at: dict[str, float] = {}
         self.runtime_realtime_priorities_override: set[str] | None = None
         self.runtime_realtime_priorities_lock = threading.Lock()
         self.signal_quality_stats = {
@@ -348,6 +417,7 @@ class DerivativesMonitor:
     def run_forever(self) -> None:
         self.start_liquidation_stream_worker()
         self.start_telegram_command_worker()
+        self.start_discord_worker()
         self.send_pending_dev_restart_status()
         self.refresh_symbols_if_due(force=True)
         logging.info("Monitoring %s derivatives symbols", len(self.symbol_configs))
@@ -359,6 +429,7 @@ class DerivativesMonitor:
                 self.flush_pending_telegram_signals()
                 self.send_summary_if_due()
                 self.flush_telegram_signal_digest_if_due()
+                self.flush_discord_alt_watch_digest_if_due()
             except Exception:
                 logging.exception("Derivatives monitor cycle failed")
 
@@ -371,6 +442,7 @@ class DerivativesMonitor:
                 time.sleep(min(5, remaining))
                 try:
                     self.flush_pending_telegram_signals()
+                    self.flush_discord_alt_watch_digest_if_due()
                 except Exception:
                     logging.exception("Failed to flush pending Telegram signals")
 
@@ -1732,6 +1804,8 @@ class DerivativesMonitor:
         conv_score, conv_label, conv_reason = conviction_score(snapshot, signal) if snapshot else ("", "", "")
         priority, quality_score, quality_reason = signal_priority(signal, snapshot)
         suppressed_from_telegram, _suppressed_reason = self.telegram_signal_suppression(signal, priority, quality_score)
+        if suppressed_from_telegram:
+            self.enqueue_discord_alt_watch_signal(signal, priority, quality_score, quality_reason)
         row = {
             "time": dt.datetime.now(dt.UTC).isoformat(),
             "symbol": signal.symbol,
@@ -1898,13 +1972,14 @@ class DerivativesMonitor:
         if webhook_url:
             self.post_json(webhook_url, payload)
         bot_token, chat_ids = resolve_telegram_credentials(telegram)
-        if bot_token and chat_ids:
+        discord_available = self.discord_config.enabled and bool(self.discord_config.bot_token)
+        if (bot_token and chat_ids) or discord_available:
             priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
             suppressed, suppressed_reason = self.telegram_signal_suppression(signal, priority, quality_score)
             self.update_signal_quality_stats(signal, priority, suppressed)
             if suppressed:
                 logging.info(
-                    "Telegram signal suppressed: %s %s priority=%s quality=%s reason=%s",
+                    "Realtime signal suppressed: %s %s priority=%s quality=%s reason=%s",
                     signal.symbol,
                     signal.kind,
                     priority,
@@ -2107,11 +2182,31 @@ class DerivativesMonitor:
         if signal.kind == "main_momentum_watch":
             if not is_core_momentum_asset(signal.symbol):
                 return False, "main momentum only core symbols"
+            if normalized_priority == "D":
+                return False, "weak momentum"
             if quality < 40:
-                return False, f"main momentum quality {quality}<40"
-            if conviction >= 55 or signal.score >= 5:
+                return False, "weak momentum"
+            _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+            price_15m = snapshot_price_change(snapshot, "15m")
+            price_1h = snapshot_price_change(snapshot, "1h")
+            oi_15m = snapshot.confirm_oi_change_percent
+            oi_1h = snapshot.oi_change_percent
+            price_supported = (price_15m or 0) > 0 or (price_1h or 0) > 0
+            oi_supported = (oi_15m or 0) > 0 or (oi_1h or 0) > 0
+            if flow_label in ("中长线派发", "短弱中强"):
+                return False, "weak momentum"
+            if not (price_supported and oi_supported):
+                return False, "weak momentum"
+            if summary_flow_value(snapshot, "15m") <= 0 and summary_flow_value(snapshot, "1h") <= 0:
+                ev_score, _ev_direction, _ev_summary, _ev_items = evidence_score(snapshot, signal)
+                spot_score, _spot_label, _spot_reason = spot_onchain_score(snapshot, signal)
+                if not (ev_score >= 10 and spot_score >= 8):
+                    return False, "weak momentum"
+            if conviction < 55:
+                return False, "weak momentum"
+            if signal.score >= 5:
                 return True, f"main momentum realtime conviction={conviction} score={signal.score}"
-            return False, f"main momentum conviction {conviction}<55 and score {signal.score}<5"
+            return False, "weak momentum"
         if normalized_priority == "D":
             return False, "priority D"
         if quality < 40:
@@ -2162,6 +2257,8 @@ class DerivativesMonitor:
             reason_context,
         )
         if not should_send:
+            if signal.kind == "main_momentum_watch" and reason == "weak momentum":
+                logging.info("Telegram signal suppressed: %s main_momentum_watch reason=weak momentum", signal.symbol)
             return True, reason
 
         key = self.telegram_signal_key(signal)
@@ -2187,7 +2284,7 @@ class DerivativesMonitor:
         quality_score: int | None = None,
         quality_reason: str | None = None,
     ) -> None:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage" if bot_token else ""
         liquidation_text = self.format_liquidation_stats(signal.symbol)
         if priority is None or quality_score is None or quality_reason is None:
             priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
@@ -2265,11 +2362,12 @@ class DerivativesMonitor:
         notifications = self.config.get("notifications", {})
         telegram = notifications.get("telegram", {})
         bot_token, chat_ids = resolve_telegram_credentials(telegram)
-        if not bot_token or not chat_ids:
+        discord_available = self.discord_config.enabled and bool(self.discord_config.bot_token)
+        if (not bot_token or not chat_ids) and not discord_available:
             return
 
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        chat_id_list = split_chat_ids(chat_ids)
+        chat_id_list = split_chat_ids(chat_ids) if bot_token and chat_ids else []
         sent_at = time.time()
         for pending in due_items:
             allowed_signals: list[Signal] = []
@@ -2297,6 +2395,12 @@ class DerivativesMonitor:
                     allowed_quality_scores.append(quality_score)
                     allowed_quality_reasons.append(quality_reason)
                 else:
+                    if signal.kind == "main_momentum_watch" and reason == "weak momentum":
+                        logging.info(
+                            "Telegram signal suppressed: %s main_momentum_watch reason=weak momentum",
+                            signal.symbol,
+                        )
+                    self.enqueue_discord_alt_watch_signal(signal, priority, quality_score, quality_reason)
                     suppressed_rows.append((signal, priority, quality_score, reason))
 
             for signal, priority, quality_score, reason in suppressed_rows:
@@ -2326,6 +2430,17 @@ class DerivativesMonitor:
             message = telegram_text(format_merged_signal_for_telegram(pending_to_send, liquidation_text, coinglass_text))
             for chat_id in chat_id_list:
                 self.post_json(url, {"chat_id": chat_id, "text": message})
+            if discord_available:
+                for index, signal in enumerate(pending_to_send.signals):
+                    priority = pending_to_send.priorities[index] if index < len(pending_to_send.priorities) else "-"
+                    quality_score = pending_to_send.quality_scores[index] if index < len(pending_to_send.quality_scores) else 0
+                    quality_reason = pending_to_send.quality_reasons[index] if index < len(pending_to_send.quality_reasons) else ""
+                    self.enqueue_discord_signal(
+                        signal,
+                        priority,
+                        quality_score,
+                        quality_reason,
+                    )
 
             best_quality = max(pending_to_send.quality_scores) if pending_to_send.quality_scores else 0
             best_priority = best_priority_label(pending_to_send.priorities)
@@ -2339,6 +2454,36 @@ class DerivativesMonitor:
                 best_priority,
                 best_quality,
             )
+
+    def signal_digest_item(
+        self,
+        signal: Signal,
+        priority: str,
+        quality_score: int,
+        quality_reason: str,
+    ) -> TelegramSignalDigestItem:
+        snapshot = signal.snapshot
+        trap_score: int | str = ""
+        main_score_value: int | None = None
+        if snapshot:
+            trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+            main_score = main_asset_score(snapshot)
+            main_score_value = main_score.total_score if main_score else None
+
+        return TelegramSignalDigestItem(
+            created_at=time.time(),
+            symbol=signal.symbol,
+            kind=signal.kind,
+            priority=priority,
+            quality_score=quality_score,
+            trap_score=trap_score,
+            main_asset_score=main_score_value,
+            signal_score=signal.score,
+            strength_score=signal_strength_score(signal),
+            price_change_percent=snapshot.price_change_percent if snapshot else None,
+            oi_change_percent=snapshot.oi_change_percent if snapshot else None,
+            reason=format_quality_reason_short(quality_reason or signal.message),
+        )
 
     def enqueue_telegram_signal_digest(
         self,
@@ -2354,30 +2499,182 @@ class DerivativesMonitor:
         if not force and priority not in set(digest_priorities):
             return
 
-        snapshot = signal.snapshot
-        trap_score: int | str = ""
-        main_score_value: int | None = None
-        if snapshot:
-            trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
-            main_score = main_asset_score(snapshot)
-            main_score_value = main_score.total_score if main_score else None
-
-        item = TelegramSignalDigestItem(
-            created_at=time.time(),
-            symbol=signal.symbol,
-            kind=signal.kind,
-            priority=priority,
-            quality_score=quality_score,
-            trap_score=trap_score,
-            main_asset_score=main_score_value,
-            signal_score=signal.score,
-            strength_score=signal_strength_score(signal),
-            price_change_percent=snapshot.price_change_percent if snapshot else None,
-            oi_change_percent=snapshot.oi_change_percent if snapshot else None,
-            reason=format_quality_reason_short(quality_reason or signal.message),
-        )
+        item = self.signal_digest_item(signal, priority, quality_score, quality_reason)
         with self.telegram_signal_digest_lock:
             self.telegram_signal_digest_queue.append(item)
+
+    def enqueue_discord_alt_watch_signal(
+        self,
+        signal: Signal,
+        priority: str,
+        quality_score: int,
+        quality_reason: str = "",
+    ) -> None:
+        if not self.discord_config.enabled or not self.discord_config.bot_token:
+            return
+        snapshot = signal.snapshot
+        symbol = str(signal.symbol or "").strip().upper()
+        if not snapshot or not is_valid_binance_usdt_symbol(symbol):
+            return
+        if symbol in MAINSTREAM_WATCH_SYMBOLS:
+            return
+
+        conviction, _conv_label, _conv_reason = conviction_score(snapshot, signal)
+        leading = leading_signal_score(snapshot, signal)
+        ev_score, _ev_direction, ev_summary, _ev_items = evidence_score(snapshot, signal)
+        trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+        if quality_score < 25 and conviction < 45:
+            return
+        if trap_score >= 8:
+            return
+        if not (
+            conviction >= 50
+            or quality_score >= 45
+            or ev_score >= 6
+            or leading.leading_score >= 5
+        ):
+            return
+
+        now = time.time()
+        with self.discord_alt_watch_lock:
+            last_sent_at = self.discord_alt_watch_symbol_sent_at.get(symbol, 0)
+            if now - last_sent_at < 1800:
+                return
+            if any(item.symbol == symbol for item in self.discord_alt_watch_queue):
+                return
+            _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+            sort_score = int(conviction + quality_score + ev_score * 3 + leading.leading_score * 3)
+            item = DiscordAltWatchItem(
+                created_at=now,
+                symbol=symbol,
+                kind=signal.kind,
+                conviction_score=int(conviction),
+                quality_score=int(quality_score),
+                leading_score=int(leading.leading_score),
+                evidence_score=int(ev_score),
+                trap_score=int(trap_score),
+                price_change_percent=snapshot.price_change_percent,
+                oi_change_percent=snapshot.oi_change_percent,
+                flow_label=flow_label,
+                reason=format_alt_watch_reason(ev_summary or quality_reason or signal.message),
+                sort_score=sort_score,
+            )
+            self.discord_alt_watch_queue.append(item)
+        logging.info("Discord alt watch queued: %s %s score=%s", symbol, signal.kind, sort_score)
+
+    def discord_alt_watch_channel_key(self) -> str:
+        return "alt_watch" if self.discord_config.channel_ids.get("alt_watch") else "digest"
+
+    def format_discord_alt_watch_digest(self, items: list[DiscordAltWatchItem]) -> str:
+        lines: list[str] = []
+        for item in items:
+            lines.append(
+                (
+                    f"{item.symbol} {signal_kind_label(item.kind)} | 把握{item.conviction_score} | "
+                    f"质量{item.quality_score} | 领先{item.leading_score} | 证据{item.evidence_score}"
+                )
+            )
+            lines.append(
+                (
+                    f"涨跌{format_percent_optional(item.price_change_percent)} / "
+                    f"OI{format_percent_optional(item.oi_change_percent)} / "
+                    f"{item.flow_label} / {item.reason}"
+                )
+            )
+        return "\n".join(lines) or "暂无山寨观察候选。"
+
+    def current_discord_alt_watch_top(self, limit: int = 10) -> list[DiscordAltWatchItem]:
+        with self.discord_alt_watch_lock:
+            return sorted(
+                self.discord_alt_watch_queue,
+                key=lambda item: (item.sort_score, item.created_at),
+                reverse=True,
+            )[:limit]
+
+    def discord_alt_watch_items_from_csv(self, lookback_minutes: int = 30) -> list[DiscordAltWatchItem]:
+        path = Path(self.signal_log_path)
+        if not path.exists():
+            return []
+        since = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=lookback_minutes)
+        best_by_symbol: dict[str, DiscordAltWatchItem] = {}
+        try:
+            with path.open(newline="", encoding="utf-8") as file:
+                rows = csv.DictReader(file)
+                for row in rows:
+                    timestamp = str(row.get("timestamp") or row.get("time") or "")
+                    try:
+                        row_time = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        if row_time.tzinfo is None:
+                            row_time = row_time.replace(tzinfo=dt.UTC)
+                    except Exception:
+                        continue
+                    if row_time < since:
+                        continue
+                    item = discord_alt_watch_item_from_row(row, row_time)
+                    if not item:
+                        continue
+                    current = best_by_symbol.get(item.symbol)
+                    if current is None or item.sort_score > current.sort_score:
+                        best_by_symbol[item.symbol] = item
+        except Exception:
+            logging.exception("Failed to read Discord alt watch rows from %s", path)
+        return sorted(
+            best_by_symbol.values(),
+            key=lambda item: (item.sort_score, item.created_at),
+            reverse=True,
+        )
+
+    def merged_discord_alt_watch_top(self, limit: int = 10) -> list[DiscordAltWatchItem]:
+        best_by_symbol: dict[str, DiscordAltWatchItem] = {}
+        for item in self.current_discord_alt_watch_top(100) + self.discord_alt_watch_items_from_csv(30):
+            current = best_by_symbol.get(item.symbol)
+            if current is None or item.sort_score > current.sort_score:
+                best_by_symbol[item.symbol] = item
+        return sorted(
+            best_by_symbol.values(),
+            key=lambda item: (item.sort_score, item.created_at),
+            reverse=True,
+        )[:limit]
+
+    def format_discord_alt_watch_command_response(self) -> str:
+        items = self.merged_discord_alt_watch_top(10)
+        if not items:
+            return "当前暂无山寨观察候选。"
+        return "🟡 山寨观察（最近30分钟，非开仓信号）\n" + self.format_discord_alt_watch_digest(items)
+
+    def flush_discord_alt_watch_digest_if_due(self, now: float | None = None) -> None:
+        if not self.discord_config.enabled or not self.discord_config.bot_token:
+            return
+        current_time = time.time() if now is None else now
+        if current_time - self.last_discord_alt_watch_digest_at < 600:
+            return
+        self.last_discord_alt_watch_digest_at = current_time
+        with self.discord_alt_watch_lock:
+            if not self.discord_alt_watch_queue:
+                return
+            sorted_items = sorted(
+                self.discord_alt_watch_queue,
+                key=lambda item: (item.sort_score, item.created_at),
+                reverse=True,
+            )
+            selected = sorted_items[:8]
+            selected_symbols = {item.symbol for item in selected}
+            self.discord_alt_watch_queue = [
+                item
+                for item in sorted_items[8:]
+                if current_time - item.created_at < 3600 and item.symbol not in selected_symbols
+            ]
+            for item in selected:
+                self.discord_alt_watch_symbol_sent_at[item.symbol] = current_time
+        self.enqueue_discord_message(
+            DiscordOutboundMessage(
+                channel_key=self.discord_alt_watch_channel_key(),
+                content=self.format_discord_alt_watch_digest(selected),
+                title="🟡 山寨观察摘要（非开仓信号）",
+                color=DISCORD_COLOR_WATCH,
+            )
+        )
+        logging.info("Discord alt watch digest sent: count=%s", len(selected))
 
     def flush_telegram_signal_digest_if_due(self) -> None:
         _realtime_priorities, digest_priorities, digest_interval_minutes, digest_max_per_priority = (
@@ -2392,29 +2689,47 @@ class DerivativesMonitor:
             items = self.telegram_signal_digest_queue
             self.telegram_signal_digest_queue = []
         digest_items = list(items)
-        digest_priorities = extend_digest_priorities(digest_priorities, digest_items)
         if not digest_items:
             return
 
         notifications = self.config.get("notifications", {})
         telegram = notifications.get("telegram", {})
         bot_token, chat_ids = resolve_telegram_credentials(telegram)
-        if not bot_token or not chat_ids:
+        discord_available = self.discord_config.enabled and bool(self.discord_config.bot_token)
+        if (not bot_token or not chat_ids) and not discord_available:
             return
 
-        message = format_telegram_signal_digest(
-            digest_items,
-            digest_priorities,
-            digest_interval_minutes,
-            digest_max_per_priority,
-        )
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        for chat_id in split_chat_ids(chat_ids):
-            try:
-                response = self.session.post(url, json={"chat_id": chat_id, "text": telegram_text(message)}, timeout=5)
-                response.raise_for_status()
-            except Exception:
-                logging.exception("Failed to send Telegram signal digest to chat_id=%s", chat_id)
+        if bot_token and chat_ids and digest_items:
+            telegram_digest_priorities = extend_digest_priorities(digest_priorities, digest_items)
+            message = format_telegram_signal_digest(
+                digest_items,
+                telegram_digest_priorities,
+                digest_interval_minutes,
+                digest_max_per_priority,
+            )
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            for chat_id in split_chat_ids(chat_ids):
+                try:
+                    response = self.session.post(url, json={"chat_id": chat_id, "text": telegram_text(message)}, timeout=5)
+                    response.raise_for_status()
+                except Exception:
+                    logging.exception("Failed to send Telegram signal digest to chat_id=%s", chat_id)
+        if discord_available and digest_items:
+            discord_digest_priorities = extend_digest_priorities(digest_priorities, digest_items)
+            message = format_telegram_signal_digest(
+                digest_items,
+                discord_digest_priorities,
+                digest_interval_minutes,
+                digest_max_per_priority,
+            )
+            self.enqueue_discord_message(
+                DiscordOutboundMessage(
+                    channel_key="digest",
+                    content=message,
+                    title="静默信号摘要",
+                    color=DISCORD_COLOR_SUMMARY,
+                )
+            )
 
     def notify_status(self, title: str, message: str) -> None:
         notifications = self.config.get("notifications", {})
@@ -2434,6 +2749,7 @@ class DerivativesMonitor:
             for chat_id in split_chat_ids(chat_ids):
                 text = message if message.startswith(title) else f"{title}\n{message}"
                 self.post_json(url, {"chat_id": chat_id, "text": telegram_text(text)})
+        self.enqueue_discord_status(title, message)
 
     def send_summary_if_due(self) -> None:
         if not self.summary_config.get("enabled", False):
@@ -2497,6 +2813,245 @@ class DerivativesMonitor:
         else:
             prefix = f"数据来源: 缓存 {age_minutes}分钟前"
         return f"{prefix}\n{text}"
+
+    def start_discord_worker(self) -> None:
+        if self.discord_worker_started:
+            return
+        config = self.discord_config
+        if not config.enabled:
+            return
+        if not config.bot_token:
+            logging.warning("Discord enabled but DISCORD_BOT_TOKEN is not configured; Discord bot skipped")
+            return
+        self.discord_worker_started = True
+        thread = threading.Thread(target=self.discord_worker_loop, args=(config,), name="discord-bot", daemon=True)
+        thread.start()
+        logging.info("Discord bot worker started")
+
+    def discord_worker_loop(self, config: DiscordConfig) -> None:
+        try:
+            import discord
+        except ImportError:
+            logging.exception("discord.py is not installed; install it with: pip install discord.py")
+            return
+
+        intents = discord.Intents.default()
+        intents.message_content = True
+        client = discord.Client(intents=intents)
+
+        async def resolve_channel(channel_key: str) -> Any:
+            channel_id = config.channel_ids.get(channel_key)
+            if not channel_id:
+                logging.warning("Discord channel missing: %s", channel_key)
+                return None
+            try:
+                numeric_channel_id = int(channel_id)
+            except ValueError:
+                logging.warning("Discord channel %s has invalid id=%s; skipping message", channel_key, channel_id)
+                return None
+            channel = client.get_channel(numeric_channel_id)
+            if channel is None:
+                channel = await client.fetch_channel(numeric_channel_id)
+            return channel
+
+        async def send_outbound(item: DiscordOutboundMessage) -> None:
+            try:
+                channel = await resolve_channel(item.channel_key)
+                if channel is None:
+                    return
+                embed = None
+                if item.title or item.fields:
+                    description = discord_embed_description_text(item)
+                    embed = discord.Embed(
+                        title=item.title or "Crypto Monitor",
+                        description=truncate_text(description, 3800) if description else None,
+                        color=item.color if item.color is not None else DISCORD_COLOR_WATCH,
+                    )
+                    for name, value, inline in item.fields or []:
+                        embed.add_field(name=name, value=truncate_text(str(value), 1024) or "-", inline=inline)
+                if embed is not None:
+                    await channel.send(embed=embed)
+                    logging.info(
+                        "Discord sent: %s %s channel=%s",
+                        item.symbol or "-",
+                        item.kind or "-",
+                        item.channel_key,
+                    )
+                    return
+                await channel.send(truncate_text(item.content or "", 1900))
+                logging.info("Discord sent: %s %s channel=%s", item.symbol or "-", item.kind or "-", item.channel_key)
+            except Exception:
+                logging.exception(
+                    "Failed to send Discord message: %s %s channel=%s",
+                    item.symbol or "-",
+                    item.kind or "-",
+                    item.channel_key,
+                )
+
+        async def send_discord_test_pushes() -> str:
+            test_targets = [
+                ("main", "主流雷达频道", "测试 主流雷达"),
+                ("alerts", "高把握信号频道", "测试 高把握信号"),
+                ("risk", "风险预警频道", "测试 风险预警"),
+                ("summary", "市场摘要频道", "测试 市场摘要"),
+                ("digest", "静默摘要频道", "测试 静默摘要"),
+                ("debug", "机器人调试频道", "测试 调试"),
+            ]
+            failures: list[str] = []
+            for channel_key, label, test_text in test_targets:
+                channel_id = config.channel_ids.get(channel_key)
+                if not channel_id:
+                    failures.append(f"{label}: 缺少频道ID")
+                    continue
+                try:
+                    channel = await resolve_channel(channel_key)
+                    if channel is None:
+                        failures.append(f"{label}: 频道未配置或无法解析")
+                        continue
+                    await channel.send(test_text)
+                    logging.info("Discord sent: channel=%s title=测试推送 embed=0", channel_key)
+                except Exception as exc:
+                    logging.exception("Failed to send Discord test message to channel=%s", channel_key)
+                    failures.append(f"{label}: 发送失败 {type(exc).__name__}: {exc}")
+
+            if failures:
+                return "测试推送完成，但以下频道失败：\n" + "\n".join(f"- {item}" for item in failures)
+            return "测试推送完成。"
+
+        async def outbound_loop() -> None:
+            await client.wait_until_ready()
+            while not client.is_closed():
+                item = await asyncio.to_thread(self.discord_outbound_queue.get)
+                await send_outbound(item)
+
+        @client.event
+        async def on_ready() -> None:
+            logging.info("Discord bot logged in as %s", client.user)
+            await send_outbound(
+                DiscordOutboundMessage(
+                    channel_key="debug",
+                    content="Discord 机器人已启动。",
+                    title="启动通知",
+                    color=DISCORD_COLOR_SUMMARY,
+                )
+            )
+
+        @client.event
+        async def on_message(message: Any) -> None:
+            if getattr(message.author, "bot", False):
+                return
+            text = str(getattr(message, "content", "") or "").strip()
+            if not text.startswith("!"):
+                return
+            try:
+                if text == "!测试推送":
+                    response = await send_discord_test_pushes()
+                    await message.channel.send(truncate_text(response, 1900))
+                    return
+                response = await asyncio.to_thread(self.discord_command_response, text)
+                if response:
+                    await message.channel.send(truncate_text(response, 1900))
+            except Exception:
+                logging.exception("Failed to handle Discord command")
+                await message.channel.send("命令处理失败，请查看服务日志。")
+
+        async def runner() -> None:
+            asyncio.create_task(outbound_loop())
+            await client.start(config.bot_token)
+
+        try:
+            asyncio.run(runner())
+        except Exception:
+            logging.exception("Discord bot worker stopped unexpectedly")
+
+    def enqueue_discord_message(self, item: DiscordOutboundMessage) -> None:
+        if not self.discord_config.enabled:
+            return
+        if not self.discord_config.bot_token:
+            return
+        try:
+            self.discord_outbound_queue.put_nowait(item)
+            logging.info(
+                "Discord enqueue: %s %s channel=%s",
+                item.symbol or "-",
+                item.kind or "-",
+                item.channel_key,
+            )
+        except queue.Full:
+            logging.warning("Discord outbound queue is full; dropping message for channel=%s", item.channel_key)
+
+    def enqueue_discord_signal(
+        self,
+        signal: Signal,
+        priority: str,
+        quality_score: int,
+        quality_reason: str,
+        content: str | None = None,
+        channel_key: str | None = None,
+    ) -> None:
+        channel = channel_key or discord_channel_for_signal(signal, priority)
+        fields = discord_signal_fields(signal, priority, quality_score, quality_reason)
+        self.enqueue_discord_message(
+            DiscordOutboundMessage(
+                channel_key=channel,
+                content=discord_signal_content_title(signal, priority),
+                title=discord_signal_title(signal, priority),
+                color=discord_signal_color(signal),
+                fields=fields,
+                symbol=signal.symbol,
+                kind=signal.kind,
+            )
+        )
+
+    def enqueue_discord_status(self, title: str, message: str) -> None:
+        channel_key = "summary" if "摘要" in title or "简报" in title else "debug"
+        self.enqueue_discord_message(
+            DiscordOutboundMessage(
+                channel_key=channel_key,
+                content=discord_clean_summary_text(message, title=title, remove_title=True),
+                title=title,
+                color=DISCORD_COLOR_SUMMARY,
+            )
+        )
+
+    def discord_command_response(self, text: str) -> str:
+        parts = text.split()
+        command = parts[0].lower()
+        if command == "!帮助":
+            return discord_help_text()
+        if command == "!摘要":
+            cached_text, cached_at, _cache_source = self.cached_market_summary()
+            if cached_text:
+                return discord_clean_summary_text(
+                    self.format_cached_market_summary_response(cached_text, cached_at),
+                    title="📊 每小时市场简报",
+                )
+            return "当前暂无市场摘要缓存，请等待下一轮扫描完成后重试。"
+        if command == "!候选":
+            return self.format_topq_response()
+        if command == "!山寨":
+            return self.format_discord_alt_watch_command_response()
+        if command == "!质量":
+            return self.format_signal_quality_stats()
+        if command == "!静默":
+            return self.format_quiet_status()
+        if command == "!诊断":
+            if len(parts) < 2:
+                return "用法: !诊断 BTCUSDT"
+            symbol = normalize_usdt_symbol(parts[1])
+            snapshot, data_source_text, degradation_text = self.telegram_command_snapshot(symbol)
+            signals = self.evaluate_snapshot(snapshot, {"mode": "both"})
+            combined_signal = self.combined_signal(snapshot, signals)
+            if combined_signal:
+                signals.append(combined_signal)
+            liquidation_text = self.format_liquidation_stats(symbol)
+            coinglass_text = self.format_coinglass_market_context(symbol)
+            response_parts = [data_source_text]
+            if degradation_text:
+                response_parts.append(degradation_text)
+            response_parts.append(format_symbol_diagnosis(snapshot, signals, liquidation_text, coinglass_text))
+            return truncate_text("\n".join(response_parts), 1900)
+        return ""
 
     def start_telegram_command_worker(self) -> None:
         if self.telegram_command_thread_started:
@@ -3456,12 +4011,14 @@ class DerivativesMonitor:
         self.send_telegram_text(bot_token, chat_id, "\n".join(lines))
 
     def handle_topq_command(self, bot_token: str, chat_id: str) -> None:
+        self.send_telegram_text(bot_token, chat_id, self.format_topq_response())
+
+    def format_topq_response(self) -> str:
         try:
             rows = self.load_recent_signal_rows(200)
         except Exception:
             logging.exception("Failed to read quality signal rows")
-            self.send_telegram_text(bot_token, chat_id, "读取信号记录失败，请查看服务日志。")
-            return
+            return "读取信号记录失败，请查看服务日志。"
 
         scored_rows = []
         for recent_index, row in enumerate(rows):
@@ -3516,8 +4073,7 @@ class DerivativesMonitor:
             )
 
         if not scored_rows:
-            self.send_telegram_text(bot_token, chat_id, "暂无高把握/观察候选。")
-            return
+            return "暂无高把握/观察候选。"
 
         scored_rows.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
         best_by_symbol_direction: dict[tuple[str, str], tuple[tuple[int, float, int, int], float, dict[str, str]]] = {}
@@ -3627,7 +4183,7 @@ class DerivativesMonitor:
             lines.append(
                 f"   {price_change}% OI{oi_change}% | 短{short_flow} 中{mid_flow} 长{long_flow} | {conclusion}"
             )
-        self.send_telegram_text(bot_token, chat_id, "\n".join(lines))
+        return "\n".join(lines)
 
     def send_telegram_text(self, bot_token: str, chat_id: str, text: str) -> None:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -3736,31 +4292,36 @@ def main_momentum_watch_signal(snapshot: MarketSnapshot) -> Signal | None:
     if not is_core_momentum_asset(snapshot.symbol):
         return None
 
-    price_5m = snapshot_price_change(snapshot, "5m")
     price_15m = snapshot_price_change(snapshot, "15m")
     price_1h = snapshot_price_change(snapshot, "1h")
     flow_15m = summary_flow_value(snapshot, "15m")
     flow_1h = summary_flow_value(snapshot, "1h")
     short_flow, mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
     threshold_15m = 0.25 if snapshot.symbol in {"BTCUSDT", "ETHUSDT"} else 0.35
-    oi_15m_up = (snapshot.confirm_oi_change_percent or 0) > 0
-    oi_1h_up = snapshot.oi_change_percent > 0
+    oi_15m = snapshot.confirm_oi_change_percent
+    oi_1h = snapshot.oi_change_percent
+    oi_15m_up = (oi_15m or 0) > 0
+    oi_1h_up = oi_1h > 0
     ev_score, ev_direction, _ev_summary, _ev_items = evidence_score(snapshot, None)
     spot_score, _spot_label, _spot_reason = spot_onchain_score(snapshot, None)
     squeeze_label, _squeeze_score, _squeeze_reason = squeeze_state(snapshot)
     absorption_label, _absorption_score, _absorption_reason = spot_absorption_state(snapshot, None)
+    strong_spot_confirm = spot_score >= 7
+    price_supported = (price_15m or 0) > 0 or (price_1h or 0) > 0
+    oi_supported = (oi_15m or 0) > 0 or (oi_1h or 0) > 0
+
+    if not (price_supported and oi_supported):
+        return None
+    if (oi_15m or 0) <= 0 and (oi_1h or 0) <= 0 and not (ev_score >= 8 and strong_spot_confirm):
+        return None
+    if flow_label == "中长线派发":
+        return None
+    if short_flow <= 2 and mid_flow <= 3:
+        return None
 
     reasons: list[str] = []
     if price_15m is not None and price_15m >= threshold_15m and flow_15m > 0:
         reasons.append(f"15m涨{price_15m:+.2f}%且资金流入")
-    if (
-        price_5m is not None
-        and price_15m is not None
-        and price_5m > 0
-        and price_15m >= threshold_15m
-        and (oi_15m_up or oi_1h_up)
-    ):
-        reasons.append("5m/15m连续走强且OI上升")
     if (
         price_15m is not None
         and price_1h is not None
@@ -3769,9 +4330,9 @@ def main_momentum_watch_signal(snapshot: MarketSnapshot) -> Signal | None:
         and (oi_15m_up or oi_1h_up)
     ):
         reasons.append("15m/1h价格与OI同步上升")
-    if ev_direction == "看多" and ev_score >= 8 and spot_score >= 7:
+    if ev_direction == "看多" and ev_score >= 8 and strong_spot_confirm:
         reasons.append("证据强多且现货/链上承接强")
-    if squeeze_label == "空头挤压" and absorption_label in ("现货承接", "链上承接"):
+    if squeeze_label == "空头挤压" and absorption_label in ("现货承接", "链上承接") and strong_spot_confirm:
         reasons.append("空头挤压+现货承接")
 
     if not reasons:
@@ -3927,6 +4488,254 @@ def resolve_telegram_credentials(config: dict[str, Any]) -> tuple[str | None, st
     if not chat_id and chat_id_env:
         chat_id = os.getenv(str(chat_id_env))
     return bot_token, chat_id
+
+
+def env_flag_enabled(name: str) -> bool:
+    return str(discord_env_value(name)).strip().lower().strip("'\"") in {"1", "true", "yes", "on"}
+
+
+def parse_env_file_value(path: str, name: str) -> str:
+    def parse_lines(lines: list[str]) -> str:
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            if key.strip() == name:
+                return value.strip().strip("'\"")
+        return ""
+
+    try:
+        with open(path, encoding="utf-8") as file:
+            return parse_lines(file.readlines())
+    except FileNotFoundError:
+        return ""
+    except PermissionError:
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "cat", path],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if result.returncode == 0:
+                return parse_lines(result.stdout.splitlines())
+        except Exception:
+            logging.debug("Failed to read env file %s via sudo", path, exc_info=True)
+    except Exception:
+        logging.debug("Failed to read env file %s", path, exc_info=True)
+    return ""
+
+
+def discord_env_value(name: str) -> str:
+    value = str(os.getenv(name, "")).strip()
+    if value:
+        return value.strip("'\"")
+    return parse_env_file_value("/etc/crypto-monitor.env", name)
+
+
+def resolve_discord_config() -> DiscordConfig:
+    channel_ids = {
+        key: discord_env_value(env_name)
+        for key, env_name in DISCORD_CHANNEL_ENV_KEYS.items()
+        if discord_env_value(env_name)
+    }
+    return DiscordConfig(
+        enabled=env_flag_enabled("DISCORD_ENABLED"),
+        bot_token=discord_env_value("DISCORD_BOT_TOKEN"),
+        channel_ids=channel_ids,
+    )
+
+
+def discord_env_diagnostics() -> str:
+    config = resolve_discord_config()
+    lines = [
+        f"DISCORD_ENABLED={int(config.enabled)}",
+        f"DISCORD_BOT_TOKEN={'set' if config.bot_token else 'missing'}",
+    ]
+    for _key, env_name in DISCORD_CHANNEL_ENV_KEYS.items():
+        value = discord_env_value(env_name)
+        lines.append(f"{env_name}={value or 'missing'}")
+    return "\n".join(lines)
+
+
+def discord_channel_for_signal(signal: Signal, priority: str) -> str:
+    normalized_kind = str(signal.kind or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized_kind in {"main_momentum_watch", "main_trend_watch"}:
+        return "main"
+    if normalized_kind in {"main_risk_watch", "top_risk", "top_exhaustion", "distribution"}:
+        return "risk"
+    if str(priority or "").strip().upper() in {"S", "A", "B"}:
+        return "alerts"
+    return "digest"
+
+
+def discord_channel_for_pending_signal(pending: PendingTelegramSignalMerge) -> str:
+    priorities = [str(priority or "").strip().upper() for priority in pending.priorities]
+    best_priority = best_priority_label(priorities)
+    for signal in pending.signals:
+        channel = discord_channel_for_signal(signal, best_priority)
+        if channel in {"main", "risk"}:
+            return channel
+    if any(priority in {"S", "A", "B"} for priority in priorities):
+        return "alerts"
+    return "digest"
+
+
+def discord_signal_title(signal: Signal, priority: str) -> str:
+    normalized_kind = str(signal.kind or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized_kind in {"main_momentum_watch", "main_trend_watch"}:
+        return "🟡 主流异动雷达"
+    if normalized_kind in {"main_risk_watch", "top_risk", "top_exhaustion", "distribution"} or is_risk_structure_kind(signal.kind):
+        return "🔴 主流风险雷达"
+    if str(priority or "").strip().upper() in {"S", "A", "B"}:
+        return "🟢 高把握信号"
+    return signal_kind_label(signal.kind)
+
+
+def discord_symbol_pair(symbol: str | None) -> str:
+    normalized = str(symbol or "").strip().upper()
+    if normalized.endswith("USDT"):
+        return f"{normalized[:-4]}/USDT"
+    return normalized or "-"
+
+
+def discord_signal_content_title(signal: Signal, priority: str) -> str:
+    return f"{discord_signal_title(signal, priority)} {discord_symbol_pair(signal.symbol)}"
+
+
+def discord_signal_color(signal: Signal) -> int:
+    if is_risk_structure_kind(signal.kind):
+        return DISCORD_COLOR_RISK
+    if signal_direction_label(signal.kind) == "看多":
+        return DISCORD_COLOR_BULLISH
+    return DISCORD_COLOR_WATCH
+
+
+def discord_clean_summary_text(text: str, title: str = "", remove_title: bool = False) -> str:
+    normalized_title = str(title or "").strip()
+    seen_title = False
+    cleaned_lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("[SUMMARY]"):
+            continue
+        if normalized_title and line == normalized_title:
+            if remove_title or seen_title:
+                continue
+            seen_title = True
+        cleaned_lines.append(raw_line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def discord_embed_description_text(item: DiscordOutboundMessage) -> str:
+    content = str(item.content or "")
+    if not content:
+        return ""
+    if item.title and not item.fields:
+        return discord_clean_summary_text(content, title=item.title, remove_title=True)
+    return content
+
+
+def discord_evidence_field(
+    signal: Signal,
+    ev_direction: str,
+    ev_display: int,
+    ev_summary: str,
+    fallback: str,
+) -> tuple[str, str, bool]:
+    if signal.kind == "main_momentum_watch" and signal.snapshot:
+        short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(signal.snapshot)
+        if flow_label == "短强中弱":
+            return ("证据", "短线异动，中线未确认", False)
+        if short_flow <= 4:
+            return ("证据", ev_summary or fallback or "短线异动观察，资金仍需确认", False)
+    if not is_risk_structure_kind(signal.kind):
+        return ("证据", f"{ev_direction} {ev_display}分 - {ev_summary or fallback}", False)
+
+    summary = ev_summary or fallback
+    if ev_direction == "看多" and text_has_any(summary, TOPQ_RISK_EVIDENCE_KEYWORDS):
+        return ("风险结论", f"风险结论：{summary}", False)
+    return ("风险证据", summary or "风险结构观察", False)
+
+
+def discord_risk_tip_field(
+    signal: Signal,
+    trap_score: int,
+    trap_label: str,
+    trap_reason: str,
+) -> tuple[str, str, bool] | None:
+    if is_risk_structure_kind(signal.kind):
+        if trap_score >= 6:
+            return ("风险提示", f"波动/诱捕风险较高 - {trap_reason}", False)
+        return None
+    if trap_score >= 3:
+        return ("风险提示", f"{trap_label} {trap_score}/10 - {trap_reason}", False)
+    return None
+
+
+def discord_flow_field_value(snapshot: MarketSnapshot) -> str:
+    short_flow, mid_flow, long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+
+    def flow_part(period: str) -> str:
+        return f"{period} {format_usd(summary_flow_value(snapshot, period))}"
+
+    short_line = " / ".join(flow_part(period) for period in ("5m", "15m", "1h"))
+    mid_line = " / ".join(flow_part(period) for period in ("4h", "12h", "24h", "72h"))
+    structure = f"短{short_flow}/中{mid_flow}/长{long_flow} | {flow_label}"
+    return f"{short_line}\n{mid_line}\n{structure}"
+
+
+def discord_signal_fields(
+    signal: Signal,
+    priority: str,
+    quality_score: int,
+    quality_reason: str,
+) -> list[tuple[str, str, bool]]:
+    snapshot = signal.snapshot
+    direction = "风险/减仓" if is_risk_structure_kind(signal.kind) else signal_direction_label(signal.kind)
+    if snapshot is None:
+        evidence_name = "风险证据" if is_risk_structure_kind(signal.kind) else "证据"
+        return [
+            ("币种", signal.symbol, True),
+            ("方向", direction, True),
+            ("等级/把握", f"{priority} / 质量 {quality_score} / 信号 {signal.score}", True),
+            (evidence_name, truncate_text(quality_reason or signal.message, 1024), False),
+        ]
+
+    conviction, conviction_label, _conviction_reason = conviction_score(snapshot, signal)
+    action, action_reason = action_label(snapshot, signal)
+    ev_score, ev_direction, ev_summary, ev_items = evidence_score(snapshot, signal)
+    ev_display = evidence_display_score(ev_direction, ev_items, ev_score)
+    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
+    fields = [
+        ("币种", signal.symbol, True),
+        ("方向", direction, True),
+        ("等级/把握", f"{priority} / 质量 {quality_score} / 把握 {conviction} {conviction_label}", True),
+        ("价格/OI", f"价格 {snapshot.close_price:.8g} | 涨跌 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}%", False),
+        ("资金流", discord_flow_field_value(snapshot), False),
+        ("操作建议", f"{action}。{action_reason}", False),
+    ]
+    fields.append(discord_evidence_field(signal, ev_direction, ev_display, ev_summary, quality_reason or signal.message))
+    risk_tip = discord_risk_tip_field(signal, trap_score, trap_label, trap_reason)
+    if risk_tip:
+        fields.append(risk_tip)
+    return fields[:8]
+
+
+def discord_help_text() -> str:
+    return (
+        "Discord 中文命令:\n"
+        "!摘要 - 返回缓存市场摘要，不触发全市场实时生成\n"
+        "!候选 - 等同 /topq，把握候选排行\n"
+        "!山寨 - 查看最近山寨观察队列 Top10\n"
+        "!诊断 BTCUSDT - 单币诊断简版\n"
+        "!质量 - 信号质量统计\n"
+        "!静默 - 等同 /quiet status\n"
+        "!测试推送 - 向各已配置频道发送测试消息\n"
+        "!帮助 - 查看命令"
+    )
 
 
 
@@ -6971,7 +7780,7 @@ def action_label(snapshot: MarketSnapshot, signal: Signal | None = None) -> tupl
     if is_telegram_risk_signal(signal):
         return risk_signal_action_label(conviction, intent_label, ev_summary, ev_display, basis_label)
     if signal and signal.kind == "main_momentum_watch":
-        return "短线拉盘观察，等待确认，不追高", "主流异动雷达只做观察提醒"
+        return "短线异动观察，等待确认，不追高", "主流异动雷达只做观察提醒"
     override, override_reason = structural_action_override(
         signal.kind if signal else None,
         basis_label,
@@ -7605,6 +8414,56 @@ def min_priority_cap(priority: str, cap: str, order: dict[str, int], reverse: di
 def compact_digest_reason(text: str) -> str:
     compact = " ".join(str(text).split())
     return truncate_text(compact, 120)
+
+
+def format_alt_watch_reason(text: str) -> str:
+    compact = " ".join(str(text or "").replace("；", " ").replace(";", " ").split())
+    return truncate_text(compact or "观察信号，等待确认", 48)
+
+
+def discord_alt_watch_item_from_row(row: dict[str, str], row_time: dt.datetime) -> DiscordAltWatchItem | None:
+    symbol = str(row.get("symbol") or "").strip().upper()
+    if not is_valid_binance_usdt_symbol(symbol):
+        return None
+    if symbol in MAINSTREAM_WATCH_SYMBOLS:
+        return None
+    suppressed = str(row.get("suppressed_from_telegram") or "").strip()
+    if suppressed not in {"1", "true", "True"}:
+        return None
+
+    conviction = parse_float(row.get("conviction_score")) or 0
+    quality = parse_float(row.get("signal_quality_score")) or 0
+    evidence = parse_float(row.get("evidence_score")) or 0
+    leading = parse_float(row.get("leading_score")) or 0
+    trap = parse_float(row.get("trap_risk_score")) or 0
+    if quality < 25 and conviction < 45:
+        return None
+    if trap >= 8:
+        return None
+    if not (conviction >= 50 or quality >= 45 or evidence >= 6 or leading >= 5):
+        return None
+
+    sort_score = int(conviction + quality + evidence * 3 + leading * 3)
+    return DiscordAltWatchItem(
+        created_at=row_time.timestamp(),
+        symbol=symbol,
+        kind=str(row.get("kind") or ""),
+        conviction_score=int(conviction),
+        quality_score=int(quality),
+        leading_score=int(leading),
+        evidence_score=int(evidence),
+        trap_score=int(trap),
+        price_change_percent=parse_float(row.get("price_change_percent")),
+        oi_change_percent=parse_float(row.get("oi_change_percent")),
+        flow_label=str(row.get("flow_trend_label") or "-"),
+        reason=format_alt_watch_reason(
+            row.get("evidence_summary")
+            or row.get("signal_quality_reason")
+            or row.get("title")
+            or ""
+        ),
+        sort_score=sort_score,
+    )
 
 
 def format_quality_reason_short(reason: str, max_parts: int = 3) -> str:
@@ -9741,10 +10600,14 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="Run one scan and print the current signal table.")
     parser.add_argument("--no-refresh", action="store_true", help="Use config symbols without refreshing the screener.")
     parser.add_argument("--test-telegram", action="store_true", help="Send a Telegram test message and exit.")
+    parser.add_argument("--test-discord-env", action="store_true", help="Print Discord env configuration and exit.")
     parser.add_argument("--symbol", help="Diagnose one futures symbol, for example SIGNUSDT.")
     args = parser.parse_args()
 
     configure_logging(args.verbose)
+    if args.test_discord_env:
+        print(discord_env_diagnostics())
+        return 0
     config = load_config(args.config)
     monitor = DerivativesMonitor(config)
     if args.test_telegram:
