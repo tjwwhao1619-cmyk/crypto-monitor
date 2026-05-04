@@ -464,6 +464,7 @@ class DerivativesMonitor:
         self.last_summary_at = 0.0
         self.last_hourly_summary_key: int | None = None
         self.last_onchain_summary_hour_key: int | None = None
+        self.last_stablecoin_liquidity_hour_key: int | None = None
         self.last_market_summary_text = ""
         self.last_market_summary_ts = 0.0
         self.last_market_summary_source = ""
@@ -1975,6 +1976,103 @@ class DerivativesMonitor:
         lines.append("结论: 稳定币供应变化仅代表潜在流动性，不等同交易所买盘")
         return "\n".join(lines)
 
+    def stablecoin_supply_rows(self, asset: str) -> list[Any]:
+        normalized = str(asset or "").strip().upper()
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                return conn.execute(
+                    """
+                    SELECT supply_usd, supply_native, timestamp, raw_json
+                    FROM stablecoin_supply
+                    WHERE asset = ?
+                    ORDER BY timestamp DESC
+                    LIMIT 200
+                    """,
+                    (normalized,),
+                ).fetchall()
+
+    def latest_stablecoin_supply_rows(self, assets: tuple[str, ...] = ("USDT", "USDC")) -> dict[str, list[Any]]:
+        self.collect_defillama_stablecoin_supply_if_due()
+        rows_by_asset: dict[str, list[Any]] = {asset: self.stablecoin_supply_rows(asset) for asset in assets}
+        if any(not rows for rows in rows_by_asset.values()):
+            self.collect_defillama_stablecoin_supply_if_due(force=True)
+            rows_by_asset = {asset: self.stablecoin_supply_rows(asset) for asset in assets}
+        return rows_by_asset
+
+    def stablecoin_snapshot_from_rows(self, asset: str, rows: list[Any]) -> dict[str, Any]:
+        if not rows:
+            return {
+                "asset": asset,
+                "supply": None,
+                "timestamp": None,
+                "changes": {"24h": None, "7d": None, "30d": None},
+                "chain_top": [],
+                "conclusion": "稳定币供应数据不足，等待下次采集",
+            }
+        latest_supply, _latest_native, latest_ts, raw_json = rows[0]
+        raw = parse_json_object(raw_json)
+        changes = stablecoin_supply_changes_from_raw(raw, rows)
+        chain_top = stablecoin_chain_distribution(raw)
+        return {
+            "asset": asset,
+            "supply": parse_float(latest_supply),
+            "timestamp": parse_float(latest_ts),
+            "changes": changes,
+            "chain_top": chain_top,
+            "conclusion": stablecoin_liquidity_conclusion(changes),
+        }
+
+    def format_stablecoin_liquidity_radar(self, target: str | None = None) -> str:
+        normalized = str(target or "").strip().upper()
+        assets = (normalized,) if normalized in {"USDT", "USDC"} else ("USDT", "USDC")
+        rows_by_asset = self.latest_stablecoin_supply_rows(assets)
+        lines = [
+            "数据源: DefiLlama 稳定币供应聚合",
+            "说明: 仅代表稳定币供应聚合变化，不代表交易所买盘或钱包净流。",
+        ]
+        for asset in assets:
+            snapshot = self.stablecoin_snapshot_from_rows(asset, rows_by_asset.get(asset, []))
+            lines.extend(self.format_stablecoin_liquidity_asset_lines(snapshot, detail=len(assets) == 1))
+        return "\n".join(lines)
+
+    def format_stablecoin_liquidity_asset_lines(self, snapshot: dict[str, Any], detail: bool = False) -> list[str]:
+        asset = str(snapshot.get("asset") or "-")
+        supply = parse_float(snapshot.get("supply"))
+        changes = snapshot.get("changes") if isinstance(snapshot.get("changes"), dict) else {}
+        chain_top = snapshot.get("chain_top") if isinstance(snapshot.get("chain_top"), list) else []
+        chain_limit = 5 if detail else 3
+        chains_text = stablecoin_chain_distribution_text(chain_top, chain_limit)
+        lines = [
+            "",
+            f"{asset}",
+            f"当前供应/市值: {format_usd_plain(supply)}",
+            (
+                "变化: "
+                f"24h {format_percent_optional(changes.get('24h'))} / "
+                f"7d {format_percent_optional(changes.get('7d'))} / "
+                f"30d {format_percent_optional(changes.get('30d'))}"
+            ),
+            f"链分布 Top{chain_limit}: {chains_text}",
+        ]
+        if detail:
+            lines.append(f"最近更新时间: {format_ts_short(parse_float(snapshot.get('timestamp')))}")
+        lines.append(f"结论: {snapshot.get('conclusion') or '稳定币供应数据不足，等待下次采集'}")
+        return lines
+
+    def send_stablecoin_liquidity_summary_if_due(self) -> None:
+        if not self.discord_config.enabled or not self.discord_config.bot_token:
+            return
+        now = time.time()
+        hour_key = int(now // 3600)
+        if self.last_stablecoin_liquidity_hour_key == hour_key:
+            return
+        message = self.format_stablecoin_liquidity_radar()
+        self.last_stablecoin_liquidity_hour_key = hour_key
+        self.save_state()
+        channel_key = "onchain" if self.discord_config.channel_ids.get("onchain") else "summary"
+        self.enqueue_discord_message(discord_onchain_embed_v2("🟠 稳定币流动性雷达", message, channel_key))
+        logging.info("Discord stablecoin liquidity radar enqueued: channel=%s hour_key=%s", channel_key, hour_key)
+
     def format_stablecoin_onchain_event_summary(self, asset: str) -> str:
         events = self.recent_onchain_transfer_events(asset, limit=5)
         if not events:
@@ -2035,6 +2133,7 @@ class DerivativesMonitor:
                 self.flush_pending_telegram_signals()
                 self.send_summary_if_due()
                 self.send_onchain_summary_if_due()
+                self.send_stablecoin_liquidity_summary_if_due()
                 self.flush_telegram_signal_digest_if_due()
                 self.flush_discord_alt_watch_digest_if_due()
                 self.flush_discord_suppressed_digest_if_due()
@@ -3548,6 +3647,8 @@ class DerivativesMonitor:
             self.last_hourly_summary_key = int(loaded_summary_key) if loaded_summary_key is not None else None
             loaded_onchain_key = payload.get("last_onchain_summary_hour_key")
             self.last_onchain_summary_hour_key = int(loaded_onchain_key) if loaded_onchain_key is not None else None
+            loaded_stablecoin_key = payload.get("last_stablecoin_liquidity_hour_key")
+            self.last_stablecoin_liquidity_hour_key = int(loaded_stablecoin_key) if loaded_stablecoin_key is not None else None
         except Exception:
             logging.warning("Failed to load monitor state", exc_info=True)
 
@@ -3557,6 +3658,7 @@ class DerivativesMonitor:
             "last_alerted_at": self.last_alerted_at,
             "last_hourly_summary_key": self.last_hourly_summary_key,
             "last_onchain_summary_hour_key": self.last_onchain_summary_hour_key,
+            "last_stablecoin_liquidity_hour_key": self.last_stablecoin_liquidity_hour_key,
         }
         try:
             with path.open("w", encoding="utf-8") as file:
@@ -4792,6 +4894,12 @@ class DerivativesMonitor:
             query = parts[1] if len(parts) >= 2 else None
             title = f"链上事件 {query}" if query else "链上事件"
             return discord_onchain_embed_v2(title, self.format_onchain_transfer_events(query), "onchain")
+        if command == "!稳定币":
+            target = parts[1] if len(parts) >= 2 else None
+            if target and str(target).strip().upper() not in {"USDT", "USDC"}:
+                return discord_onchain_embed_v2("稳定币流动性雷达", "用法: !稳定币 或 !稳定币 USDT / !稳定币 USDC", "onchain")
+            title = f"🟠 稳定币流动性雷达 {str(target).upper()}" if target else "🟠 稳定币流动性雷达"
+            return discord_onchain_embed_v2(title, self.format_stablecoin_liquidity_radar(target), "onchain")
         if command in ("!链上摘要", "!外部资金摘要"):
             return discord_onchain_embed_v2("外部资金确认摘要", self.format_onchain_summary_from_cache(), "onchain")
         if command in ("!链上", "!链上资金", "!外部资金"):
@@ -7592,6 +7700,93 @@ def stablecoin_supply_changes(rows: list[Any]) -> dict[str, float | None]:
     return changes
 
 
+def parse_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        payload = json.loads(str(value))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def format_usd_plain(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    abs_value = abs(float(value))
+    if abs_value >= 1_000_000_000:
+        return f"{abs_value / 1_000_000_000:.2f}B"
+    if abs_value >= 1_000_000:
+        return f"{abs_value / 1_000_000:.2f}M"
+    if abs_value >= 1_000:
+        return f"{abs_value / 1_000:.1f}K"
+    return f"{abs_value:.0f}"
+
+
+def stablecoin_supply_changes_from_raw(raw: dict[str, Any], rows: list[Any]) -> dict[str, float | None]:
+    current = parse_float((raw.get("circulating") or {}).get("peggedUSD")) if isinstance(raw.get("circulating"), dict) else None
+    if current is None and rows:
+        current = parse_float(rows[0][0])
+    raw_keys = {
+        "24h": "circulatingPrevDay",
+        "7d": "circulatingPrevWeek",
+        "30d": "circulatingPrevMonth",
+    }
+    changes: dict[str, float | None] = {"24h": None, "7d": None, "30d": None}
+    for label, key in raw_keys.items():
+        prev_obj = raw.get(key)
+        prev = parse_float(prev_obj.get("peggedUSD")) if isinstance(prev_obj, dict) else parse_float(prev_obj)
+        if current is not None and prev:
+            changes[label] = percent_change(prev, current)
+    historical = stablecoin_supply_changes(rows)
+    for label, value in historical.items():
+        if changes.get(label) is None:
+            changes[label] = value
+    return changes
+
+
+def stablecoin_chain_distribution(raw: dict[str, Any]) -> list[tuple[str, float]]:
+    chain_values = raw.get("chainCirculating")
+    if not isinstance(chain_values, dict):
+        return []
+    rows: list[tuple[str, float]] = []
+    for chain, payload in chain_values.items():
+        if not isinstance(payload, dict):
+            continue
+        current = payload.get("current")
+        value = parse_float(current.get("peggedUSD")) if isinstance(current, dict) else parse_float(payload.get("peggedUSD"))
+        if value is not None and value > 0:
+            rows.append((str(chain), value))
+    return sorted(rows, key=lambda item: item[1], reverse=True)
+
+
+def stablecoin_chain_distribution_text(chain_top: list[tuple[str, float]], limit: int = 5) -> str:
+    if not chain_top:
+        return "n/a"
+    total = sum(value for _chain, value in chain_top)
+    parts = []
+    for chain, value in chain_top[:limit]:
+        share = (value / total * 100) if total else None
+        share_text = f" {share:.1f}%" if share is not None else ""
+        parts.append(f"{chain} {format_usd_plain(value)}{share_text}")
+    return " / ".join(parts)
+
+
+def stablecoin_liquidity_conclusion(changes: dict[str, float | None]) -> str:
+    day = parse_float(changes.get("24h"))
+    week = parse_float(changes.get("7d"))
+    values = [value for value in (day, week) if value is not None]
+    if not values:
+        return "稳定币供应数据不足，等待下次采集"
+    if any(value >= 0.15 for value in values):
+        return "稳定币供应扩张，潜在流动性增加，但需观察是否进入交易所"
+    if any(value <= -0.15 for value in values):
+        return "稳定币供应收缩，场外流动性边际转弱"
+    return "稳定币供应变化不大，流动性中性"
+
+
 def discord_summary_embed_v2(title: str, message: str, channel_key: str = "summary") -> DiscordOutboundMessage:
     text = discord_clean_summary_text(message, title=title, remove_title=True)
     fields = discord_chunk_fields(text, "摘要")
@@ -7698,6 +7893,7 @@ def discord_help_text() -> str:
         "!地址源 - 查看自建链上地址标签库状态\n"
         "!地址 USDT - 查询资产或实体相关地址标签\n"
         "!链上事件 - 查看最近24h已标记地址链上转账事件\n"
+        "!稳定币 - 查看 DefiLlama 稳定币供应聚合变化\n"
         "!外部资金 - 查看 BTC/ETH/SOL/BNB/DOGE 现货/DEX/CoinGlass 外部资金确认\n"
         "!外部资金 BTCUSDT - 单币现货/DEX/CoinGlass 外部资金确认\n"
         "!链上 BTCUSDT - 旧别名，当前不代表真实钱包流\n"

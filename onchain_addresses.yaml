@@ -19,6 +19,10 @@ ethereum:
     confidence: low
 
 tron:
+  # TODO: Add Tron Tether Treasury only after Tronscan/Tokenview/official source
+  # explicitly labels the address as "Tether Treasury".
+  # Candidate TBPxhVAsuzoFnKyXtc1o2UySEydPHgATto is labeled by Tokenview as
+  # "Tether MultiSigWallet (TBPx)", not "Tether Treasury"; keep it inactive.
   - label: Tether Treasury Tron
     entity: Tether
     type: treasury
