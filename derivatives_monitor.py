@@ -46,6 +46,10 @@ DEFILLAMA_STABLECOINS_URL = "https://stablecoins.llama.fi/stablecoins"
 DEFAULT_EXTERNAL_DATA_DB_PATH = "external_data.sqlite"
 DEFAULT_ONCHAIN_ADDRESS_CONFIG_PATH = "onchain_addresses.yaml"
 DEFILLAMA_STABLECOIN_TTL_SECONDS = 2700
+ONCHAIN_SCAN_INTERVAL_SECONDS = 900
+ONCHAIN_SCAN_ADDRESS_TTL_SECONDS = 900
+ONCHAIN_SCAN_ADDRESS_LIMIT = 20
+ONCHAIN_SCAN_TRANSFER_LIMIT = 50
 DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS = 900
 FLOW_SHORT_PERIODS = ["5m", "15m", "1h"]
 FLOW_MID_PERIODS = ["4h", "12h", "24h"]
@@ -286,6 +290,23 @@ class OnchainAddressLabel:
 
 
 @dataclass(frozen=True)
+class OnchainTransferEvent:
+    chain: str
+    tx_hash: str
+    timestamp: float
+    asset: str
+    amount: float | None
+    amount_usd: float | None
+    from_address: str
+    to_address: str
+    from_label: str
+    to_label: str
+    direction: str
+    source: str
+    raw_json: dict[str, Any] | list[Any] | str | None
+
+
+@dataclass(frozen=True)
 class MainAssetScore:
     total_score: int
     label: str
@@ -475,6 +496,8 @@ class DerivativesMonitor:
         self.data_sources = self.build_data_source_specs()
         self.onchain_address_labels: list[OnchainAddressLabel] = []
         self.last_external_stablecoin_collect_at = 0.0
+        self.last_onchain_scan_collect_at = 0.0
+        self.onchain_scan_address_cache: dict[tuple[str, str], float] = {}
         self.init_external_data_store()
         self.load_and_store_onchain_address_labels()
         self.flow_metrics_cache: dict[tuple[str, str], tuple[float, float | None, float | None]] = {}
@@ -726,6 +749,9 @@ class DerivativesMonitor:
                     );
                     CREATE INDEX IF NOT EXISTS idx_onchain_transfer_events_asset_time ON onchain_transfer_events(asset, timestamp);
                     CREATE INDEX IF NOT EXISTS idx_onchain_transfer_events_direction_time ON onchain_transfer_events(direction, timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_onchain_transfer_events_source_time ON onchain_transfer_events(source, timestamp);
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_onchain_transfer_events_unique_basic
+                        ON onchain_transfer_events(chain, tx_hash, asset, from_address, to_address);
                     """
                 )
         for spec in self.data_sources.values():
@@ -875,6 +901,41 @@ class DerivativesMonitor:
                 ).fetchone()
         return int(row[0] if row else 0)
 
+    def onchain_transfer_event_query_count(self, query: str, since_seconds: int = 86400) -> int:
+        cutoff = time.time() - since_seconds
+        normalized = str(query or "").strip().lower()
+        if not normalized:
+            return self.onchain_transfer_event_count(since_seconds)
+        like = f"%{normalized}%"
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM onchain_transfer_events
+                    WHERE timestamp >= ?
+                      AND (lower(asset) = ? OR lower(from_label) LIKE ? OR lower(to_label) LIKE ?
+                           OR lower(from_address) LIKE ? OR lower(to_address) LIKE ?)
+                    """,
+                    (cutoff, normalized, like, like, like, like),
+                ).fetchone()
+        return int(row[0] if row else 0)
+
+    def onchain_transfer_direction_counts(self, since_seconds: int = 86400) -> dict[str, int]:
+        cutoff = time.time() - since_seconds
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT COALESCE(direction, 'unknown'), COUNT(*)
+                    FROM onchain_transfer_events
+                    WHERE timestamp >= ?
+                    GROUP BY direction
+                    """,
+                    (cutoff,),
+                ).fetchall()
+        return {str(direction): int(count) for direction, count in rows}
+
     def format_onchain_address_sources(self) -> str:
         labels = list(self.onchain_address_labels)
         by_chain: dict[str, int] = {}
@@ -895,6 +956,7 @@ class DerivativesMonitor:
             f"Tronscan key: {'configured' if (os.getenv('TRONSCAN_API_KEY', '').strip() or os.getenv('TRONGRID_API_KEY', '').strip()) else 'disabled/not configured'}",
             f"Solscan key: {'configured' if os.getenv('SOLSCAN_API_KEY', '').strip() else 'disabled/not configured'}",
             f"最近24h onchain_transfer_events: {self.onchain_transfer_event_count()}",
+            f"最近24h direction: {format_count_mapping(self.onchain_transfer_direction_counts())}",
         ]
         return "\n".join(lines)
 
@@ -926,6 +988,137 @@ class DerivativesMonitor:
             )
         if len(matches) > 20:
             lines.append(f"共 {len(matches)} 条，展示前 20 条。")
+        return "\n".join(lines)
+
+    def label_for_onchain_address(self, chain: str, address: str) -> OnchainAddressLabel | None:
+        normalized_chain = str(chain or "").strip().lower()
+        normalized_address = normalize_onchain_address(normalized_chain, address)
+        for item in self.onchain_address_labels:
+            if item.chain == normalized_chain and normalize_onchain_address(item.chain, item.address) == normalized_address:
+                return item
+        return None
+
+    def classify_onchain_transfer_event(self, chain: str, from_address: str, to_address: str) -> tuple[str, str, str]:
+        from_label = self.label_for_onchain_address(chain, from_address)
+        to_label = self.label_for_onchain_address(chain, to_address)
+        from_label_text = from_label.label if from_label else short_address(from_address)
+        to_label_text = to_label.label if to_label else short_address(to_address)
+        if is_zero_onchain_address(from_address):
+            return "mint", from_label_text, to_label_text
+        if is_zero_onchain_address(to_address):
+            return "burn", from_label_text, to_label_text
+        if to_label and to_label.type == "exchange":
+            if from_label and from_label.type == "treasury":
+                return "treasury_to_exchange", from_label_text, to_label_text
+            return "exchange_inflow", from_label_text, to_label_text
+        if from_label and from_label.type == "exchange":
+            return "exchange_outflow", from_label_text, to_label_text
+        if from_label and from_label.type == "treasury":
+            return "treasury_outflow", from_label_text, to_label_text
+        if to_label and to_label.type == "treasury":
+            return "treasury_inflow", from_label_text, to_label_text
+        return "unknown", from_label_text, to_label_text
+
+    def write_onchain_transfer_events(self, events: list[OnchainTransferEvent]) -> int:
+        if not events:
+            return 0
+        now = time.time()
+        rows = [
+            (
+                event.chain,
+                event.tx_hash,
+                event.timestamp,
+                event.asset,
+                event.amount,
+                event.amount_usd,
+                event.from_address,
+                event.to_address,
+                event.from_label,
+                event.to_label,
+                event.direction,
+                event.source,
+                json.dumps(event.raw_json, ensure_ascii=False) if event.raw_json is not None else None,
+                now,
+            )
+            for event in events
+            if event.tx_hash
+        ]
+        if not rows:
+            return 0
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                before = conn.total_changes
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO onchain_transfer_events (
+                        chain, tx_hash, timestamp, asset, amount, amount_usd,
+                        from_address, to_address, from_label, to_label,
+                        direction, source, raw_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                return int(conn.total_changes - before)
+
+    def recent_onchain_transfer_events(
+        self,
+        query: str | None = None,
+        since_seconds: int = 86400,
+        limit: int = 15,
+    ) -> list[dict[str, Any]]:
+        cutoff = time.time() - since_seconds
+        normalized = str(query or "").strip()
+        params: list[Any] = [cutoff]
+        where = "timestamp >= ?"
+        if normalized:
+            like = f"%{normalized.lower()}%"
+            where += (
+                " AND (lower(asset) = ? OR lower(from_label) LIKE ? OR lower(to_label) LIKE ? "
+                "OR lower(from_address) LIKE ? OR lower(to_address) LIKE ?)"
+            )
+            params.extend([normalized.lower(), like, like, like, like])
+        params.append(limit)
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT chain, tx_hash, timestamp, asset, amount, amount_usd,
+                           from_address, to_address, from_label, to_label, direction, source
+                    FROM onchain_transfer_events
+                    WHERE {where}
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                    """,
+                    params,
+                ).fetchall()
+        keys = [
+            "chain", "tx_hash", "timestamp", "asset", "amount", "amount_usd",
+            "from_address", "to_address", "from_label", "to_label", "direction", "source",
+        ]
+        return [dict(zip(keys, row)) for row in rows]
+
+    def format_onchain_transfer_events(self, query: str | None = None) -> str:
+        events = self.recent_onchain_transfer_events(query, limit=15)
+        suffix = f" {query}" if query else ""
+        lines = [
+            f"最近24h链上转账事件{suffix}",
+            "说明: 仅来自 onchain_addresses.yaml 已配置地址标签；覆盖有限。",
+        ]
+        if not events:
+            lines.append("暂无钱包级转账事件。")
+            return "\n".join(lines)
+        for event in events:
+            amount = format_optional_value(parse_float(event.get("amount")))
+            asset = str(event.get("asset") or "-")
+            lines.append(
+                f"{format_ts_short(parse_float(event.get('timestamp')))} | {asset} {amount} | "
+                f"{event.get('from_label') or short_address(str(event.get('from_address') or ''))} -> "
+                f"{event.get('to_label') or short_address(str(event.get('to_address') or ''))} | "
+                f"{event.get('direction') or 'unknown'} | {event.get('source') or '-'}"
+            )
+        total = self.onchain_transfer_event_query_count(str(query or ""))
+        if total > len(events):
+            lines.append(f"共 {total} 条，展示前 {len(events)} 条。")
         return "\n".join(lines)
 
     def write_external_data_points(self, points: list[ExternalDataPoint]) -> None:
@@ -1172,8 +1365,255 @@ class DerivativesMonitor:
             logging.debug("DefiLlama stablecoin supply fetch failed", exc_info=True)
             self.update_source_health(spec.name, False, f"{type(exc).__name__}: {exc}")
 
+    def collect_onchain_scan_transfers_if_due(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_onchain_scan_collect_at < ONCHAIN_SCAN_INTERVAL_SECONDS:
+            return
+        self.last_onchain_scan_collect_at = now
+        labels = [
+            item for item in self.onchain_address_labels
+            if item.chain in {"ethereum", "tron"} and any(asset in {"USDT", "USDC", "ETH"} for asset in item.assets)
+        ]
+        if not labels:
+            for source_name in ("Etherscan", "Tronscan"):
+                spec = self.data_sources.get(source_name)
+                if spec and spec.enabled:
+                    self.update_source_health(source_name, False, "no configured onchain address labels")
+            solscan = self.data_sources.get("Solscan")
+            if solscan and not solscan.enabled:
+                self.update_source_health("Solscan", False, "SOLSCAN_API_KEY not configured; adapter reserved")
+            return
+        scanned = 0
+        for label in labels:
+            if scanned >= ONCHAIN_SCAN_ADDRESS_LIMIT:
+                break
+            cache_key = (label.chain, normalize_onchain_address(label.chain, label.address))
+            if not force and now - self.onchain_scan_address_cache.get(cache_key, 0.0) < ONCHAIN_SCAN_ADDRESS_TTL_SECONDS:
+                continue
+            self.onchain_scan_address_cache[cache_key] = now
+            if label.chain == "ethereum":
+                self.collect_etherscan_transfers_for_label(label)
+                scanned += 1
+            elif label.chain == "tron":
+                self.collect_tron_transfers_for_label(label)
+                scanned += 1
+        solscan = self.data_sources.get("Solscan")
+        if solscan:
+            if solscan.enabled:
+                self.update_source_health("Solscan", False, "adapter reserved; collection not implemented")
+            else:
+                self.update_source_health("Solscan", False, "SOLSCAN_API_KEY not configured; adapter reserved")
+
+    def collect_etherscan_transfers_for_label(self, label: OnchainAddressLabel) -> None:
+        api_key = os.getenv("ETHERSCAN_API_KEY", "").strip()
+        source_name = "Etherscan"
+        if not api_key:
+            self.update_source_health(source_name, False, "ETHERSCAN_API_KEY not configured")
+            return
+        if not any(asset in {"USDT", "USDC", "ETH"} for asset in label.assets):
+            return
+        try:
+            events: list[OnchainTransferEvent] = []
+            token_params = {
+                "module": "account",
+                "action": "tokentx",
+                "address": label.address,
+                "page": 1,
+                "offset": ONCHAIN_SCAN_TRANSFER_LIMIT,
+                "sort": "desc",
+                "apikey": api_key,
+            }
+            response = self.session.get("https://api.etherscan.io/api", params=token_params, timeout=12)
+            response.raise_for_status()
+            payload = response.json()
+            result = payload.get("result") if isinstance(payload, dict) else None
+            if isinstance(result, list):
+                for row in result:
+                    if not isinstance(row, dict):
+                        continue
+                    asset = str(row.get("tokenSymbol") or "").upper()
+                    if asset not in {"USDT", "USDC"} or asset not in label.assets:
+                        continue
+                    events.append(self.etherscan_token_row_to_event(row, asset))
+            if "ETH" in label.assets:
+                eth_params = dict(token_params)
+                eth_params["action"] = "txlist"
+                response = self.session.get("https://api.etherscan.io/api", params=eth_params, timeout=12)
+                response.raise_for_status()
+                payload = response.json()
+                result = payload.get("result") if isinstance(payload, dict) else None
+                if isinstance(result, list):
+                    for row in result:
+                        if isinstance(row, dict):
+                            events.append(self.etherscan_eth_row_to_event(row))
+            written = self.write_onchain_transfer_events([event for event in events if event])
+            logging.info("onchain transfer scan Etherscan: address=%s events=%s written=%s", short_address(label.address), len(events), written)
+            self.update_source_health(source_name, True)
+        except Exception as exc:
+            logging.debug("Etherscan onchain transfer scan failed: address=%s", short_address(label.address), exc_info=True)
+            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}")
+
+    def etherscan_token_row_to_event(self, row: dict[str, Any], asset: str) -> OnchainTransferEvent:
+        decimals = parse_float(row.get("tokenDecimal")) or 0
+        raw_value = parse_float(row.get("value"))
+        amount = raw_value / (10 ** int(decimals)) if raw_value is not None and decimals >= 0 else raw_value
+        from_address = str(row.get("from") or "")
+        to_address = str(row.get("to") or "")
+        direction, from_label, to_label = self.classify_onchain_transfer_event("ethereum", from_address, to_address)
+        return OnchainTransferEvent(
+            chain="ethereum",
+            tx_hash=str(row.get("hash") or ""),
+            timestamp=parse_float(row.get("timeStamp")) or time.time(),
+            asset=asset,
+            amount=amount,
+            amount_usd=None,
+            from_address=from_address,
+            to_address=to_address,
+            from_label=from_label,
+            to_label=to_label,
+            direction=direction,
+            source="Etherscan",
+            raw_json=row,
+        )
+
+    def etherscan_eth_row_to_event(self, row: dict[str, Any]) -> OnchainTransferEvent:
+        raw_value = parse_float(row.get("value"))
+        amount = raw_value / 1_000_000_000_000_000_000 if raw_value is not None else None
+        from_address = str(row.get("from") or "")
+        to_address = str(row.get("to") or "")
+        direction, from_label, to_label = self.classify_onchain_transfer_event("ethereum", from_address, to_address)
+        return OnchainTransferEvent(
+            chain="ethereum",
+            tx_hash=str(row.get("hash") or ""),
+            timestamp=parse_float(row.get("timeStamp")) or time.time(),
+            asset="ETH",
+            amount=amount,
+            amount_usd=None,
+            from_address=from_address,
+            to_address=to_address,
+            from_label=from_label,
+            to_label=to_label,
+            direction=direction,
+            source="Etherscan",
+            raw_json=row,
+        )
+
+    def collect_tron_transfers_for_label(self, label: OnchainAddressLabel) -> None:
+        trongrid_key = os.getenv("TRONGRID_API_KEY", "").strip()
+        tronscan_key = os.getenv("TRONSCAN_API_KEY", "").strip()
+        source_name = "Tronscan"
+        if not (trongrid_key or tronscan_key):
+            self.update_source_health(source_name, False, "TRONSCAN_API_KEY/TRONGRID_API_KEY not configured")
+            return
+        if "USDT" not in label.assets:
+            return
+        try:
+            if trongrid_key:
+                events = self.fetch_trongrid_trc20_transfers(label, trongrid_key)
+                source_label = "TronGrid"
+            else:
+                events = self.fetch_tronscan_trc20_transfers(label, tronscan_key)
+                source_label = "Tronscan"
+            written = self.write_onchain_transfer_events(events)
+            logging.info("onchain transfer scan %s: address=%s events=%s written=%s", source_label, short_address(label.address), len(events), written)
+            self.update_source_health(source_name, True)
+        except Exception as exc:
+            logging.debug("Tron onchain transfer scan failed: address=%s", short_address(label.address), exc_info=True)
+            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}")
+
+    def fetch_trongrid_trc20_transfers(self, label: OnchainAddressLabel, api_key: str) -> list[OnchainTransferEvent]:
+        headers = {"TRON-PRO-API-KEY": api_key} if api_key else {}
+        url = f"https://api.trongrid.io/v1/accounts/{label.address}/transactions/trc20"
+        params = {"limit": ONCHAIN_SCAN_TRANSFER_LIMIT, "only_confirmed": "true", "order_by": "block_timestamp,desc"}
+        response = self.session.get(url, headers=headers, params=params, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        events: list[OnchainTransferEvent] = []
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    event = self.trongrid_row_to_event(row)
+                    if event.asset == "USDT":
+                        events.append(event)
+        return events
+
+    def fetch_tronscan_trc20_transfers(self, label: OnchainAddressLabel, api_key: str) -> list[OnchainTransferEvent]:
+        headers = {"TRON-PRO-API-KEY": api_key} if api_key else {}
+        params = {
+            "limit": ONCHAIN_SCAN_TRANSFER_LIMIT,
+            "start": 0,
+            "sort": "-timestamp",
+            "relatedAddress": label.address,
+        }
+        response = self.session.get("https://apilist.tronscanapi.com/api/token_trc20/transfers", headers=headers, params=params, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        rows = (payload.get("token_transfers") or payload.get("data")) if isinstance(payload, dict) else None
+        events: list[OnchainTransferEvent] = []
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    event = self.tronscan_row_to_event(row)
+                    if event.asset == "USDT":
+                        events.append(event)
+        return events
+
+    def trongrid_row_to_event(self, row: dict[str, Any]) -> OnchainTransferEvent:
+        token_info = row.get("token_info") if isinstance(row.get("token_info"), dict) else {}
+        asset = str(token_info.get("symbol") or "").upper()
+        decimals = parse_float(token_info.get("decimals")) or 6
+        raw_value = parse_float(row.get("value"))
+        amount = raw_value / (10 ** int(decimals)) if raw_value is not None else None
+        from_address = str(row.get("from") or "")
+        to_address = str(row.get("to") or "")
+        direction, from_label, to_label = self.classify_onchain_transfer_event("tron", from_address, to_address)
+        timestamp_ms = parse_float(row.get("block_timestamp"))
+        return OnchainTransferEvent(
+            chain="tron",
+            tx_hash=str(row.get("transaction_id") or row.get("txID") or ""),
+            timestamp=(timestamp_ms / 1000) if timestamp_ms and timestamp_ms > 10_000_000_000 else (timestamp_ms or time.time()),
+            asset=asset,
+            amount=amount,
+            amount_usd=None,
+            from_address=from_address,
+            to_address=to_address,
+            from_label=from_label,
+            to_label=to_label,
+            direction=direction,
+            source="TronGrid",
+            raw_json=row,
+        )
+
+    def tronscan_row_to_event(self, row: dict[str, Any]) -> OnchainTransferEvent:
+        token_info = row.get("tokenInfo") if isinstance(row.get("tokenInfo"), dict) else {}
+        asset = str(token_info.get("tokenAbbr") or token_info.get("symbol") or row.get("symbol") or "").upper()
+        decimals = parse_float(token_info.get("tokenDecimal") or token_info.get("decimals")) or 6
+        raw_value = parse_float(row.get("quant") or row.get("amount") or row.get("value"))
+        amount = raw_value / (10 ** int(decimals)) if raw_value is not None else None
+        from_address = str(row.get("from_address") or row.get("fromAddress") or row.get("from") or "")
+        to_address = str(row.get("to_address") or row.get("toAddress") or row.get("to") or "")
+        direction, from_label, to_label = self.classify_onchain_transfer_event("tron", from_address, to_address)
+        timestamp_ms = parse_float(row.get("block_ts") or row.get("timestamp") or row.get("block_timestamp"))
+        return OnchainTransferEvent(
+            chain="tron",
+            tx_hash=str(row.get("transaction_id") or row.get("transactionHash") or row.get("hash") or ""),
+            timestamp=(timestamp_ms / 1000) if timestamp_ms and timestamp_ms > 10_000_000_000 else (timestamp_ms or time.time()),
+            asset=asset,
+            amount=amount,
+            amount_usd=None,
+            from_address=from_address,
+            to_address=to_address,
+            from_label=from_label,
+            to_label=to_label,
+            direction=direction,
+            source="Tronscan",
+            raw_json=row,
+        )
+
     def collect_external_data_if_due(self) -> None:
         self.collect_defillama_stablecoin_supply_if_due()
+        self.collect_onchain_scan_transfers_if_due()
 
     def persist_external_confirmation_metrics(
         self,
@@ -1234,10 +1674,21 @@ class DerivativesMonitor:
                     "SELECT source, COUNT(*) FROM external_data_points WHERE timestamp >= ? GROUP BY source",
                     (cutoff,),
                 ).fetchall()
-        return {str(source): int(count) for source, count in rows}
+                event_rows = conn.execute(
+                    "SELECT source, COUNT(*) FROM onchain_transfer_events WHERE timestamp >= ? GROUP BY source",
+                    (cutoff,),
+                ).fetchall()
+        counts = {str(source): int(count) for source, count in rows}
+        for source, count in event_rows:
+            key = str(source)
+            if key == "TronGrid":
+                key = "Tronscan"
+            counts[key] = counts.get(key, 0) + int(count)
+        return counts
 
     def format_external_source_health(self, only_available: bool = False) -> str:
         self.collect_defillama_stablecoin_supply_if_due()
+        self.collect_onchain_scan_transfers_if_due()
         counts = self.external_source_recent_counts()
         lines = [
             "数据源健康检查",
@@ -1268,6 +1719,7 @@ class DerivativesMonitor:
         if normalized not in {"USDT", "USDC"}:
             return "暂无该资产外部资金数据"
         self.collect_defillama_stablecoin_supply_if_due()
+        self.collect_onchain_scan_transfers_if_due()
         with self.external_data_lock:
             with self.external_db_connection() as conn:
                 rows = conn.execute(
@@ -1281,10 +1733,12 @@ class DerivativesMonitor:
                     (normalized,),
                 ).fetchall()
         if not rows:
+            event_text = self.format_stablecoin_onchain_event_summary(normalized)
             return (
                 f"资产: {normalized}\n"
                 "数据源: DefiLlama 稳定币供应聚合，不代表交易所买盘或钱包净流\n"
                 "稳定币供应数据暂不可用\n"
+                f"{event_text}\n"
                 "结论: 稳定币供应变化仅代表潜在流动性，不等同交易所买盘"
             )
         latest_supply, latest_native, latest_ts, _raw = rows[0]
@@ -1304,7 +1758,25 @@ class DerivativesMonitor:
             f"7d {format_percent_optional(changes.get('7d'))} / "
             f"30d {format_percent_optional(changes.get('30d'))}"
         )
+        lines.append(self.format_stablecoin_onchain_event_summary(normalized))
         lines.append("结论: 稳定币供应变化仅代表潜在流动性，不等同交易所买盘")
+        return "\n".join(lines)
+
+    def format_stablecoin_onchain_event_summary(self, asset: str) -> str:
+        events = self.recent_onchain_transfer_events(asset, limit=5)
+        if not events:
+            return "最近24h链上事件: 暂无钱包级转账事件，仅显示 DefiLlama 供应聚合"
+        direction_counts: dict[str, int] = {}
+        for event in events:
+            direction = str(event.get("direction") or "unknown")
+            direction_counts[direction] = direction_counts.get(direction, 0) + 1
+        lines = [f"最近24h链上事件: {self.onchain_transfer_event_query_count(asset)} 条 | {format_count_mapping(direction_counts)}"]
+        for event in events[:3]:
+            lines.append(
+                f"- {format_ts_short(parse_float(event.get('timestamp')))} "
+                f"{event.get('asset') or asset} {format_optional_value(parse_float(event.get('amount')))} "
+                f"{event.get('from_label')} -> {event.get('to_label')} | {event.get('direction')}"
+            )
         return "\n".join(lines)
 
     def discord_external_funds_command_response(self, target: str) -> DiscordOutboundMessage:
@@ -4083,6 +4555,10 @@ class DerivativesMonitor:
             if len(parts) < 2:
                 return "用法: !地址 USDT 或 !地址 Binance"
             return discord_onchain_embed_v2(f"地址标签 {parts[1]}", self.format_onchain_address_query(parts[1]), "onchain")
+        if command == "!链上事件":
+            query = parts[1] if len(parts) >= 2 else None
+            title = f"链上事件 {query}" if query else "链上事件"
+            return discord_onchain_embed_v2(title, self.format_onchain_transfer_events(query), "onchain")
         if command in ("!链上摘要", "!外部资金摘要"):
             return discord_onchain_embed_v2("外部资金确认摘要", self.format_onchain_summary_from_cache(), "onchain")
         if command in ("!链上", "!链上资金", "!外部资金"):
@@ -6798,6 +7274,23 @@ def short_address(address: str) -> str:
     return f"{value[:8]}...{value[-6:]}"
 
 
+def normalize_onchain_address(chain: str, address: str) -> str:
+    value = str(address or "").strip()
+    if str(chain or "").lower() in {"ethereum", "tron"}:
+        return value.lower()
+    return value
+
+
+def is_zero_onchain_address(address: str) -> bool:
+    value = str(address or "").strip().lower()
+    return value in {
+        "",
+        "0x0000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000",
+        "11111111111111111111111111111111",
+    }
+
+
 def is_placeholder_onchain_address(address: str) -> bool:
     value = str(address or "").strip()
     lower = value.lower()
@@ -6946,6 +7439,7 @@ def discord_help_text() -> str:
         "!外部资金来源 - 查看当前真实可用外部资金来源\n"
         "!地址源 - 查看自建链上地址标签库状态\n"
         "!地址 USDT - 查询资产或实体相关地址标签\n"
+        "!链上事件 - 查看最近24h已标记地址链上转账事件\n"
         "!外部资金 - 查看 BTC/ETH/SOL/BNB/DOGE 现货/DEX/CoinGlass 外部资金确认\n"
         "!外部资金 BTCUSDT - 单币现货/DEX/CoinGlass 外部资金确认\n"
         "!链上 BTCUSDT - 旧别名，当前不代表真实钱包流\n"
