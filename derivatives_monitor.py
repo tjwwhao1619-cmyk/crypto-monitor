@@ -43,9 +43,15 @@ COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS = 2700
 TELEGRAM_SNAPSHOT_CACHE_TTL_SECONDS = 600
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 DEFILLAMA_STABLECOINS_URL = "https://stablecoins.llama.fi/stablecoins"
+DEFILLAMA_CHAINS_URL = "https://api.llama.fi/v2/chains"
+DEFILLAMA_DEX_OVERVIEW_URL = "https://api.llama.fi/overview/dexs"
+DEFILLAMA_FEES_OVERVIEW_URL = "https://api.llama.fi/overview/fees"
 DEFAULT_EXTERNAL_DATA_DB_PATH = "external_data.sqlite"
 DEFAULT_ONCHAIN_ADDRESS_CONFIG_PATH = "onchain_addresses.yaml"
 DEFILLAMA_STABLECOIN_TTL_SECONDS = 2700
+DEFILLAMA_EXTENDED_TTL_SECONDS = 3600
+DEXSCREENER_MARKET_TTL_SECONDS = 900
+DEXSCREENER_COLLECT_LIMIT = 30
 ONCHAIN_SCAN_INTERVAL_SECONDS = 900
 ONCHAIN_SCAN_ADDRESS_TTL_SECONDS = 900
 ONCHAIN_SCAN_ADDRESS_LIMIT = 20
@@ -265,6 +271,8 @@ class DataSourceSpec:
     scanned_addresses: int = 0
     fetched_events: int = 0
     written_events: int = 0
+    fetched_count: int = 0
+    written_count: int = 0
     last_scan_at: float | None = None
 
 
@@ -517,6 +525,9 @@ class DerivativesMonitor:
         self.onchain_address_labels: list[OnchainAddressLabel] = []
         self.onchain_address_candidates: list[OnchainAddressCandidate] = []
         self.last_external_stablecoin_collect_at = 0.0
+        self.last_defillama_extended_collect_at = 0.0
+        self.last_dexscreener_collect_at = 0.0
+        self.dexscreener_symbol_collect_cache: dict[str, float] = {}
         self.last_onchain_scan_collect_at = 0.0
         self.onchain_scan_address_cache: dict[tuple[str, str], float] = {}
         self.init_external_data_store()
@@ -611,6 +622,16 @@ class DerivativesMonitor:
                 last_error="稳定币供应聚合，不等同钱包流/交易所净流",
                 confidence="medium",
             ),
+            "DefiLlama TVL/DEX metrics": DataSourceSpec(
+                name="DefiLlama TVL/DEX metrics",
+                category="external",
+                is_real_onchain=False,
+                requires_api_key=False,
+                ttl_seconds=DEFILLAMA_EXTENDED_TTL_SECONDS,
+                priority=51,
+                enabled=True,
+                confidence="medium",
+            ),
             "Derived spot/DEX confirmation": DataSourceSpec(
                 name="Derived spot/DEX confirmation",
                 category="external",
@@ -684,6 +705,8 @@ class DerivativesMonitor:
                         scanned_addresses INTEGER NOT NULL DEFAULT 0,
                         fetched_events INTEGER NOT NULL DEFAULT 0,
                         written_events INTEGER NOT NULL DEFAULT 0,
+                        fetched_count INTEGER NOT NULL DEFAULT 0,
+                        written_count INTEGER NOT NULL DEFAULT 0,
                         last_scan_at REAL,
                         updated_at REAL NOT NULL
                     );
@@ -729,13 +752,18 @@ class DerivativesMonitor:
                         symbol TEXT,
                         asset TEXT,
                         chain TEXT,
+                        pair_address TEXT,
                         dex TEXT,
                         quote_symbol TEXT,
+                        price_change_5m REAL,
                         price_change_1h REAL,
                         price_change_24h REAL,
+                        volume_5m_usd REAL,
                         volume_1h_usd REAL,
                         volume_24h_usd REAL,
                         liquidity_usd REAL,
+                        fdv REAL,
+                        market_cap REAL,
                         timestamp REAL NOT NULL,
                         raw_json TEXT,
                         created_at REAL NOT NULL
@@ -782,17 +810,31 @@ class DerivativesMonitor:
                     """
                 )
                 self.ensure_source_health_scan_columns(conn)
+                self.ensure_dex_market_snapshot_columns(conn)
         for spec in self.data_sources.values():
             self.update_source_health(spec.name)
 
     def ensure_source_health_scan_columns(self, conn: sqlite3.Connection) -> None:
         existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(source_health)").fetchall()}
-        int_columns = ("scanned_addresses", "fetched_events", "written_events")
+        int_columns = ("scanned_addresses", "fetched_events", "written_events", "fetched_count", "written_count")
         for column in int_columns:
             if column not in existing:
                 conn.execute(f"ALTER TABLE source_health ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
         if "last_scan_at" not in existing:
             conn.execute("ALTER TABLE source_health ADD COLUMN last_scan_at REAL")
+
+    def ensure_dex_market_snapshot_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(dex_market_snapshots)").fetchall()}
+        columns = {
+            "pair_address": "TEXT",
+            "price_change_5m": "REAL",
+            "volume_5m_usd": "REAL",
+            "fdv": "REAL",
+            "market_cap": "REAL",
+        }
+        for column, column_type in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE dex_market_snapshots ADD COLUMN {column} {column_type}")
 
     def update_source_health(
         self,
@@ -802,6 +844,8 @@ class DerivativesMonitor:
         scanned_addresses: int | None = None,
         fetched_events: int | None = None,
         written_events: int | None = None,
+        fetched_count: int | None = None,
+        written_count: int | None = None,
         last_scan_at: float | None = None,
     ) -> None:
         spec = self.data_sources.get(source_name)
@@ -819,6 +863,10 @@ class DerivativesMonitor:
             spec.fetched_events = max(0, int(fetched_events))
         if written_events is not None:
             spec.written_events = max(0, int(written_events))
+        if fetched_count is not None:
+            spec.fetched_count = max(0, int(fetched_count))
+        if written_count is not None:
+            spec.written_count = max(0, int(written_count))
         if last_scan_at is not None:
             spec.last_scan_at = float(last_scan_at)
         with self.external_data_lock:
@@ -828,8 +876,9 @@ class DerivativesMonitor:
                     INSERT INTO source_health (
                         source, category, enabled, is_real_onchain, requires_api_key, ttl_seconds,
                         priority, confidence, last_success, last_error, scanned_addresses,
-                        fetched_events, written_events, last_scan_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        fetched_events, written_events, fetched_count, written_count,
+                        last_scan_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(source) DO UPDATE SET
                         category=excluded.category,
                         enabled=excluded.enabled,
@@ -843,6 +892,8 @@ class DerivativesMonitor:
                         scanned_addresses=excluded.scanned_addresses,
                         fetched_events=excluded.fetched_events,
                         written_events=excluded.written_events,
+                        fetched_count=excluded.fetched_count,
+                        written_count=excluded.written_count,
                         last_scan_at=excluded.last_scan_at,
                         updated_at=excluded.updated_at
                     """,
@@ -860,6 +911,8 @@ class DerivativesMonitor:
                         spec.scanned_addresses,
                         spec.fetched_events,
                         spec.written_events,
+                        spec.fetched_count,
+                        spec.written_count,
                         spec.last_scan_at,
                         now,
                     ),
@@ -1413,8 +1466,22 @@ class DerivativesMonitor:
                     source=source,
                     symbol=None,
                     asset=asset,
-                    metric=f"exchange_balance_change_percent_{range_label}",
+                    metric=f"exchange_balance_{range_label}",
                     value=parse_float(balance.get("change_percent")),
+                    timestamp=now,
+                    raw_json=balance,
+                    confidence="medium",
+                    is_real_onchain=False,
+                )
+            )
+            display_range = {"24h": "1d", "7d": "7d", "30d": "30d"}.get(str(range_label), str(range_label))
+            points.append(
+                ExternalDataPoint(
+                    source=source,
+                    symbol=f"{asset}USDT",
+                    asset=asset,
+                    metric=f"exchange_balance_{display_range}",
+                    value=parse_float(balance.get("change")),
                     timestamp=now,
                     raw_json=balance,
                     confidence="medium",
@@ -1462,14 +1529,24 @@ class DerivativesMonitor:
         oi = context.get("open_interest") if isinstance(context.get("open_interest"), dict) else {}
         for key, value in oi.items():
             add(f"open_interest_{key}", value, oi)
+        add("oi_1h", oi.get("change_1h"), oi)
+        add("oi_4h", oi.get("change_4h"), oi)
+        add("oi_24h", oi.get("change_24h"), oi)
         if "funding_oi_weight" in context:
             add("funding_oi_weight", context.get("funding_oi_weight"), {"value": context.get("funding_oi_weight")})
+            add("funding_current", context.get("funding_oi_weight"), {"value": context.get("funding_oi_weight")})
         taker = context.get("taker_flow") if isinstance(context.get("taker_flow"), dict) else {}
         for key, value in taker.items():
             add(f"taker_flow_{key}", value, taker)
+        add("taker_buy_24h", taker.get("buy_ratio"), taker)
+        add("taker_sell_24h", taker.get("sell_ratio"), taker)
         orderbook = context.get("orderbook") if isinstance(context.get("orderbook"), dict) else {}
         for key, value in orderbook.items():
             add(f"orderbook_{key}", value, orderbook)
+        add("orderbook_bid_1h", orderbook.get("bids_usd_1h"), orderbook)
+        add("orderbook_ask_1h", orderbook.get("asks_usd_1h"), orderbook)
+        add("orderbook_bid_4h", orderbook.get("bids_usd_avg_4h"), orderbook)
+        add("orderbook_ask_4h", orderbook.get("asks_usd_avg_4h"), orderbook)
         major_long = context.get("major_long") if isinstance(context.get("major_long"), dict) else {}
         taker_ranges = major_long.get("taker_ranges") if isinstance(major_long.get("taker_ranges"), dict) else {}
         for range_label, values in taker_ranges.items():
@@ -1484,6 +1561,8 @@ class DerivativesMonitor:
         for range_label, values in funding_ranges.items():
             if isinstance(values, dict):
                 add(f"funding_accumulated_{range_label}", values.get("rate"), values)
+                display_range = {"24h": "1d", "7d": "7d"}.get(str(range_label), str(range_label))
+                add(f"funding_{display_range}", values.get("rate"), values)
         balance_ranges = major_long.get("balance_ranges") if isinstance(major_long.get("balance_ranges"), dict) else {}
         self.write_exchange_balance_rows(base, balance_ranges)
         self.write_external_data_points(points)
@@ -1493,6 +1572,9 @@ class DerivativesMonitor:
         pair = _DEXSCREENER_PAIR_CACHE.get(str(symbol or "").upper())
         if not isinstance(pair, dict):
             return
+        self.persist_dexscreener_pair_snapshot(symbol, pair)
+
+    def persist_dexscreener_pair_snapshot(self, symbol: str, pair: dict[str, Any]) -> None:
         now = time.time()
         price_change = pair.get("priceChange") or {}
         volume = pair.get("volume") or {}
@@ -1504,13 +1586,18 @@ class DerivativesMonitor:
             str(symbol or "").upper(),
             str(base_token.get("symbol") or normalize_dex_symbol(symbol) or ""),
             str(pair.get("chainId") or ""),
+            str(pair.get("pairAddress") or ""),
             str(pair.get("dexId") or ""),
             str(quote_token.get("symbol") or ""),
+            safe_float(price_change.get("m5")),
             safe_float(price_change.get("h1")),
             safe_float(price_change.get("h24")),
+            safe_float(volume.get("m5")),
             safe_float(volume.get("h1")),
             safe_float(volume.get("h24")),
             safe_float(liquidity.get("usd")),
+            safe_float(pair.get("fdv")),
+            safe_float(pair.get("marketCap")),
             now,
             json.dumps(pair, ensure_ascii=False),
             now,
@@ -1520,21 +1607,93 @@ class DerivativesMonitor:
                 conn.execute(
                     """
                     INSERT INTO dex_market_snapshots (
-                        source, symbol, asset, chain, dex, quote_symbol, price_change_1h,
-                        price_change_24h, volume_1h_usd, volume_24h_usd, liquidity_usd,
-                        timestamp, raw_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source, symbol, asset, chain, pair_address, dex, quote_symbol,
+                        price_change_5m, price_change_1h, price_change_24h,
+                        volume_5m_usd, volume_1h_usd, volume_24h_usd,
+                        liquidity_usd, fdv, market_cap, timestamp, raw_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     row,
                 )
         self.write_external_data_points(
             [
-                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_price_change_1h", row[6], now, pair, "medium", False),
-                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_volume_24h_usd", row[9], now, pair, "medium", False),
-                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_liquidity_usd", row[10], now, pair, "medium", False),
+                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_price_change_1h", row[8], now, pair, "medium", False),
+                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_volume_24h", row[12], now, pair, "medium", False),
+                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_volume_24h_usd", row[12], now, pair, "medium", False),
+                ExternalDataPoint("DexScreener", str(symbol or "").upper(), row[2], "dex_liquidity_usd", row[13], now, pair, "medium", False),
             ]
         )
-        self.update_source_health("DexScreener", True)
+        self.update_source_health("DexScreener", True, fetched_count=1, written_count=4)
+
+    def fetch_dexscreener_pair_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        normalized = normalize_usdt_symbol(symbol)
+        base = normalize_dex_symbol(normalized)
+        if not base:
+            return None
+        response = self.session.get(
+            "https://api.dexscreener.com/latest/dex/search",
+            params={"q": base},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        pairs = payload.get("pairs") if isinstance(payload, dict) else None
+        if not isinstance(pairs, list):
+            return None
+        pair = best_dex_pair(base, pairs)
+        if pair:
+            _DEXSCREENER_PAIR_CACHE[normalized] = pair
+        return pair
+
+    def dexscreener_collection_symbols(self) -> list[str]:
+        symbols: list[str] = list(ONCHAIN_SUMMARY_SYMBOLS)
+        with self.discord_alt_watch_lock:
+            symbols.extend(item.symbol for item in self.discord_alt_watch_queue[:20])
+        symbols.extend(self.latest_snapshots.keys())
+        try:
+            for row in self.load_recent_signal_rows(120):
+                symbol = str(row.get("symbol") or "").strip().upper()
+                if symbol:
+                    symbols.append(symbol)
+        except Exception:
+            logging.debug("Failed to read recent signals for DexScreener collection", exc_info=True)
+        deduped = []
+        seen = set()
+        for symbol in symbols:
+            normalized = normalize_usdt_symbol(symbol)
+            if normalized in seen or not is_valid_binance_usdt_symbol(normalized):
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped[:DEXSCREENER_COLLECT_LIMIT]
+
+    def collect_dexscreener_market_snapshots_if_due(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_dexscreener_collect_at < DEXSCREENER_MARKET_TTL_SECONDS:
+            return
+        self.last_dexscreener_collect_at = now
+        fetched = 0
+        written = 0
+        no_pair = 0
+        for symbol in self.dexscreener_collection_symbols():
+            if not force and now - self.dexscreener_symbol_collect_cache.get(symbol, 0.0) < DEXSCREENER_MARKET_TTL_SECONDS:
+                continue
+            self.dexscreener_symbol_collect_cache[symbol] = now
+            try:
+                pair = self.fetch_dexscreener_pair_for_symbol(symbol)
+                fetched += 1
+                if not pair:
+                    no_pair += 1
+                    continue
+                self.persist_dexscreener_pair_snapshot(symbol, pair)
+                written += 1
+            except Exception as exc:
+                logging.debug("DexScreener market snapshot failed: symbol=%s", symbol, exc_info=True)
+                self.update_source_health("DexScreener", False, f"{type(exc).__name__}: {exc}", fetched_count=fetched, written_count=written)
+        if fetched:
+            error = f"no pair for {no_pair} symbols" if no_pair else None
+            self.update_source_health("DexScreener", True if written else False, error, fetched_count=fetched, written_count=written)
+            logging.info("DexScreener market snapshots collected: fetched=%s written=%s no_pair=%s", fetched, written, no_pair)
 
     def collect_defillama_stablecoin_supply_if_due(self, force: bool = False) -> None:
         now = time.time()
@@ -1578,6 +1737,23 @@ class DerivativesMonitor:
                         is_real_onchain=False,
                     )
                 )
+                for chain_name, chain_value in stablecoin_chain_distribution(asset):
+                    metric_suffix = defillama_chain_metric_suffix(chain_name)
+                    if metric_suffix not in {"tron", "ethereum", "solana", "bsc", "arbitrum", "base"}:
+                        continue
+                    points.append(
+                        ExternalDataPoint(
+                            source=spec.name,
+                            symbol=None,
+                            asset=symbol,
+                            metric=f"stablecoin_supply_{metric_suffix}",
+                            value=chain_value,
+                            timestamp=now,
+                            raw_json={"chain": chain_name, "asset": symbol, "source": "DefiLlama stablecoin chain distribution"},
+                            confidence=spec.confidence,
+                            is_real_onchain=False,
+                        )
+                    )
             if not rows:
                 self.update_source_health(spec.name, False, "USDT/USDC not found")
                 return
@@ -1592,10 +1768,117 @@ class DerivativesMonitor:
                         rows,
                     )
             self.write_external_data_points(points)
-            self.update_source_health(spec.name, True)
+            self.update_source_health(spec.name, True, fetched_count=len(assets), written_count=len(points))
         except Exception as exc:
             logging.debug("DefiLlama stablecoin supply fetch failed", exc_info=True)
             self.update_source_health(spec.name, False, f"{type(exc).__name__}: {exc}")
+
+    def collect_defillama_extended_metrics_if_due(self, force: bool = False) -> None:
+        now = time.time()
+        spec = self.data_sources.get("DefiLlama TVL/DEX metrics")
+        if not spec or not spec.enabled:
+            return
+        if not force and now - self.last_defillama_extended_collect_at < spec.ttl_seconds:
+            return
+        self.last_defillama_extended_collect_at = now
+        points: list[ExternalDataPoint] = []
+        fetched_count = 0
+        errors: list[str] = []
+        try:
+            chain_response = self.session.get(DEFILLAMA_CHAINS_URL, timeout=12)
+            chain_response.raise_for_status()
+            chain_rows = chain_response.json()
+            if isinstance(chain_rows, list):
+                fetched_count += len(chain_rows)
+                wanted = {"ethereum", "tron", "solana", "bsc", "arbitrum", "base"}
+                for row in chain_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    chain_name = str(row.get("name") or row.get("chain") or "").strip()
+                    suffix = defillama_chain_metric_suffix(chain_name)
+                    if suffix not in wanted:
+                        continue
+                    points.append(
+                        ExternalDataPoint(
+                            source=spec.name,
+                            symbol=None,
+                            asset=chain_name,
+                            metric="chain_tvl_usd",
+                            value=parse_float(row.get("tvl")),
+                            timestamp=now,
+                            raw_json=row,
+                            confidence=spec.confidence,
+                            is_real_onchain=False,
+                        )
+                    )
+        except Exception as exc:
+            errors.append(f"chain TVL {type(exc).__name__}: {exc}")
+
+        try:
+            dex_response = self.session.get(
+                DEFILLAMA_DEX_OVERVIEW_URL,
+                params={"excludeTotalDataChart": "true", "excludeTotalDataChartBreakdown": "true"},
+                timeout=12,
+            )
+            dex_response.raise_for_status()
+            dex_payload = dex_response.json()
+            dex_rows = dex_payload.get("protocols") if isinstance(dex_payload, dict) else None
+            if isinstance(dex_rows, list):
+                fetched_count += len(dex_rows)
+                global_24h = parse_float(dex_payload.get("total24h")) if isinstance(dex_payload, dict) else None
+                global_7d = parse_float(dex_payload.get("total7d")) if isinstance(dex_payload, dict) else None
+                points.append(ExternalDataPoint(spec.name, None, "global", "dex_volume_24h", global_24h, now, dex_payload, spec.confidence, False))
+                points.append(ExternalDataPoint(spec.name, None, "global", "dex_volume_7d", global_7d, now, dex_payload, spec.confidence, False))
+                chain_totals: dict[str, dict[str, float]] = {}
+                for row in dex_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    chain_name = str(row.get("chain") or "").strip()
+                    suffix = defillama_chain_metric_suffix(chain_name)
+                    if suffix not in {"ethereum", "tron", "solana", "bsc", "arbitrum", "base"}:
+                        continue
+                    bucket = chain_totals.setdefault(chain_name, {"24h": 0.0, "7d": 0.0})
+                    bucket["24h"] += parse_float(row.get("total24h")) or 0.0
+                    bucket["7d"] += parse_float(row.get("total7d")) or 0.0
+                for chain_name, values in chain_totals.items():
+                    points.append(ExternalDataPoint(spec.name, None, chain_name, "dex_volume_24h", values["24h"], now, {"chain": chain_name}, spec.confidence, False))
+                    points.append(ExternalDataPoint(spec.name, None, chain_name, "dex_volume_7d", values["7d"], now, {"chain": chain_name}, spec.confidence, False))
+        except Exception as exc:
+            errors.append(f"DEX volume {type(exc).__name__}: {exc}")
+
+        try:
+            fees_response = self.session.get(
+                DEFILLAMA_FEES_OVERVIEW_URL,
+                params={"excludeTotalDataChart": "true", "excludeTotalDataChartBreakdown": "true", "dataType": "dailyFees"},
+                timeout=12,
+            )
+            fees_response.raise_for_status()
+            fees_payload = fees_response.json()
+            fee_rows = fees_payload.get("protocols") if isinstance(fees_payload, dict) else None
+            if isinstance(fee_rows, list):
+                fetched_count += len(fee_rows)
+                points.append(ExternalDataPoint(spec.name, None, "global", "protocol_fees_24h", parse_float(fees_payload.get("total24h")), now, fees_payload, spec.confidence, False))
+                for row in sorted(
+                    (item for item in fee_rows if isinstance(item, dict)),
+                    key=lambda item: parse_float(item.get("total24h")) or 0.0,
+                    reverse=True,
+                )[:20]:
+                    protocol = str(row.get("name") or row.get("displayName") or row.get("slug") or "").strip()
+                    if not protocol:
+                        continue
+                    points.append(ExternalDataPoint(spec.name, None, protocol, "protocol_fees_24h", parse_float(row.get("total24h")), now, row, spec.confidence, False))
+                    revenue = parse_float(row.get("revenue24h") or row.get("dailyRevenue"))
+                    if revenue is not None:
+                        points.append(ExternalDataPoint(spec.name, None, protocol, "protocol_revenue_24h", revenue, now, row, spec.confidence, False))
+        except Exception as exc:
+            errors.append(f"fees {type(exc).__name__}: {exc}")
+
+        if points:
+            self.write_external_data_points(points)
+            self.update_source_health(spec.name, True, fetched_count=fetched_count, written_count=len(points))
+            logging.info("DefiLlama extended metrics collected: fetched=%s written=%s", fetched_count, len(points))
+        else:
+            self.update_source_health(spec.name, False, "; ".join(errors) or "no DefiLlama extended metrics", fetched_count=fetched_count, written_count=0)
 
     def collect_onchain_scan_transfers_if_due(self, force: bool = False) -> None:
         now = time.time()
@@ -1915,6 +2198,8 @@ class DerivativesMonitor:
 
     def collect_external_data_if_due(self) -> None:
         self.collect_defillama_stablecoin_supply_if_due()
+        self.collect_defillama_extended_metrics_if_due()
+        self.collect_dexscreener_market_snapshots_if_due()
         self.collect_onchain_scan_transfers_if_due()
 
     def persist_external_confirmation_metrics(
@@ -1988,13 +2273,117 @@ class DerivativesMonitor:
             counts[key] = counts.get(key, 0) + int(count)
         return counts
 
+    def external_collection_table_counts(self, since_seconds: int = 86400) -> dict[str, int]:
+        cutoff = time.time() - since_seconds
+        tables = (
+            ("external_data_points", "timestamp"),
+            ("stablecoin_supply", "timestamp"),
+            ("exchange_balances", "timestamp"),
+            ("dex_market_snapshots", "timestamp"),
+            ("onchain_transfer_events", "timestamp"),
+        )
+        counts: dict[str, int] = {}
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                for table, column in tables:
+                    row = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} >= ?", (cutoff,)).fetchone()
+                    counts[table] = int(row[0] if row else 0)
+        return counts
+
+    def external_collection_source_top(self, since_seconds: int = 86400, limit: int = 10) -> list[tuple[str, int]]:
+        cutoff = time.time() - since_seconds
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT source, COUNT(*) AS count
+                    FROM (
+                        SELECT source, timestamp FROM external_data_points
+                        UNION ALL
+                        SELECT source, timestamp FROM stablecoin_supply
+                        UNION ALL
+                        SELECT source, timestamp FROM exchange_balances
+                        UNION ALL
+                        SELECT source, timestamp FROM dex_market_snapshots
+                        UNION ALL
+                        SELECT source, timestamp FROM onchain_transfer_events
+                    )
+                    WHERE timestamp >= ?
+                    GROUP BY source
+                    ORDER BY count DESC
+                    LIMIT ?
+                    """,
+                    (cutoff, limit),
+                ).fetchall()
+        return [(str(source), int(count)) for source, count in rows]
+
+    def metric_recent_count(self, source: str, metric_prefixes: tuple[str, ...], since_seconds: int = 86400) -> int:
+        cutoff = time.time() - since_seconds
+        clauses = " OR ".join("metric LIKE ?" for _prefix in metric_prefixes)
+        params: list[Any] = [source, cutoff]
+        params.extend(f"{prefix}%" for prefix in metric_prefixes)
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM external_data_points
+                    WHERE source = ? AND timestamp >= ? AND ({clauses})
+                    """,
+                    params,
+                ).fetchone()
+        return int(row[0] if row else 0)
+
+    def format_external_collection_stats(self) -> str:
+        self.collect_external_data_if_due()
+        table_counts = self.external_collection_table_counts()
+        source_top = self.external_collection_source_top()
+        lines = ["外部数据采集统计（最近24h）"]
+        for table in (
+            "external_data_points",
+            "stablecoin_supply",
+            "exchange_balances",
+            "dex_market_snapshots",
+            "onchain_transfer_events",
+        ):
+            lines.append(f"- {table}: {table_counts.get(table, 0)}")
+        lines.append("")
+        lines.append("按 source Top10:")
+        if source_top:
+            lines.extend(f"- {source}: {count}" for source, count in source_top)
+        else:
+            lines.append("- 暂无最近24h采集数据")
+        return "\n".join(lines)
+
     def format_external_source_health(self, only_available: bool = False) -> str:
         self.collect_defillama_stablecoin_supply_if_due()
+        self.collect_defillama_extended_metrics_if_due()
+        self.collect_dexscreener_market_snapshots_if_due()
         self.collect_onchain_scan_transfers_if_due()
         counts = self.external_source_recent_counts()
+        table_counts = self.external_collection_table_counts()
+        defillama_extended_count = counts.get("DefiLlama TVL/DEX metrics", 0)
+        dex_snapshot_count = table_counts.get("dex_market_snapshots", 0)
+        coinglass_structured_count = self.metric_recent_count(
+            "CoinGlass aggregation",
+            (
+                "exchange_balance_",
+                "oi_",
+                "funding_",
+                "taker_buy_",
+                "taker_sell_",
+                "orderbook_",
+            ),
+        )
         lines = [
             "数据源健康检查",
             "说明: 现阶段不把外部数据接入交易信号加减分；真实链上=是仅代表钱包/交易级链上事件。",
+            (
+                "扩展采集24h: "
+                f"DefiLlama={defillama_extended_count} / "
+                f"DexScreener snapshots={dex_snapshot_count} / "
+                f"CoinGlass structured={coinglass_structured_count}"
+            ),
         ]
         for spec in sorted(self.data_sources.values(), key=lambda item: item.priority):
             count = counts.get(spec.name, 0)
@@ -2006,7 +2395,8 @@ class DerivativesMonitor:
                 f"- {spec.name} | {spec.category} | enabled={yes_no(spec.enabled)} | "
                 f"真实链上={yes_no(spec.is_real_onchain)} | key={yes_no(spec.requires_api_key)} | "
                 f"confidence={spec.confidence} | last_success={success_text} | "
-                f"last_error={truncate_text(error_text, 80)} | 24h数据={count}"
+                f"last_error={truncate_text(error_text, 80)} | 24h数据={count} | "
+                f"fetched={spec.fetched_count} written={spec.written_count}"
             )
             if spec.name in {"Etherscan", "Tronscan", "Solscan"}:
                 lines.append(
@@ -5281,6 +5671,8 @@ class DerivativesMonitor:
             return self.discord_alt_watch_command_response()
         if command == "!数据源":
             return discord_summary_embed_v2("数据源健康检查", self.format_external_source_health(), "debug")
+        if command == "!采集统计":
+            return discord_summary_embed_v2("外部数据采集统计", self.format_external_collection_stats(), "debug")
         if command == "!外部资金来源":
             return discord_onchain_embed_v2("外部资金来源", self.format_external_source_health(only_available=False), "onchain")
         if command in ("!外部资金总览", "!资金面", "!资金驾驶舱"):
@@ -8181,6 +8573,23 @@ def stablecoin_chain_distribution_text(chain_top: list[tuple[str, float]], limit
     return " / ".join(parts)
 
 
+def defillama_chain_metric_suffix(chain_name: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "", str(chain_name or "").strip().lower())
+    aliases = {
+        "ethereum": "ethereum",
+        "eth": "ethereum",
+        "tron": "tron",
+        "solana": "solana",
+        "bsc": "bsc",
+        "binancesmartchain": "bsc",
+        "bnbchain": "bsc",
+        "arbitrum": "arbitrum",
+        "arbitrumone": "arbitrum",
+        "base": "base",
+    }
+    return aliases.get(normalized, normalized)
+
+
 def stablecoin_liquidity_conclusion(changes: dict[str, float | None]) -> str:
     day = parse_float(changes.get("24h"))
     week = parse_float(changes.get("7d"))
@@ -8306,6 +8715,7 @@ def discord_help_text() -> str:
         "!候选 - 等同 /topq，把握候选排行\n"
         "!山寨 - 查看最近山寨观察队列 Top10\n"
         "!数据源 - 查看采集层数据源健康状态\n"
+        "!采集统计 - 查看外部数据最近24h采集数量\n"
         "!外部资金来源 - 查看当前真实可用外部资金来源\n"
         "!外部资金总览 / !资金面 - 查看外部资金驾驶舱\n"
         "!地址源 - 查看自建链上地址标签库状态\n"
