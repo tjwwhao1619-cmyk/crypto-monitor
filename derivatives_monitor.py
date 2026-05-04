@@ -265,6 +265,7 @@ class DataSourceSpec:
     scanned_addresses: int = 0
     fetched_events: int = 0
     written_events: int = 0
+    last_scan_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -666,6 +667,7 @@ class DerivativesMonitor:
                         scanned_addresses INTEGER NOT NULL DEFAULT 0,
                         fetched_events INTEGER NOT NULL DEFAULT 0,
                         written_events INTEGER NOT NULL DEFAULT 0,
+                        last_scan_at REAL,
                         updated_at REAL NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS stablecoin_supply (
@@ -768,9 +770,12 @@ class DerivativesMonitor:
 
     def ensure_source_health_scan_columns(self, conn: sqlite3.Connection) -> None:
         existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(source_health)").fetchall()}
-        for column in ("scanned_addresses", "fetched_events", "written_events"):
+        int_columns = ("scanned_addresses", "fetched_events", "written_events")
+        for column in int_columns:
             if column not in existing:
                 conn.execute(f"ALTER TABLE source_health ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+        if "last_scan_at" not in existing:
+            conn.execute("ALTER TABLE source_health ADD COLUMN last_scan_at REAL")
 
     def update_source_health(
         self,
@@ -780,6 +785,7 @@ class DerivativesMonitor:
         scanned_addresses: int | None = None,
         fetched_events: int | None = None,
         written_events: int | None = None,
+        last_scan_at: float | None = None,
     ) -> None:
         spec = self.data_sources.get(source_name)
         if not spec:
@@ -796,6 +802,8 @@ class DerivativesMonitor:
             spec.fetched_events = max(0, int(fetched_events))
         if written_events is not None:
             spec.written_events = max(0, int(written_events))
+        if last_scan_at is not None:
+            spec.last_scan_at = float(last_scan_at)
         with self.external_data_lock:
             with self.external_db_connection() as conn:
                 conn.execute(
@@ -803,8 +811,8 @@ class DerivativesMonitor:
                     INSERT INTO source_health (
                         source, category, enabled, is_real_onchain, requires_api_key, ttl_seconds,
                         priority, confidence, last_success, last_error, scanned_addresses,
-                        fetched_events, written_events, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        fetched_events, written_events, last_scan_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(source) DO UPDATE SET
                         category=excluded.category,
                         enabled=excluded.enabled,
@@ -818,6 +826,7 @@ class DerivativesMonitor:
                         scanned_addresses=excluded.scanned_addresses,
                         fetched_events=excluded.fetched_events,
                         written_events=excluded.written_events,
+                        last_scan_at=excluded.last_scan_at,
                         updated_at=excluded.updated_at
                     """,
                     (
@@ -834,6 +843,7 @@ class DerivativesMonitor:
                         spec.scanned_addresses,
                         spec.fetched_events,
                         spec.written_events,
+                        spec.last_scan_at,
                         now,
                     ),
                 )
@@ -983,6 +993,7 @@ class DerivativesMonitor:
                 "scanned_addresses": self.data_sources.get(name).scanned_addresses if self.data_sources.get(name) else 0,
                 "fetched_events": self.data_sources.get(name).fetched_events if self.data_sources.get(name) else 0,
                 "written_events": self.data_sources.get(name).written_events if self.data_sources.get(name) else 0,
+                "last_scan_at": self.data_sources.get(name).last_scan_at if self.data_sources.get(name) else None,
             }
             for name in names
         }
@@ -990,7 +1001,7 @@ class DerivativesMonitor:
             with self.external_db_connection() as conn:
                 rows = conn.execute(
                     """
-                    SELECT source, enabled, last_success, last_error, scanned_addresses, fetched_events, written_events
+                    SELECT source, enabled, last_success, last_error, scanned_addresses, fetched_events, written_events, last_scan_at
                     FROM source_health
                     WHERE source IN ('Etherscan', 'Tronscan', 'Solscan')
                     """
@@ -1005,6 +1016,7 @@ class DerivativesMonitor:
                 "scanned_addresses": int(row[4] or 0),
                 "fetched_events": int(row[5] or 0),
                 "written_events": int(row[6] or 0),
+                "last_scan_at": parse_float(row[7]),
             }
         return placeholders
 
@@ -1013,25 +1025,52 @@ class DerivativesMonitor:
         lines = ["Scan adapters:"]
         for name in ("Etherscan", "Tronscan", "Solscan"):
             row = rows.get(name, {})
+            enabled = bool(row.get("enabled"))
+            error_text = truncate_text(str(row.get("last_error") or "-"), 80)
+            if not enabled and "not configured" in error_text:
+                status_text = "disabled/not configured"
+            elif not enabled and name == "Solscan":
+                status_text = "disabled/not configured / reserved"
+            elif name == "Solscan" and "reserved" in error_text:
+                status_text = "reserved"
+            else:
+                status_text = (
+                    f"scanned={int(row.get('scanned_addresses') or 0)} "
+                    f"fetched={int(row.get('fetched_events') or 0)} "
+                    f"written={int(row.get('written_events') or 0)}"
+                )
             lines.append(
-                f"- {name}: enabled={yes_no(bool(row.get('enabled')))} | "
-                f"scanned={int(row.get('scanned_addresses') or 0)} | "
-                f"fetched={int(row.get('fetched_events') or 0)} | "
-                f"written={int(row.get('written_events') or 0)} | "
-                f"last_success={format_ts_short(parse_float(row.get('last_success')))} | "
-                f"last_error={truncate_text(str(row.get('last_error') or '-'), 80)}"
+                f"{name}: {status_text} "
+                f"last={format_ts_short(parse_float(row.get('last_scan_at')) or parse_float(row.get('last_success')))} "
+                f"error={error_text}"
             )
         return lines
 
-    def onchain_event_empty_status_text(self) -> str:
+    def onchain_event_empty_status_text(self, query: str | None = None) -> str:
         rows = self.scan_adapter_health_rows()
-        any_configured = any(bool(row.get("enabled")) for row in rows.values())
-        any_success = any(parse_float(row.get("last_success")) for row in rows.values())
-        if any_success:
+        relevant = rows
+        normalized = str(query or "").strip().upper()
+        if normalized in {"USDT", "USDC", "ETH"}:
+            relevant = {name: row for name, row in rows.items() if name in {"Etherscan", "Tronscan"}}
+        configured = [row for row in relevant.values() if bool(row.get("enabled"))]
+        scan_rows = [
+            row for row in relevant.values()
+            if parse_float(row.get("last_scan_at")) or parse_float(row.get("last_success"))
+        ]
+        if not configured and not scan_rows:
+            return "数据源未配置。"
+        status_rows = scan_rows or configured
+        if any("no configured onchain address labels" in str(row.get("last_error") or "") for row in status_rows):
+            return "尚未扫描或没有有效地址标签。"
+        any_scan = bool(scan_rows)
+        if not any_scan:
+            return "尚未扫描或没有有效地址标签。"
+        if all(str(row.get("last_error") or "").strip() for row in status_rows):
+            return "最近扫描失败，请查看 Scan 状态。"
+        fetched_total = sum(int(row.get("fetched_events") or 0) for row in status_rows)
+        if fetched_total == 0:
             return "最近扫描正常，但暂无匹配转账事件。"
-        if any_configured:
-            return "尚未扫描或等待下一轮采集。"
-        return "尚未扫描/数据源未配置。"
+        return "最近扫描有数据返回，但暂无符合当前查询的已入库事件。"
 
     def format_onchain_address_sources(self) -> str:
         labels = list(self.onchain_address_labels)
@@ -1203,7 +1242,8 @@ class DerivativesMonitor:
             "说明: 仅来自 onchain_addresses.yaml 已配置地址标签；覆盖有限。",
         ]
         if not events:
-            lines.append(self.onchain_event_empty_status_text())
+            lines.append(self.onchain_event_empty_status_text(query))
+            lines.extend(self.format_scan_adapter_status_lines())
             return "\n".join(lines)
         for event in events:
             amount = format_optional_value(parse_float(event.get("amount")))
@@ -1527,13 +1567,35 @@ class DerivativesMonitor:
                     scanned_addresses=values[0],
                     fetched_events=values[1],
                     written_events=values[2],
+                    last_scan_at=now,
+                )
+                logging.info(
+                    "onchain transfer scan %s: scanned=%s fetched=%s written=%s",
+                    source_name,
+                    values[0],
+                    values[1],
+                    values[2],
                 )
         solscan = self.data_sources.get("Solscan")
         if solscan:
             if solscan.enabled:
-                self.update_source_health("Solscan", False, "adapter reserved; collection not implemented", scanned_addresses=0, fetched_events=0, written_events=0)
+                self.update_source_health(
+                    "Solscan",
+                    False,
+                    "adapter reserved; collection not implemented",
+                    scanned_addresses=0,
+                    fetched_events=0,
+                    written_events=0,
+                )
             else:
-                self.update_source_health("Solscan", False, "SOLSCAN_API_KEY not configured; adapter reserved", scanned_addresses=0, fetched_events=0, written_events=0)
+                self.update_source_health(
+                    "Solscan",
+                    False,
+                    "SOLSCAN_API_KEY not configured; adapter reserved",
+                    scanned_addresses=0,
+                    fetched_events=0,
+                    written_events=0,
+                )
 
     def collect_etherscan_transfers_for_label(self, label: OnchainAddressLabel) -> tuple[int, int] | None:
         api_key = os.getenv("ETHERSCAN_API_KEY", "").strip()
@@ -1584,11 +1646,11 @@ class DerivativesMonitor:
                 len(events),
                 written,
             )
-            self.update_source_health(source_name, True, scanned_addresses=1, fetched_events=len(events), written_events=written)
+            self.update_source_health(source_name, True, scanned_addresses=1, fetched_events=len(events), written_events=written, last_scan_at=time.time())
             return len(events), written
         except Exception as exc:
             logging.debug("Etherscan onchain transfer scan failed: address=%s", short_address(label.address), exc_info=True)
-            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}", scanned_addresses=1, fetched_events=0, written_events=0)
+            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}", scanned_addresses=1, fetched_events=0, written_events=0, last_scan_at=time.time())
             return None
 
     def etherscan_token_row_to_event(self, row: dict[str, Any], asset: str) -> OnchainTransferEvent:
@@ -1660,11 +1722,11 @@ class DerivativesMonitor:
                 len(events),
                 written,
             )
-            self.update_source_health(source_name, True, scanned_addresses=1, fetched_events=len(events), written_events=written)
+            self.update_source_health(source_name, True, scanned_addresses=1, fetched_events=len(events), written_events=written, last_scan_at=time.time())
             return len(events), written
         except Exception as exc:
             logging.debug("Tron onchain transfer scan failed: address=%s", short_address(label.address), exc_info=True)
-            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}", scanned_addresses=1, fetched_events=0, written_events=0)
+            self.update_source_health(source_name, False, f"{type(exc).__name__}: {exc}", scanned_addresses=1, fetched_events=0, written_events=0, last_scan_at=time.time())
             return None
 
     def fetch_trongrid_trc20_transfers(self, label: OnchainAddressLabel, api_key: str) -> list[OnchainTransferEvent]:
