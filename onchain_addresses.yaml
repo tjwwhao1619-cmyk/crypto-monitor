@@ -6,10 +6,10 @@ ethereum:
   - label: Tether Treasury Ethereum
     entity: Tether
     type: treasury
-    address: "0x..."
+    address: "0x5754284f345afc66a98fbb0a0afe71e0f007b949"
     assets: [USDT]
-    source: "placeholder"
-    confidence: low
+    source: "Etherscan labeled address / Tokenview labeled Tether Treasury"
+    confidence: high
   - label: Binance Hot Wallet Ethereum
     entity: Binance
     type: exchange
