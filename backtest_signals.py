@@ -12,8 +12,8 @@ import requests
 import yaml
 
 BASE = "https://fapi.binance.com"
-BULL = {"discovery", "hot_breakout", "bottom_reversal"}
-BEAR = {"top_risk", "distribution", "top_exhaustion"}
+BULL = {"discovery", "hot_breakout", "bottom_reversal", "main_trend_watch"}
+BEAR = {"top_risk", "distribution", "top_exhaustion", "main_risk_watch"}
 HORIZONS = {"15m": 900, "1h": 3600, "4h": 14400, "12h": 43200, "24h": 86400}
 REPORT_HORIZONS = ["15m", "1h", "4h", "12h", "24h"]
 LONG_FLOW_GROUPS = (
@@ -50,6 +50,13 @@ EVIDENCE_SCORE_GROUPS = (
     ("1..4", "偏多", 1, 4),
     (">=5", "多头强", 5, None),
 )
+LEADING_SCORE_GROUPS = (
+    ("0", "无", 0, 0),
+    ("1-2", "弱", 1, 2),
+    ("3-5", "中", 3, 5),
+    ("6+", "强", 6, None),
+)
+LEADING_DIRECTION_GROUPS = ("long", "short", "neutral")
 
 
 def parse_time(value):
@@ -145,6 +152,9 @@ def eval_signal(session, row):
     out["evidence_direction"] = (row.get("evidence_direction") or "").strip() or None
     out["evidence_summary"] = (row.get("evidence_summary") or "").strip() or None
     out["evidence_items"] = row.get("evidence_items") or ""
+    out["leading_score"] = parse_int(row.get("leading_score"))
+    out["leading_direction"] = (row.get("leading_direction") or "").strip() or None
+    out["leading_label"] = (row.get("leading_label") or "").strip() or None
     out["funding_rate_percent"] = parse_float(row.get("funding_rate_percent"))
     out["suppressed_from_telegram"] = parse_bool_int(row.get("suppressed_from_telegram"))
     for name in ("12h", "24h", "48h", "72h", "96h", "120h", "144h"):
@@ -350,6 +360,56 @@ def evidence_score_group(score):
         if (low is None or score >= low) and (high is None or score <= high):
             return label, name
     return None
+
+
+def leading_score_group(score):
+    if score is None:
+        return None
+    for label, name, low, high in LEADING_SCORE_GROUPS:
+        if score >= low and (high is None or score <= high):
+            return label, name
+    return None
+
+
+def print_leading_backtest(results):
+    print("[LEADING SIGNAL] 领先信号分组回测")
+    grouped = [(x, leading_score_group(x.get("leading_score"))) for x in results]
+    if not any(group for _x, group in grouped):
+        print("暂无 leading_score 样本")
+        print("")
+    else:
+        for label, name, _low, _high in LEADING_SCORE_GROUPS:
+            group_rows = [x for x, group in grouped if group == (label, name)]
+            print(f"{label} {name}: 样本={len(group_rows)}")
+            for h in REPORT_HORIZONS:
+                vals = [x[h] for x in group_rows if x[h] is not None]
+                if not vals:
+                    print(f"  {h}: 样本=0")
+                    continue
+                wins = sum(v > 0 for v in vals)
+                print(
+                    f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                    f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))} "
+                    f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
+                )
+        print("")
+
+    print("[LEADING DIRECTION] 领先方向分组回测")
+    for direction in LEADING_DIRECTION_GROUPS:
+        group_rows = [x for x in results if (x.get("leading_direction") or "neutral") == direction]
+        print(f"{direction}: 样本={len(group_rows)}")
+        for h in REPORT_HORIZONS:
+            vals = [x[h] for x in group_rows if x[h] is not None]
+            if not vals:
+                print(f"  {h}: 样本=0")
+                continue
+            wins = sum(v > 0 for v in vals)
+            print(
+                f"  {h}: 样本={len(vals)} 胜率={wins}/{len(vals)} {wins/len(vals)*100:.1f}% "
+                f"平均={fmt(statistics.mean(vals))} 中位={fmt(statistics.median(vals))} "
+                f"最好={fmt(max(vals))} 最差={fmt(min(vals))}"
+            )
+    print("")
 
 
 def print_score_group_backtest(results, title, score_field, groups):
@@ -871,7 +931,7 @@ def run_backtest(args):
         raise SystemExit("no backtestable signals")
 
     print("[BACKTEST] 最近信号回测")
-    print("说明: discovery/hot 按看多计算，top_risk/distribution 按看空计算")
+    print("说明: discovery/hot/main_trend_watch 按看多计算，top_risk/distribution/main_risk_watch 按看空/风险计算")
     print("")
 
     for kind in sorted(set(x["kind"] for x in results)):
@@ -898,6 +958,7 @@ def run_backtest(args):
     print_contract_spot_divergence_backtest(results)
     print_major_flow_backtest(results)
     print_conviction_backtest(results)
+    print_leading_backtest(results)
     print_position_behavior_backtest(results)
     print_squeeze_state_backtest(results)
     print_market_intent_backtest(results)
@@ -919,6 +980,7 @@ def run_backtest(args):
             f" squeeze={x.get('squeeze_state_label') or '-'}"
             f" basis={x.get('basis_state') or '-'}"
             f" flow={x.get('flow_trend_label') or '-'}"
+            f" lead={x.get('leading_score') if x.get('leading_score') is not None else '-'}/{x.get('leading_direction') or '-'}/{x.get('leading_label') or '-'}"
             f"{flow_detail(x)} MFE={fmt(x['mfe'])} MAE={fmt(x['mae'])}"
         )
 
