@@ -479,6 +479,7 @@ class DerivativesMonitor:
         self.last_onchain_summary_hour_key: int | None = None
         self.last_stablecoin_liquidity_hour_key: int | None = None
         self.last_coinglass_summary_hour_key: int | None = None
+        self.last_external_funds_overview_hour_key: int | None = None
         self.last_market_summary_text = ""
         self.last_market_summary_ts = 0.0
         self.last_market_summary_source = ""
@@ -2313,6 +2314,156 @@ class DerivativesMonitor:
         self.enqueue_discord_message(discord_onchain_embed_v2("🔷 CoinGlass 聚合资金摘要", message, channel_key))
         logging.info("Discord CoinGlass summary enqueued: channel=%s hour_key=%s", channel_key, hour_key)
 
+    def stablecoin_overview_lines_and_bias(self) -> tuple[list[str], str]:
+        rows_by_asset = self.latest_stablecoin_supply_rows(("USDT", "USDC"))
+        lines = ["数据源: DefiLlama 稳定币供应聚合；不代表交易所买盘。"]
+        conclusions: list[str] = []
+        for asset in ("USDT", "USDC"):
+            snapshot = self.stablecoin_snapshot_from_rows(asset, rows_by_asset.get(asset, []))
+            changes = snapshot.get("changes") if isinstance(snapshot.get("changes"), dict) else {}
+            conclusion = str(snapshot.get("conclusion") or "")
+            conclusions.append(conclusion)
+            lines.append(
+                f"{asset}: {format_usd_plain(parse_float(snapshot.get('supply')))} | "
+                f"24h {format_percent_optional(changes.get('24h'))} / 7d {format_percent_optional(changes.get('7d'))} | "
+                f"{stablecoin_conclusion_short(conclusion)}"
+            )
+        if any("扩张" in item for item in conclusions):
+            bias = "support"
+        elif any("收缩" in item for item in conclusions):
+            bias = "risk"
+        elif any("数据不足" in item for item in conclusions):
+            bias = "insufficient"
+        else:
+            bias = "neutral"
+        return lines, bias
+
+    def coinglass_overview_lines_and_bias(self) -> tuple[list[str], str]:
+        lines = ["CoinGlass 是外部聚合数据，不是钱包级链上流。"]
+        support = risk = conflict = insufficient = 0
+        for symbol in ONCHAIN_SUMMARY_SYMBOLS:
+            snapshot = self.coinglass_panel_snapshot(symbol)
+            metrics = snapshot.get("metrics") if isinstance(snapshot.get("metrics"), dict) else {}
+            balances = snapshot.get("balances") if isinstance(snapshot.get("balances"), dict) else {}
+            balance_text = (
+                f"1d {format_coinglass_balance_snapshot(balances.get('24h'))} / "
+                f"7d {format_coinglass_balance_snapshot(balances.get('7d'))} / "
+                f"30d {format_coinglass_balance_snapshot(balances.get('30d'))}"
+            )
+            taker_text = (
+                f"买{format_ratio_percent(metric_value(metrics, 'taker_flow_buy_ratio'))}/"
+                f"卖{format_ratio_percent(metric_value(metrics, 'taker_flow_sell_ratio'))}"
+            )
+            orderbook_bias = coinglass_orderbook_judgement(metric_value(metrics, "orderbook_bid_ask_ratio"))
+            judgement = coinglass_panel_judgement(metrics, balances)
+            short_bias = coinglass_judgement_short(judgement)
+            if short_bias == "支撑":
+                support += 1
+            elif short_bias == "抛压" or "拥挤" in judgement:
+                risk += 1
+            elif short_bias == "分歧":
+                conflict += 1
+            else:
+                insufficient += 1
+            lines.append(
+                f"{symbol}: 余额 {balance_text} | 主动{taker_text} | 订单簿 {orderbook_bias} | {short_bias}"
+            )
+        if support and not risk:
+            bias = "support"
+        elif risk and not support:
+            bias = "risk"
+        elif support or risk or conflict:
+            bias = "conflict"
+        elif insufficient >= len(ONCHAIN_SUMMARY_SYMBOLS):
+            bias = "insufficient"
+        else:
+            bias = "neutral"
+        return lines, bias
+
+    def onchain_event_overview_lines_and_bias(self) -> tuple[list[str], str]:
+        active_count = len(self.onchain_address_labels)
+        event_count = self.onchain_transfer_event_count()
+        empty_status = self.onchain_event_empty_status_text()
+        lines = [
+            f"active 地址标签数: {active_count}",
+            f"最近24h事件数: {event_count}",
+            f"状态: {empty_status if event_count == 0 else '最近24h有已标记钱包级转账事件'}",
+        ]
+        lines.extend(self.format_scan_adapter_status_lines())
+        if event_count > 0:
+            bias = "support"
+        elif active_count <= 0:
+            bias = "insufficient"
+        elif "扫描正常" in empty_status:
+            bias = "neutral"
+        else:
+            bias = "insufficient"
+        return lines, bias
+
+    def external_source_health_overview_lines(self) -> list[str]:
+        counts = self.external_source_recent_counts()
+        specs = self.data_sources
+        coinglass = specs.get("CoinGlass aggregation")
+        defillama = specs.get("DefiLlama stablecoin supply")
+        labels_count = len(self.onchain_address_labels)
+        scan_rows = self.scan_adapter_health_rows()
+        scan_status = " / ".join(
+            f"{name}:{'on' if row.get('enabled') else 'off'}"
+            for name, row in scan_rows.items()
+        )
+        return [
+            f"CoinGlass last_success={format_ts_short(coinglass.last_success if coinglass else None)} | 24h数据={counts.get('CoinGlass aggregation', 0)}",
+            f"DefiLlama last_success={format_ts_short(defillama.last_success if defillama else None)} | 24h数据={counts.get('DefiLlama stablecoin supply', 0)}",
+            f"Address labels count={labels_count}",
+            f"Scan adapters configured: {scan_status}",
+        ]
+
+    def external_funds_overview_conclusion(self, stablecoin_bias: str, coinglass_bias: str, onchain_bias: str) -> str:
+        biases = [stablecoin_bias, coinglass_bias, onchain_bias]
+        if biases.count("support") >= 2 and "risk" not in biases:
+            return "外部资金偏支撑：多项外部资金背景偏正，但不构成买卖建议。"
+        if biases.count("risk") >= 2:
+            return "外部资金偏风险：供应/聚合资金或链上状态偏弱，追多需谨慎。"
+        if "support" in biases and "risk" in biases:
+            return "外部资金分歧：部分资金背景有支撑，但风险项仍在，追多仍需谨慎。"
+        if biases.count("insufficient") >= 2:
+            return "外部资金数据不足：等待稳定币、CoinGlass 和地址事件缓存补齐。"
+        return "外部资金中性：当前外部资金背景未形成明确方向。"
+
+    def external_funds_overview_embed(self, channel_key: str = "onchain") -> DiscordOutboundMessage:
+        stable_lines, stable_bias = self.stablecoin_overview_lines_and_bias()
+        coinglass_lines, coinglass_bias = self.coinglass_overview_lines_and_bias()
+        onchain_lines, onchain_bias = self.onchain_event_overview_lines_and_bias()
+        health_lines = self.external_source_health_overview_lines()
+        conclusion = self.external_funds_overview_conclusion(stable_bias, coinglass_bias, onchain_bias)
+        fields = [
+            ("稳定币流动性", discord_field_value("\n".join(stable_lines)), False),
+            ("CoinGlass 主流聚合", discord_field_value("\n".join(coinglass_lines)), False),
+            ("链上事件状态", discord_field_value("\n".join(onchain_lines)), False),
+            ("数据源健康", discord_field_value("\n".join(health_lines)), False),
+            ("总结论", discord_field_value(conclusion), False),
+        ]
+        return DiscordOutboundMessage(
+            channel_key=channel_key,
+            title="🧭 外部资金总览",
+            color=DISCORD_COLOR_SUMMARY,
+            fields=fields,
+            kind="external_funds_overview",
+        )
+
+    def send_external_funds_overview_if_due(self) -> None:
+        if not self.discord_config.enabled or not self.discord_config.bot_token:
+            return
+        now = time.time()
+        hour_key = int(now // 3600)
+        if self.last_external_funds_overview_hour_key == hour_key:
+            return
+        channel_key = "onchain" if self.discord_config.channel_ids.get("onchain") else "summary"
+        self.last_external_funds_overview_hour_key = hour_key
+        self.save_state()
+        self.enqueue_discord_message(self.external_funds_overview_embed(channel_key))
+        logging.info("Discord external funds overview enqueued: channel=%s hour_key=%s", channel_key, hour_key)
+
     def format_stablecoin_onchain_event_summary(self, asset: str) -> str:
         events = self.recent_onchain_transfer_events(asset, limit=5)
         if not events:
@@ -2375,6 +2526,7 @@ class DerivativesMonitor:
                 self.send_onchain_summary_if_due()
                 self.send_stablecoin_liquidity_summary_if_due()
                 self.send_coinglass_summary_if_due()
+                self.send_external_funds_overview_if_due()
                 self.flush_telegram_signal_digest_if_due()
                 self.flush_discord_alt_watch_digest_if_due()
                 self.flush_discord_suppressed_digest_if_due()
@@ -3892,6 +4044,8 @@ class DerivativesMonitor:
             self.last_stablecoin_liquidity_hour_key = int(loaded_stablecoin_key) if loaded_stablecoin_key is not None else None
             loaded_coinglass_key = payload.get("last_coinglass_summary_hour_key")
             self.last_coinglass_summary_hour_key = int(loaded_coinglass_key) if loaded_coinglass_key is not None else None
+            loaded_overview_key = payload.get("last_external_funds_overview_hour_key")
+            self.last_external_funds_overview_hour_key = int(loaded_overview_key) if loaded_overview_key is not None else None
         except Exception:
             logging.warning("Failed to load monitor state", exc_info=True)
 
@@ -3903,6 +4057,7 @@ class DerivativesMonitor:
             "last_onchain_summary_hour_key": self.last_onchain_summary_hour_key,
             "last_stablecoin_liquidity_hour_key": self.last_stablecoin_liquidity_hour_key,
             "last_coinglass_summary_hour_key": self.last_coinglass_summary_hour_key,
+            "last_external_funds_overview_hour_key": self.last_external_funds_overview_hour_key,
         }
         try:
             with path.open("w", encoding="utf-8") as file:
@@ -5128,6 +5283,8 @@ class DerivativesMonitor:
             return discord_summary_embed_v2("数据源健康检查", self.format_external_source_health(), "debug")
         if command == "!外部资金来源":
             return discord_onchain_embed_v2("外部资金来源", self.format_external_source_health(only_available=False), "onchain")
+        if command in ("!外部资金总览", "!资金面", "!资金驾驶舱"):
+            return self.external_funds_overview_embed("onchain")
         if command == "!地址源":
             return discord_onchain_embed_v2("地址标签源", self.format_onchain_address_sources(), "onchain")
         if command == "!地址候选":
@@ -8037,6 +8194,16 @@ def stablecoin_liquidity_conclusion(changes: dict[str, float | None]) -> str:
     return "稳定币供应变化不大，流动性中性"
 
 
+def stablecoin_conclusion_short(conclusion: str) -> str:
+    if "扩张" in conclusion:
+        return "扩张"
+    if "收缩" in conclusion:
+        return "收缩"
+    if "数据不足" in conclusion:
+        return "数据不足"
+    return "中性"
+
+
 def discord_summary_embed_v2(title: str, message: str, channel_key: str = "summary") -> DiscordOutboundMessage:
     text = discord_clean_summary_text(message, title=title, remove_title=True)
     fields = discord_chunk_fields(text, "摘要")
@@ -8140,6 +8307,7 @@ def discord_help_text() -> str:
         "!山寨 - 查看最近山寨观察队列 Top10\n"
         "!数据源 - 查看采集层数据源健康状态\n"
         "!外部资金来源 - 查看当前真实可用外部资金来源\n"
+        "!外部资金总览 / !资金面 - 查看外部资金驾驶舱\n"
         "!地址源 - 查看自建链上地址标签库状态\n"
         "!地址候选 - 查看交易所/treasury 地址候选审计\n"
         "!地址 USDT - 查询资产或实体相关地址标签\n"
@@ -8692,6 +8860,18 @@ def coinglass_panel_judgement(metrics: dict[str, Any], balances: dict[str, Any])
     if not metrics and not balances:
         return "CoinGlass 数据不足，等待缓存"
     return "CoinGlass 聚合数据中性/分歧"
+
+
+def coinglass_judgement_short(judgement: str) -> str:
+    if "数据不足" in judgement:
+        return "数据不足"
+    if "支撑" in judgement:
+        return "支撑"
+    if any(keyword in judgement for keyword in ("抛压", "风险", "拥挤")):
+        return "抛压"
+    if "分歧" in judgement:
+        return "分歧"
+    return "分歧"
 
 
 def ratio_gte(value: float | None, threshold_percent: float) -> bool:
