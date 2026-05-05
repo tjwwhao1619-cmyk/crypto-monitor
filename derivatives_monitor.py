@@ -62,6 +62,7 @@ ONCHAIN_SCAN_ADDRESS_TTL_SECONDS = 900
 ONCHAIN_SCAN_ADDRESS_LIMIT = 20
 ONCHAIN_SCAN_TRANSFER_LIMIT = 50
 DISCORD_SUPPRESSED_DIGEST_INTERVAL_SECONDS = 900
+DISCORD_SYMBOL_CONFLICT_WINDOW_SECONDS = 1800
 FLOW_SHORT_PERIODS = ["5m", "15m", "1h"]
 FLOW_MID_PERIODS = ["4h", "12h", "24h"]
 FLOW_LONG_PERIODS = ["48h", "72h", "96h", "120h", "144h"]
@@ -256,6 +257,19 @@ class DiscordOutboundMessage:
     kind: str | None = None
     final_route: str | None = None
     route_tags: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class DiscordSymbolSignalMemory:
+    timestamp: float
+    symbol: str
+    side: str
+    signal: Signal
+    priority: str
+    quality_score: int
+    quality_reason: str
+    route_decision: "RouteDecision"
+    channel_key: str
 
 
 @dataclass(frozen=True)
@@ -606,6 +620,8 @@ class DerivativesMonitor:
         self.discord_suppressed_digest_lock = threading.Lock()
         self.discord_suppressed_digest_recent: deque[float] = deque(maxlen=1000)
         self.discord_signal_cooldowns: dict[str, tuple[float, str]] = {}
+        self.discord_symbol_signal_memory: dict[str, DiscordSymbolSignalMemory] = {}
+        self.discord_symbol_signal_memory_lock = threading.Lock()
         self.last_discord_suppressed_digest_flush_at = 0.0
         self.last_discord_suppressed_digest_flush_attempt_at = 0.0
         self.last_discord_suppressed_digest_flush_status = "not attempted"
@@ -4959,6 +4975,62 @@ class DerivativesMonitor:
     def discord_signal_key(self, signal: Signal) -> str:
         return f"{signal.symbol}/{signal.kind}"
 
+    def remove_queued_discord_symbol_messages(self, symbol: str) -> int:
+        removed = 0
+        target = str(symbol or "").strip().upper()
+        with self.discord_outbound_queue.mutex:
+            kept = []
+            while self.discord_outbound_queue.queue:
+                item = self.discord_outbound_queue.queue.popleft()
+                if str(item.symbol or "").strip().upper() == target and item.kind != "conflict_observe":
+                    removed += 1
+                    continue
+                kept.append(item)
+            self.discord_outbound_queue.queue.extend(kept)
+        return removed
+
+    def discord_symbol_conflict_previous(
+        self,
+        signal: Signal,
+        side: str,
+        now: float,
+    ) -> DiscordSymbolSignalMemory | None:
+        if side not in {"long", "risk"}:
+            return None
+        symbol = str(signal.symbol or "").strip().upper()
+        with self.discord_symbol_signal_memory_lock:
+            previous = self.discord_symbol_signal_memory.get(symbol)
+            if previous and now - previous.timestamp <= DISCORD_SYMBOL_CONFLICT_WINDOW_SECONDS and previous.side != side:
+                return previous
+        return None
+
+    def remember_discord_symbol_signal(
+        self,
+        signal: Signal,
+        side: str,
+        now: float,
+        priority: str,
+        quality_score: int,
+        quality_reason: str,
+        route_decision: RouteDecision,
+        channel_key: str,
+    ) -> None:
+        if side not in {"long", "risk"}:
+            return
+        symbol = str(signal.symbol or "").strip().upper()
+        with self.discord_symbol_signal_memory_lock:
+            self.discord_symbol_signal_memory[symbol] = DiscordSymbolSignalMemory(
+                timestamp=now,
+                symbol=symbol,
+                side=side,
+                signal=signal,
+                priority=priority,
+                quality_score=quality_score,
+                quality_reason=quality_reason,
+                route_decision=route_decision,
+                channel_key=channel_key,
+            )
+
     def route_discord_signal(
         self,
         signal: Signal,
@@ -4997,6 +5069,42 @@ class DerivativesMonitor:
                 {"route": final_decision.route, "evidence_summary": humanize_route_reason(final_decision, signal)},
             )
             return
+        side = discord_side_for_signal(signal, final_decision)
+        previous = self.discord_symbol_conflict_previous(signal, side, now)
+        if previous is not None:
+            conflict_decision = discord_conflict_route_decision(max(final_decision.score, previous.route_decision.score))
+            channel = discord_channel_for_route(conflict_decision, signal, self.discord_config.channel_ids)
+            self.remove_queued_discord_symbol_messages(signal.symbol)
+            self.enqueue_discord_message(
+                discord_conflict_observe_embed(
+                    signal,
+                    priority,
+                    quality_score,
+                    quality_reason,
+                    channel,
+                    conflict_decision,
+                    previous.signal,
+                )
+            )
+            self.discord_signal_cooldowns[key] = (now, conflict_decision.route)
+            self.remember_discord_symbol_signal(
+                signal,
+                side,
+                now,
+                priority,
+                quality_score,
+                quality_reason,
+                conflict_decision,
+                channel,
+            )
+            logging.info(
+                "Discord conflict merged: symbol=%s previous=%s current=%s channel_key=%s",
+                signal.symbol,
+                previous.side,
+                side,
+                channel,
+            )
+            return
         channel = discord_channel_for_route(final_decision, signal, self.discord_config.channel_ids)
         self.enqueue_discord_signal(
             signal,
@@ -5007,6 +5115,7 @@ class DerivativesMonitor:
             channel_key=channel,
         )
         self.discord_signal_cooldowns[key] = (now, final_decision.route)
+        self.remember_discord_symbol_signal(signal, side, now, priority, quality_score, quality_reason, final_decision, channel)
 
     def update_signal_quality_stats(self, signal: Signal, priority: str, suppressed: bool) -> None:
         with self.signal_quality_stats_lock:
@@ -7253,6 +7362,7 @@ class DerivativesMonitor:
             ("👀 普通观察", {DISCORD_ROUTE_OBSERVE}),
         ]
         grouped: dict[str, list[tuple[tuple[float, ...], dict[str, str], RouteDecision, MultiTimeframePriceAction | None]]] = {title: [] for title, _routes in sections}
+        raw_entries: list[tuple[str, str, str, tuple[float, ...], dict[str, str], RouteDecision, MultiTimeframePriceAction | None]] = []
         best_seen: set[tuple[str, str, str]] = set()
         for recent_index, row in enumerate(rows):
             symbol = str(row.get("symbol") or "").strip().upper()
@@ -7286,6 +7396,23 @@ class DerivativesMonitor:
                 kind_rank,
                 -recent_index,
             )
+            side = discord_side_for_signal(row, decision)
+            raw_entries.append((symbol, side, display_route, score_key, row, decision, price_action))
+
+        sides_by_symbol: dict[str, set[str]] = {}
+        for symbol, side, _display_route, _score_key, _row, _decision, _price_action in raw_entries:
+            if side in {"long", "risk"}:
+                sides_by_symbol.setdefault(symbol, set()).add(side)
+        conflict_symbols = {symbol for symbol, sides in sides_by_symbol.items() if {"long", "risk"}.issubset(sides)}
+        conflict_added: set[str] = set()
+        for symbol, side, display_route, score_key, row, decision, price_action in raw_entries:
+            if symbol in conflict_symbols:
+                if symbol in conflict_added:
+                    continue
+                conflict_added.add(symbol)
+                conflict_decision = discord_conflict_route_decision(decision.score)
+                grouped["🟡 重点观察"].append((score_key, row, conflict_decision, price_action))
+                continue
             for title, routes in sections:
                 if display_route in routes:
                     grouped[title].append((score_key, row, decision, price_action))
@@ -8362,6 +8489,10 @@ def discord_channel_for_route(
     route = route_decision.route if route_decision else DISCORD_ROUTE_OBSERVE
     channel_ids = channel_ids or {}
     normalized_kind = topq_kind_normalized(signal.kind if signal else "")
+    if discord_is_conflict_observe(route_decision):
+        if channel_ids.get("observe"):
+            return "observe"
+        return "alerts"
     if route == DISCORD_ROUTE_REALTIME:
         if normalized_kind in {"main_momentum_watch", "main_trend_watch"}:
             return "main"
@@ -8399,6 +8530,18 @@ def discord_correct_route_channel_mismatch(
 ) -> str:
     route = str(route or "")
     channel_ids = channel_ids or {}
+    if "多空分歧观察" in str(title or "") and channel_key in {"main", "risk", "digest", "alt_watch"}:
+        corrected = "observe" if channel_ids.get("observe") else "alerts"
+        logging.warning(
+            "Discord route/channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+            symbol or (signal.symbol if signal else "-"),
+            kind or (signal.kind if signal else "-"),
+            route or DISCORD_ROUTE_OBSERVE,
+            channel_key,
+            corrected,
+            title or "-",
+        )
+        return corrected
     if route == DISCORD_ROUTE_PRIORITY_OBSERVE and channel_key in {"main", "high-confidence", "high_confidence"}:
         corrected = "observe" if channel_ids.get("observe") else ("alerts" if channel_ids.get("alerts") else "alt_watch")
         logging.warning(
@@ -8453,6 +8596,8 @@ def discord_signal_title_for_route(signal: Signal, priority: str, route_decision
     if route_decision:
         pair = discord_symbol_pair(signal.symbol)
         price_action = safe_multi_timeframe_price_action(signal.symbol, log_result=False) if signal.snapshot else None
+        if discord_is_conflict_observe(route_decision):
+            return f"🟡 多空分歧观察 {pair}"
         if breakout_entry_is_high_risk_display(signal.snapshot, price_action, signal, route_decision):
             return f"👀 高位观察 {pair}"
         if route_decision.route == DISCORD_ROUTE_PRIORITY_OBSERVE:
@@ -9257,6 +9402,8 @@ def discord_signal_fields(
 ) -> list[tuple[str, str, bool]]:
     snapshot = signal.snapshot
     direction = "风险/减仓" if is_risk_structure_kind(signal.kind) else signal_direction_label(signal.kind)
+    if discord_is_conflict_observe(route_decision):
+        return discord_conflict_observe_fields(signal, route_decision=route_decision)
     if snapshot is None:
         evidence_name = "风险证据" if is_risk_structure_kind(signal.kind) else "证据"
         return [
@@ -9377,6 +9524,8 @@ def discord_signal_embed_v2(
     channel_key: str,
     route_decision: RouteDecision | None = None,
 ) -> DiscordOutboundMessage:
+    if discord_is_conflict_observe(route_decision):
+        return discord_conflict_observe_embed(signal, priority, quality_score, quality_reason, channel_key, route_decision)
     normalized_kind = topq_kind_normalized(signal.kind)
     if normalized_kind == "main_momentum_watch":
         return discord_main_momentum_watch_embed_v2(signal, priority, quality_score, quality_reason, channel_key, route_decision)
@@ -9973,6 +10122,13 @@ def discord_candidate_brief_lines(
     decision: RouteDecision,
     price_action: MultiTimeframePriceAction | None,
 ) -> list[str]:
+    if discord_is_conflict_observe(decision):
+        symbol = discord_symbol_pair(row.get("symbol"))
+        return [
+            f"🟡 多空分歧观察 {symbol}｜把握{format_csv_compact_number(row.get('conviction_score'), signed=False)}｜质量{format_csv_compact_number(row.get('signal_quality_score'), signed=False)}",
+            "短线资金和结构出现反复，多空证据冲突，等待方向确认。",
+            "方向: 观察 / 暂不站队｜操作: 暂不追多，也不追空。等待 15m/1h 方向重新一致。",
+        ]
     symbol = display_usdt_symbol(row.get("symbol"))
     kind_text = discord_candidate_kind_text(row.get("kind"), decision.route)
     conviction = format_csv_compact_number(row.get("conviction_score"), signed=False)
@@ -14264,6 +14420,178 @@ def topq_is_bullish_candidate(kind: str | None) -> bool:
 def topq_is_risk_candidate(kind: str | None) -> bool:
     normalized = topq_kind_normalized(kind)
     return normalized in TOPQ_RISK_KINDS or is_risk_structure_kind(normalized)
+
+
+DISCORD_CONFLICT_OBSERVE_TAG = "conflict_observe"
+DISCORD_CONFLICT_LONG_FORBIDDEN_KEYWORDS = ("高位拥挤", "派发", "主动卖盘强", "出货")
+
+
+def discord_side_for_signal(
+    signal: Signal | dict[str, Any] | None,
+    route_decision: RouteDecision | None = None,
+) -> str:
+    if signal is None:
+        return ""
+    kind = topq_kind_normalized(signal.kind if isinstance(signal, Signal) else signal.get("kind"))
+    parts: list[str] = [kind]
+    if isinstance(signal, Signal):
+        parts.extend([signal.title, signal.message])
+    else:
+        parts.extend(
+            str(signal.get(key) or "")
+            for key in (
+                "direction",
+                "evidence_direction",
+                "leading_direction",
+                "signal_direction",
+                "title",
+                "message",
+                "evidence_summary",
+                "discord_route_reason",
+                "discord_route_tags",
+            )
+        )
+    if route_decision:
+        parts.append(route_decision.reason)
+        parts.extend(route_decision.route_tags or [])
+    text = " ".join(str(part or "") for part in parts)
+    risk = (
+        kind in DISCORD_RISK_KINDS
+        or topq_is_risk_candidate(kind)
+        or text_has_any(text, ("risk", "short", "风险", "看空", "减仓", "top_risk", "top_exhaustion", "distribution", "main_risk_watch"))
+    )
+    bullish = (
+        kind in DISCORD_BULLISH_KINDS
+        or topq_is_bullish_candidate(kind)
+        or text_has_any(text, ("direction long", "long", "看多", "bottom_reversal", "discovery", "hot_breakout", "main_momentum_watch", "main_trend_watch"))
+    )
+    if risk and not bullish:
+        return "risk"
+    if bullish and not risk:
+        return "long"
+    if risk and bullish:
+        return "risk" if kind in DISCORD_RISK_KINDS or topq_is_risk_candidate(kind) else "long"
+    return ""
+
+
+def discord_is_conflict_observe(route_decision: RouteDecision | None) -> bool:
+    return bool(route_decision and DISCORD_CONFLICT_OBSERVE_TAG in (route_decision.route_tags or []))
+
+
+def discord_conflict_route_decision(score: int = 0) -> RouteDecision:
+    return RouteDecision(
+        DISCORD_ROUTE_OBSERVE,
+        "观察",
+        "多空证据冲突，等待方向确认",
+        max(0, int(score or 0)),
+        True,
+        [DISCORD_CONFLICT_OBSERVE_TAG],
+    )
+
+
+def discord_conflict_filter_long_evidence(items: list[str]) -> list[str]:
+    return [item for item in items if item and not text_has_any(item, DISCORD_CONFLICT_LONG_FORBIDDEN_KEYWORDS)]
+
+
+def discord_conflict_evidence_lists(
+    signal: Signal | dict[str, Any] | None,
+    previous: Signal | dict[str, Any] | None = None,
+    price_action: MultiTimeframePriceAction | None = None,
+) -> tuple[list[str], list[str]]:
+    snapshots = []
+    for item in (previous, signal):
+        snapshot = item.snapshot if isinstance(item, Signal) else None
+        if snapshot is not None:
+            snapshots.append(snapshot)
+    snapshot = snapshots[-1] if snapshots else None
+    long_items: list[str] = []
+    risk_items: list[str] = []
+    if snapshot is not None:
+        short_in = any(summary_flow_value(snapshot, period) > 0 for period in ("5m", "15m", "1h"))
+        mid_in = any(summary_flow_value(snapshot, period) > 0 for period in ("4h", "12h", "24h"))
+        long_in = any(summary_flow_value(snapshot, period) > 0 for period in ("72h", "144h"))
+        if short_in or mid_in or long_in:
+            labels = []
+            if short_in:
+                labels.append("短线")
+            if mid_in:
+                labels.append("中线")
+            if long_in:
+                labels.append("长线")
+            long_items.append("/".join(labels) + "资金流入")
+        if snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio >= 1.08:
+            long_items.append("主动买盘强")
+        if snapshot.oi_change_percent > 0 and snapshot.price_change_percent > 0:
+            long_items.append("OI增仓推涨")
+        if snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio < 1:
+            risk_items.append("主动卖盘转强")
+        if (
+            (snapshot.global_long_short_ratio is not None and snapshot.global_long_short_ratio >= 1.8)
+            or (snapshot.top_account_ratio is not None and snapshot.top_account_ratio >= 1.8)
+        ):
+            risk_items.append("散户多头拥挤")
+    text_parts: list[str] = []
+    for item in (previous, signal):
+        if isinstance(item, Signal):
+            text_parts.extend([item.title, item.message])
+        elif isinstance(item, dict):
+            text_parts.extend(str(item.get(key) or "") for key in ("evidence_summary", "message", "discord_route_reason", "external_confirmation_text"))
+    combined = " ".join(str(part or "") for part in text_parts)
+    if text_has_any(combined, ("现货确认", "外部确认", "现货/DEX/外部确认")) and not text_has_any(combined, DISCORD_WEAK_EXTERNAL_CONFIRMATION_KEYWORDS):
+        long_items.append("现货/外部确认")
+    if text_has_any(combined, ("现货/外部确认不足", "外部确认不足", "现货确认偏弱", "外部确认偏弱", "现货未跟", "无标准现货", "偏弱")):
+        risk_items.append("现货/外部确认不足")
+    if price_action is not None:
+        pa_text = " ".join([price_action.label, price_action.recommendation, *price_action.items, *price_action.risk_items, *price_action.patterns])
+        if price_action.long_score <= 3 or text_has_any(pa_text, ("大周期下跌", "大周期未确认")):
+            risk_items.append("大周期下跌趋势反弹")
+        if text_has_any(pa_text, ("4h箱体未突破", "箱体未突破")):
+            risk_items.append("4h箱体未突破")
+    long_items = discord_conflict_filter_long_evidence(long_items)
+    if not long_items:
+        long_items.append("短线/中线/长线资金流入")
+    if not risk_items:
+        risk_items.append("现货/外部确认不足")
+    return list(dict.fromkeys(long_items))[:5], list(dict.fromkeys(risk_items))[:5]
+
+
+def discord_conflict_observe_fields(
+    signal: Signal,
+    previous: Signal | None = None,
+    route_decision: RouteDecision | None = None,
+) -> list[tuple[str, str, bool]]:
+    price_action = safe_multi_timeframe_price_action(signal.symbol, log_result=True) if signal.snapshot else None
+    long_items, risk_items = discord_conflict_evidence_lists(signal, previous, price_action)
+    return [
+        ("币种/方向", discord_field_value(f"{signal.symbol} / 观察 / 暂不站队"), True),
+        ("Discord路由", discord_field_value("观察\n原因：多空证据冲突，等待方向确认"), False),
+        ("结论", discord_field_value("短线资金和结构出现反复，多空证据冲突，等待方向确认。"), False),
+        ("操作建议", discord_field_value("暂不追多，也不追空。等待 15m/1h 方向重新一致。"), False),
+        ("看多证据", discord_field_value("\n".join(f"- {item}" for item in long_items)), False),
+        ("风险证据", discord_field_value("\n".join(f"- {item}" for item in risk_items)), False),
+    ][:12]
+
+
+def discord_conflict_observe_embed(
+    signal: Signal,
+    priority: str,
+    quality_score: int,
+    quality_reason: str,
+    channel_key: str,
+    route_decision: RouteDecision | None = None,
+    previous: Signal | None = None,
+) -> DiscordOutboundMessage:
+    decision = route_decision or discord_conflict_route_decision()
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=f"🟡 多空分歧观察 {discord_symbol_pair(signal.symbol)}",
+        color=DISCORD_COLOR_WATCH,
+        fields=discord_conflict_observe_fields(signal, previous, decision),
+        symbol=signal.symbol,
+        kind="conflict_observe",
+        final_route=decision.route,
+        route_tags=decision.route_tags,
+    )
 
 
 def topq_risk_action(evidence_summary: str, basis_label: str) -> str:

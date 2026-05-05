@@ -4,6 +4,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import derivatives_monitor as m
+import queue
+import threading
 
 
 def snapshot(symbol="SKYAIUSDT", price_position=55, price_change=2, oi_change=3, funding=0.01):
@@ -65,6 +67,17 @@ def priority_observe_decision():
         90,
         True,
         ["priority_observe"],
+    )
+
+
+def observe_decision():
+    return m.RouteDecision(
+        m.DISCORD_ROUTE_OBSERVE,
+        "观察",
+        "risk observe",
+        70,
+        True,
+        ["risk"],
     )
 
 
@@ -185,3 +198,94 @@ def test_evidence_score_display_is_capped_at_10(monkeypatch):
 
     assert "10/10" in value
     assert "11/10" not in value
+
+
+def test_discord_symbol_long_then_risk_merges_conflict_observe(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    monitor.discord_config = m.DiscordConfig(True, "token", {"alerts": "2222222222226118"})
+    monitor.discord_outbound_queue = queue.Queue()
+    monitor.discord_signal_cooldowns = {}
+    monitor.discord_symbol_signal_memory = {}
+    monitor.discord_symbol_signal_memory_lock = threading.Lock()
+
+    decisions = [priority_observe_decision(), observe_decision()]
+    monkeypatch.setattr(m, "discord_route_decision", lambda *args, **kwargs: decisions.pop(0))
+    monkeypatch.setattr(m, "safe_multi_timeframe_price_action", lambda *args, **kwargs: price_action("4h箱体未突破", long_score=2))
+
+    long_sig = m.Signal("ADAUSDT", "bottom_reversal", 1, "看多", "direction long 看多", "k1", snapshot("ADAUSDT"))
+    risk_sig = m.Signal("ADAUSDT", "top_risk", 1, "风险", "风险 看空 主动卖盘强 高位拥挤", "k2", snapshot("ADAUSDT"))
+
+    monitor.route_discord_signal(long_sig, "A", 80, "smoke")
+    monitor.route_discord_signal(risk_sig, "B", 60, "smoke")
+
+    items = list(monitor.discord_outbound_queue.queue)
+    assert len(items) == 1
+    item = items[0]
+    assert item.kind == "conflict_observe"
+    assert item.final_route == m.DISCORD_ROUTE_OBSERVE
+    assert "conflict_observe" in item.route_tags
+
+
+def test_conflict_observe_channel_is_not_main_or_risk():
+    decision = m.discord_conflict_route_decision(80)
+    sig = m.Signal("ADAUSDT", "top_risk", 1, "risk", "", "k", snapshot("ADAUSDT"))
+
+    channel = m.discord_channel_for_route(decision, sig, {"main": "1", "risk": "2", "alerts": "3"})
+
+    assert channel == "alerts"
+    assert channel not in {"main", "risk"}
+
+
+def test_conflict_observe_copy_and_long_evidence_sanitized(monkeypatch):
+    monkeypatch.setattr(m, "safe_multi_timeframe_price_action", lambda *args, **kwargs: price_action("4h箱体未突破", long_score=2))
+    decision = m.discord_conflict_route_decision(80)
+    sig = m.Signal("ADAUSDT", "top_risk", 1, "risk", "风险 看空 主动卖盘强 高位拥挤 派发", "k", snapshot("ADAUSDT"))
+
+    title = m.discord_signal_title_for_route(sig, "B", decision)
+    fields = m.discord_signal_fields(sig, "B", 60, "smoke", decision)
+    text = "\n".join([title] + [f"{name}\n{value}" for name, value, _inline in fields])
+    long_value = next(value for name, value, _inline in fields if name == "看多证据")
+
+    assert "多空分歧观察" in text
+    assert "暂不站队" in text
+    for forbidden in ("高位拥挤", "派发", "主动卖盘强"):
+        assert forbidden not in long_value
+
+
+def test_discord_candidates_show_single_conflict_for_same_symbol(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    rows = [
+        {
+            "symbol": "ADAUSDT",
+            "kind": "bottom_reversal",
+            "conviction_score": "60",
+            "evidence_score": "8",
+            "leading_score": "6",
+            "signal_quality_score": "80",
+            "flow_trend_label": "多周期共振流入",
+        },
+        {
+            "symbol": "ADAUSDT",
+            "kind": "top_risk",
+            "conviction_score": "58",
+            "evidence_score": "7",
+            "leading_score": "5",
+            "signal_quality_score": "70",
+            "flow_trend_label": "资金分歧",
+            "evidence_summary": "高位拥挤 主动卖盘强",
+        },
+    ]
+    monkeypatch.setattr(monitor, "load_recent_signal_rows", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(m, "light_multi_timeframe_price_action", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        m,
+        "discord_route_decision",
+        lambda row, context=None: priority_observe_decision() if row["kind"] == "bottom_reversal" else observe_decision(),
+    )
+
+    text = monitor.format_discord_route_candidates_response()
+
+    assert text.count("ADA/USDT") == 1
+    assert "🟡 多空分歧观察 ADA/USDT" in text
+    assert "底部反转" not in text
+    assert "风险信号" not in text
