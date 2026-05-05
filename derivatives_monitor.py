@@ -16256,6 +16256,327 @@ def humanize_action(
     return f"{fallback_action}。{cleaned_reason}" if fallback_reason else fallback_action
 
 
+# --- SignalVerdict phase 1 ---
+@dataclass(frozen=True)
+class SignalVerdict:
+    """Unified crypto signal judgement before Discord display/routing.
+
+    Phase 1 is passive: it does not change existing signal score, route, channel,
+    Telegram, CSV, or backtest behavior. It gives us one clean judgement object
+    to compare against the older route/kind/evidence layers.
+    """
+
+    final_direction: str  # 看多 / 看空风险 / 多空分歧 / 仅观察 / 忽略
+    confidence: str  # 高 / 中 / 低
+    entry_state: str  # 可跟踪 / 等回踩确认 / 等跌破确认 / 暂不站队 / 静默
+    verdict_score: int
+    long_score: int
+    risk_score: int
+    conflict_score: int
+    entry_score: int
+    primary_reasons: list[str]
+    risk_reasons: list[str]
+    display_title: str
+    action_text: str
+
+
+def _signal_verdict_values(value):
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        out = []
+        for item in value.values():
+            out.extend(_signal_verdict_values(item))
+        return out
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for item in value:
+            out.extend(_signal_verdict_values(item))
+        return out
+    return [str(value)]
+
+
+def _signal_verdict_text(data: dict, *keys: str) -> str:
+    chunks: list[str] = []
+    for key in keys:
+        chunks.extend(_signal_verdict_values(data.get(key)))
+    return " ".join(chunks)
+
+
+def _signal_verdict_num(data: dict, *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        value = data.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return default
+
+
+def _signal_verdict_data(signal, snapshot=None, kline_structure=None, route_decision=None) -> dict:
+    data: dict = {}
+
+    if isinstance(signal, dict):
+        data.update(signal)
+    else:
+        for key in (
+            "symbol", "kind", "direction", "score", "strength", "evidence_score",
+            "evidence_direction", "evidence_summary", "leading_score",
+            "leading_direction", "leading_label", "signal_quality_score",
+            "conviction_score", "action_label", "conclusion", "flow_label",
+            "flow_trend_label", "risk_score", "risk_items", "evidence_items",
+        ):
+            if hasattr(signal, key):
+                data[key] = getattr(signal, key)
+
+    if snapshot is not None:
+        source = snapshot if isinstance(snapshot, dict) else vars(snapshot)
+        for key in (
+            "flow_label", "flow_trend_label", "short_term_score", "mid_term_score",
+            "long_term_score", "taker_buy_sell_ratio", "funding_rate",
+            "basis_pct", "price_change_pct", "open_interest_change_pct",
+        ):
+            if key in source and key not in data:
+                data[key] = source.get(key)
+
+    if kline_structure is not None:
+        source = kline_structure if isinstance(kline_structure, dict) else vars(kline_structure)
+        data.setdefault("kline_score", source.get("score"))
+        data.setdefault("kline_short_score", source.get("short_score"))
+        data.setdefault("kline_mid_score", source.get("mid_score"))
+        data.setdefault("kline_long_score", source.get("long_score"))
+        data.setdefault("kline_text", " ".join(_signal_verdict_values(source)))
+
+    if route_decision is not None:
+        source = route_decision if isinstance(route_decision, dict) else vars(route_decision)
+        data.setdefault("route", source.get("route"))
+        data.setdefault("route_reason", source.get("reason"))
+        data.setdefault("route_tags", source.get("tags"))
+
+    return data
+
+
+def build_signal_verdict(signal, snapshot=None, kline_structure=None, route_decision=None) -> SignalVerdict:
+    """Build a deterministic judgement layer for crypto Discord signals.
+
+    This intentionally separates raw signal kind from final user-facing judgement:
+    - risk kind + strong bullish evidence => 多空分歧
+    - high bullish confluence + low risk => 看多
+    - strong risk + weak bullish evidence => 看空风险
+    - everything else => 仅观察
+    """
+
+    data = _signal_verdict_data(signal, snapshot, kline_structure, route_decision)
+
+    kind_text = _signal_verdict_text(data, "kind", "signal_kind", "type", "direction", "action", "action_label")
+    kind_lower = kind_text.lower()
+    evidence_direction = _signal_verdict_text(data, "evidence_direction", "evidence_dir", "evidence_label")
+    leading_direction = _signal_verdict_text(data, "leading_direction", "leading_dir", "leading_label")
+    flow_label = _signal_verdict_text(
+        data, "flow_label", "flow_state", "flow_trend_label", "funding_flow_label", "money_flow_label"
+    )
+    kline_text = _signal_verdict_text(
+        data, "kline_summary", "kline_label", "kline_text", "kline_structure",
+        "price_action_label", "price_action_summary", "patterns", "kline_patterns"
+    )
+    evidence_text = _signal_verdict_text(
+        data, "evidence_items", "evidence_lines", "evidence_summary", "evidence_text",
+        "positive_evidence", "bullish_evidence", "trigger_items", "trigger_lines",
+        "reasons", "reason", "summary", "conclusion"
+    )
+    risk_text = _signal_verdict_text(
+        data, "risk_items", "risk_lines", "risk_reasons", "risk_text", "warnings", "warning"
+    )
+    route_text = _signal_verdict_text(data, "route", "route_reason", "route_tags")
+    all_text = " ".join([kind_text, evidence_direction, leading_direction, flow_label, kline_text, evidence_text, risk_text, route_text])
+
+    evidence_score = _signal_verdict_num(data, "evidence_score", "ev", "evidence")
+    leading_score = _signal_verdict_num(data, "leading_score", "lead", "leading")
+    kline_score = _signal_verdict_num(data, "kline_score", "price_action_score", "pa_score")
+    raw_risk_score = _signal_verdict_num(data, "risk_score", "structure_risk_score", "trap_score")
+    conviction_score = _signal_verdict_num(data, "conviction_score", "conviction")
+
+    risk_kind = any(term in kind_lower for term in (
+        "risk", "short", "top_risk", "top_exhaustion", "distribution", "main_risk_watch"
+    )) or any(term in kind_text for term in ("风险", "减仓", "看空", "顶部", "派发"))
+
+    bullish_direction = any(term in evidence_direction + leading_direction for term in (
+        "看多", "偏多", "bull", "long", "多头"
+    ))
+
+    bearish_direction = any(term in evidence_direction + leading_direction for term in (
+        "看空", "偏风险", "risk", "short", "风险"
+    ))
+
+    bullish_terms = (
+        "OI增仓推涨", "短线增仓推涨", "主力建仓", "大户偏多建仓",
+        "主动买盘强", "短线主力流入", "中线主力流入", "长线主力流入",
+        "现货/DEX/外部确认", "现货承接", "资金流入", "放量阳线",
+        "突破近20根高点", "15m 突破近20根高点", "连续收盘抬高",
+        "15m/1h 转强", "15m/1h K线转强", "K线转强", "短线转强",
+        "空头拥挤", "回踩承接", "多周期共振流入"
+    )
+    risk_terms = (
+        "主动卖盘强", "中线资金不支持", "长线资金不支持",
+        "下跌趋势反弹", "大周期压力", "压力位", "长上影",
+        "出货", "派发", "高位拥挤", "追高风险", "短强中弱",
+        "4h/12h资金流不支持", "OI扩张>10%但主动买卖比<1",
+        "费率偏热", "合约溢价", "高位增仓"
+    )
+
+    bullish_count = sum(1 for term in bullish_terms if term in all_text)
+    risk_count = sum(1 for term in risk_terms if term in all_text)
+
+    spot_confirmed = ("现货/DEX/外部确认" in all_text or "现货承接" in all_text)
+    kline_confirmed = kline_score >= 7 or any(term in kline_text for term in (
+        "15m/1h 转强", "15m/1h K线转强", "突破近20根高点", "放量阳线", "连续收盘抬高"
+    ))
+    flow_support = any(term in flow_label for term in ("多周期共振流入", "中长线吸筹", "短强中弱", "资金分歧"))
+
+    long_score = 0
+    long_score += min(25, int(evidence_score * 2.5))
+    long_score += min(20, int(leading_score * 2))
+    long_score += min(20, int(kline_score * 2))
+    long_score += min(20, bullish_count * 4)
+    if bullish_direction:
+        long_score += 8
+    if spot_confirmed:
+        long_score += 7
+    long_score = max(0, min(100, long_score))
+
+    risk_score = 0
+    risk_score += min(35, int(raw_risk_score * 5))
+    risk_score += min(30, risk_count * 6)
+    if risk_kind:
+        risk_score += 10
+    if bearish_direction:
+        risk_score += 8
+    risk_score = max(0, min(100, risk_score))
+
+    conflict_score = 0
+    if risk_kind and bullish_count >= 3:
+        conflict_score += 25
+    if long_score >= 55 and risk_score >= 35:
+        conflict_score += 25
+    if leading_score >= 5 and risk_kind and (spot_confirmed or kline_confirmed):
+        conflict_score += 25
+    if "资金分歧" in flow_label or "短强中弱" in flow_label:
+        conflict_score += 15
+    conflict_score = max(0, min(100, conflict_score))
+
+    entry_score = 0
+    if kline_confirmed:
+        entry_score += 30
+    if spot_confirmed:
+        entry_score += 20
+    if evidence_score >= 7:
+        entry_score += 20
+    if leading_score >= 6:
+        entry_score += 10
+    entry_score -= min(35, risk_count * 6 + int(raw_risk_score * 3))
+    entry_score = max(0, min(100, entry_score))
+
+    # Deterministic final judgement.
+    if conflict_score >= 55 and risk_score < 75:
+        final_direction = "多空分歧"
+    elif risk_score >= 65 and long_score < 65:
+        final_direction = "看空风险"
+    elif long_score >= 72 and risk_score <= 45 and entry_score >= 50:
+        final_direction = "看多"
+    elif risk_kind and risk_score >= 45 and long_score < 70:
+        final_direction = "看空风险"
+    else:
+        final_direction = "仅观察"
+
+    if final_direction == "看多":
+        if entry_score >= 65 and risk_score <= 35:
+            entry_state = "可跟踪"
+        else:
+            entry_state = "等回踩确认"
+    elif final_direction == "看空风险":
+        entry_state = "等跌破确认"
+    elif final_direction == "多空分歧":
+        entry_state = "暂不站队"
+    else:
+        entry_state = "静默" if conviction_score and conviction_score < 50 else "仅观察"
+
+    verdict_score = max(long_score, risk_score, conflict_score)
+    if final_direction == "多空分歧":
+        confidence_value = conflict_score
+    elif final_direction == "看多":
+        confidence_value = min(long_score, entry_score + 20) - max(0, risk_score - 35)
+    elif final_direction == "看空风险":
+        confidence_value = risk_score - max(0, long_score - 55)
+    else:
+        confidence_value = verdict_score * 0.5
+
+    if confidence_value >= 70:
+        confidence = "高"
+    elif confidence_value >= 50:
+        confidence = "中"
+    else:
+        confidence = "低"
+
+    primary_reasons: list[str] = []
+    risk_reasons: list[str] = []
+
+    if bullish_count >= 3:
+        primary_reasons.append("看多证据集中")
+    if kline_confirmed:
+        primary_reasons.append("K线短中线有确认")
+    if spot_confirmed:
+        primary_reasons.append("现货/外部确认有支撑")
+    if "多周期共振流入" in flow_label:
+        primary_reasons.append("资金多周期回流")
+    if final_direction == "多空分歧":
+        primary_reasons.insert(0, "看多证据和风险证据同时存在")
+    if final_direction == "看空风险":
+        primary_reasons.insert(0, "风险证据占主导")
+    if not primary_reasons:
+        primary_reasons.append("确认不足，先观察")
+
+    if risk_count >= 2:
+        risk_reasons.append("风险项较多")
+    if any(term in all_text for term in ("压力位", "长上影", "追高风险")):
+        risk_reasons.append("接近压力区，追高风险")
+    if any(term in all_text for term in ("中线资金不支持", "长线资金不支持", "短强中弱")):
+        risk_reasons.append("中长线资金未确认")
+    if risk_kind and final_direction != "看空风险":
+        risk_reasons.append("原始风险信号仍需尊重")
+    if not risk_reasons:
+        risk_reasons.append("暂无压倒性风险")
+
+    if final_direction == "看多":
+        display_title = "高确定性看多" if confidence == "高" else "看多观察"
+        action_text = "等回踩不破或放量延续确认，不追高" if entry_state != "可跟踪" else "可跟踪，仍需按止损执行"
+    elif final_direction == "看空风险":
+        display_title = "风险预警" if confidence == "高" else "风险观察"
+        action_text = "等跌破短线结构确认，不盲目追空"
+    elif final_direction == "多空分歧":
+        display_title = "多空分歧观察"
+        action_text = "暂不站队，等待15m/1h方向重新一致"
+    else:
+        display_title = "普通观察"
+        action_text = "确认不足，降低打扰，等待资金和K线共振"
+
+    return SignalVerdict(
+        final_direction=final_direction,
+        confidence=confidence,
+        entry_state=entry_state,
+        verdict_score=int(max(0, min(100, round(verdict_score)))),
+        long_score=int(long_score),
+        risk_score=int(risk_score),
+        conflict_score=int(conflict_score),
+        entry_score=int(entry_score),
+        primary_reasons=primary_reasons[:3],
+        risk_reasons=risk_reasons[:3],
+        display_title=display_title,
+        action_text=action_text,
+    )
+# --- end SignalVerdict phase 1 ---
+
 def discord_route_decision(
     signal: Signal | dict[str, Any],
     snapshot: MarketSnapshot | None = None,
@@ -16448,7 +16769,8 @@ def discord_route_decision(
     if single_signal_direction_conflict(data):
         route = DISCORD_ROUTE_CONFLICT_OBSERVE
         reasons.append("single signal internal direction conflict")
-        tags.append(DISCORD_CONFLICT_OBSERVE_TAG)
+        tags.append(
+DISCORD_CONFLICT_OBSERVE_TAG)
         tags.append("single_signal_direction_conflict")
 
     final_action = ""
