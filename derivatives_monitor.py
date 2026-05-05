@@ -6183,6 +6183,7 @@ class DerivativesMonitor:
                 )
         return False, ""
 
+
     def send_telegram(
         self,
         bot_token: str,
@@ -6191,37 +6192,37 @@ class DerivativesMonitor:
         priority: str | None = None,
         quality_score: int | None = None,
         quality_reason: str | None = None,
-    ) -> None:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage" if bot_token else ""
-        liquidation_text = self.format_liquidation_stats(signal.symbol)
-        if priority is None or quality_score is None or quality_reason is None:
-            priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
-        if signal.kind != "test":
-            conviction, action_text, reason_context = self.telegram_realtime_filter_inputs(signal, signal.snapshot)
-            should_send, reason = self.should_send_realtime_telegram(
-                signal,
-                signal.snapshot,
-                conviction,
-                quality_score,
-                priority,
-                action_text,
-                reason_context,
-            )
-            if not should_send:
-                logging.info(
-                    "Telegram signal suppressed: %s %s priority=%s quality=%s reason=%s",
-                    signal.symbol,
-                    signal.kind,
-                    priority,
+        ) -> None:
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage" if bot_token else ""
+            liquidation_text = self.format_liquidation_stats(signal.symbol)
+            if priority is None or quality_score is None or quality_reason is None:
+                priority, quality_score, quality_reason = signal_priority(signal, signal.snapshot)
+            if signal.kind != "test":
+                conviction, action_text, reason_context = self.telegram_realtime_filter_inputs(signal, signal.snapshot)
+                should_send, reason = self.should_send_realtime_telegram(
+                    signal,
+                    signal.snapshot,
+                    conviction,
                     quality_score,
-                    reason,
+                    priority,
+                    action_text,
+                    reason_context,
                 )
-                return
-        payload = {
-            "chat_id": chat_id,
-            "text": telegram_text(format_signal_for_telegram(signal, liquidation_text, priority, quality_score, quality_reason)),
-        }
-        self.post_json(url, payload)
+                if not should_send:
+                    logging.info(
+                        "Telegram signal suppressed: %s %s priority=%s quality=%s reason=%s",
+                        signal.symbol,
+                        signal.kind,
+                        priority,
+                        quality_score,
+                        reason,
+                    )
+                    return
+            payload = {
+                "chat_id": chat_id,
+                "text": telegram_text(format_signal_for_telegram(signal, liquidation_text, priority, quality_score, quality_reason)),
+            }
+            self.post_json(url, payload)
 
     def enqueue_pending_telegram_signal(
         self,
@@ -6229,7 +6230,7 @@ class DerivativesMonitor:
         priority: str,
         quality_score: int,
         quality_reason: str,
-    ) -> None:
+        ) -> None:
         now = time.time()
         key = self.telegram_signal_merge_key(signal)
         direction = signal_direction_label(signal.kind)
@@ -7284,6 +7285,9 @@ class DerivativesMonitor:
         return "\n".join(lines)
 
     def start_telegram_command_worker(self) -> None:
+        if telegram_runtime_disabled_by_env():
+            logging.info("Telegram command worker disabled by TELEGRAM_ENABLED")
+            return
         if self.telegram_command_thread_started:
             return
         if not self.telegram_commands_config.get("enabled", False):
@@ -9319,7 +9323,15 @@ def optional_lte(value: float | None, threshold: float) -> bool:
     return value is not None and value <= threshold
 
 
+
+def telegram_runtime_disabled_by_env() -> bool:
+    value = os.environ.get("TELEGRAM_ENABLED", "1").strip().lower()
+    return value in {"0", "false", "no", "off", "disabled"}
+
+
 def resolve_telegram_credentials(config: dict[str, Any]) -> tuple[str | None, str | None]:
+    if telegram_runtime_disabled_by_env():
+        return "", ""
     bot_token = config.get("bot_token")
     chat_id = config.get("chat_id")
     bot_token_env = config.get("bot_token_env")
@@ -16619,79 +16631,163 @@ def topq_is_risk_candidate(kind: str | None) -> bool:
     return normalized in TOPQ_RISK_KINDS or is_risk_structure_kind(normalized)
 
 
-def single_signal_direction_conflict(data: dict[str, Any]) -> bool:
-    kind = topq_kind_normalized(data.get("kind"))
-    if kind not in DISCORD_RISK_KINDS and not topq_is_risk_candidate(kind):
+def single_signal_direction_conflict(data: dict) -> bool:
+    """Only mark one risk signal as long/short conflict when bullish evidence is genuinely strong.
+
+    Weak bullish support inside a risk signal should remain risk/observe with support notes.
+    This prevents too many ordinary risk observations from becoming 多空分歧观察.
+    """
+    if not isinstance(data, dict):
+        if hasattr(data, "__dict__"):
+            data = vars(data)
+        else:
+            return False
+
+    def values(value):
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            out = []
+            for v in value.values():
+                out.extend(values(v))
+            return out
+        if isinstance(value, (list, tuple, set)):
+            out = []
+            for v in value:
+                out.extend(values(v))
+            return out
+        return [str(value)]
+
+    def text_of(*keys) -> str:
+        chunks = []
+        for key in keys:
+            chunks.extend(values(data.get(key)))
+        return " ".join(chunks)
+
+    def num_of(*keys, default=0.0) -> float:
+        for key in keys:
+            value = data.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except Exception:
+                continue
+        return default
+
+    kind_text = text_of("kind", "signal_kind", "type", "direction", "signal_direction", "action", "action_label")
+    kind_lower = kind_text.lower()
+    risk_class = any(term in kind_lower for term in (
+        "risk", "short", "top_risk", "top_exhaustion", "distribution", "main_risk_watch"
+    )) or any(term in kind_text for term in ("风险", "减仓", "看空", "顶部", "派发"))
+
+    if not risk_class:
         return False
-    evidence_direction = str(data.get("evidence_direction") or "").strip().lower()
-    evidence = int(parse_float(data.get("evidence")) or 0)
-    leading = int(parse_float(data.get("leading")) or 0)
-    leading_direction = str(data.get("leading_direction") or "").strip().lower()
-    leading_label = str(data.get("leading_label") or "")
-    flow_label = str(data.get("flow_label") or "")
-    evidence_summary = str(data.get("evidence_summary") or "")
-    external_text = str(data.get("external_confirmation_text") or "")
-    spot_label = str(data.get("spot_onchain_label") or "")
-    spot_absorption = str(data.get("spot_absorption_label") or "")
-    price_action = data.get("price_action")
-    kline_score = max(
-        int(parse_float(data.get("kline_short_score")) or 0),
-        int(parse_float(data.get("kline_mid_score")) or 0),
-        int(parse_float(data.get("kline_long_score")) or 0),
-        int(parse_float(data.get("kline_score")) or 0),
-        int(getattr(price_action, "score", 0) or 0) if price_action is not None else 0,
+
+    evidence_direction = text_of("evidence_direction", "evidence_dir", "evidence_label")
+    leading_direction = text_of("leading_direction", "leading_dir", "leading_label")
+    flow_label = text_of(
+        "flow_label", "flow_state", "funding_flow_label", "money_flow_label",
+        "flow_trend_label", "flow_trend", "fund_flow_label"
     )
-    kline_text = " ".join(
-        str(part or "")
-        for part in (
-            data.get("kline_label"),
-            data.get("kline_text"),
-            getattr(price_action, "label", "") if price_action is not None else "",
-            getattr(price_action, "recommendation", "") if price_action is not None else "",
-            " ".join(getattr(price_action, "items", []) or []) if price_action is not None else "",
-            " ".join(getattr(price_action, "patterns", []) or []) if price_action is not None else "",
+    kline_text = text_of(
+        "kline_summary", "kline_label", "kline_text", "kline_structure",
+        "price_action_label", "price_action_summary", "price_action_text",
+        "patterns", "kline_patterns"
+    )
+    evidence_text = text_of(
+        "evidence_items", "evidence_lines", "evidence_summary", "evidence_text",
+        "positive_evidence", "bullish_evidence", "trigger_items", "trigger_lines",
+        "reasons", "reason", "summary", "conclusion"
+    )
+    risk_text = text_of("risk_items", "risk_lines", "risk_reasons", "risk_text", "warnings", "warning")
+    all_text = " ".join([evidence_direction, leading_direction, flow_label, kline_text, evidence_text, risk_text])
+
+    evidence_score = num_of("evidence_score", "ev", "evidence")
+    leading_score = num_of("leading_score", "lead", "leading")
+    kline_score = num_of("kline_score", "price_action_score", "pa_score")
+    risk_score = num_of("risk_score", "structure_risk_score", "trap_score")
+
+    bullish_direction = any(term in evidence_direction + leading_direction for term in (
+        "看多", "偏多", "bull", "long", "多头"
+    ))
+
+    bullish_terms = (
+        "OI增仓推涨", "短线增仓推涨", "主力建仓", "大户偏多建仓",
+        "主动买盘强", "短线主力流入", "中线主力流入", "长线主力流入",
+        "现货/DEX/外部确认", "现货承接", "资金流入", "放量阳线",
+        "突破近20根高点", "连续收盘抬高", "15m/1h 转强", "短线转强",
+        "空头拥挤", "回踩承接"
+    )
+    hard_risk_terms = (
+        "主动卖盘强", "中线资金不支持", "长线资金不支持",
+        "下跌趋势反弹", "大周期压力", "压力位", "长上影",
+        "出货", "派发", "高位拥挤", "追高风险",
+        "短强中弱", "4h/12h资金流不支持", "OI扩张>10%但主动买卖比<1"
+    )
+
+    bullish_count = sum(1 for term in bullish_terms if term in all_text)
+    hard_risk_count = sum(1 for term in hard_risk_terms if term in all_text)
+
+    spot_confirmed = ("现货/DEX/外部确认" in all_text or "现货承接" in all_text)
+    kline_turning = any(term in kline_text for term in (
+        "15m/1h 转强", "15m/1h K线转强", "K线转强", "中短线转强",
+        "突破近20根高点", "15m 突破近20根高点", "放量阳线", "连续收盘抬高"
+    ))
+    flow_has_support = any(term in flow_label for term in ("资金分歧", "短强中弱", "中长线吸筹", "多周期"))
+
+    # 风险已经很明确时，不要改成多空分歧；保留风险观察，只在正文里写反向支撑。
+    if risk_score >= 7:
+        return False
+    if hard_risk_count >= 5:
+        return False
+
+    # PENGU 类：风险标签，但证据/现货支撑很强，且结构风险不高。
+    strong_bullish_evidence = (
+        bullish_direction
+        and evidence_score >= 8
+        and leading_score >= 5
+        and bullish_count >= 4
+        and spot_confirmed
+        and risk_score <= 5
+    )
+
+    # SUI 类：证据分可能不高，但领先/K线明显偏多，不能显示成单边减仓。
+    strong_kline_conflict = (
+        leading_score >= 6
+        and kline_score >= 8
+        and kline_turning
+        and bullish_count >= 3
+        and risk_score <= 5
+    )
+
+    # 资金分歧类：只有同时具备较强证据和 K线/现货确认，才算内部冲突。
+    flow_conflict = (
+        flow_has_support
+        and evidence_score >= 7
+        and leading_score >= 5
+        and bullish_count >= 4
+        and (spot_confirmed or kline_score >= 7)
+        and risk_score <= 5
+    )
+
+    # SUI/PENGU 这类：kind 是风险，但领先信号和承接证据明显偏多。
+    # 这里不要求 evidence_score 很高，因为有些风险信号会把看多证据降权到较低 evidence_score。
+    # 但必须限制风险不能太重，避免重新把普通风险信号都打成多空分歧。
+    leading_bullish_conflict = (
+        leading_score >= 6
+        and bullish_count >= 3
+        and risk_score <= 5
+        and hard_risk_count <= 4
+        and (
+            bullish_direction
+            or spot_confirmed
+            or kline_turning
+            or any(term in all_text for term in ("现货承接", "现货/DEX/外部确认", "短线主力流入", "OI增仓推涨"))
         )
     )
-    bullish_text = " ".join([evidence_summary, external_text, spot_label, spot_absorption, kline_text, leading_label])
-    bullish_evidence_count = sum(
-        1
-        for keyword in (
-            "OI增仓推涨",
-            "主力建仓",
-            "中线主力流入",
-            "长线主力流入",
-            "短线资金回流",
-            "现货确认",
-            "外部确认",
-            "现货承接",
-            "现货/DEX/外部确认",
-            "多周期共振流入",
-            "突破",
-            "放量阳线",
-        )
-        if keyword in bullish_text
-    )
-    evidence_bullish = evidence_direction in {"看多", "long", "bull", "bullish"} and evidence >= 6
-    leading_bullish = leading >= 5 and (
-        leading_direction in {"long", "bull", "bullish", "看多", "neutral", "中性", ""}
-        or text_has_any(leading_label, ("偏多", "看多", "中性", "分歧"))
-    )
-    kline_bullish = kline_score >= 7 and text_has_any(
-        kline_text,
-        ("15m", "1h", "转强", "突破", "放量阳线", "突破近20根高点", "短线强"),
-    )
-    flow_conflict = flow_label in {"短强中弱", "资金分歧"} and bullish_evidence_count >= 3
-    external_bullish = text_has_any(bullish_text, ("现货/DEX/外部确认", "现货确认", "外部确认")) and text_has_any(
-        bullish_text,
-        ("现货承接", "承接"),
-    )
-    return bool(
-        (evidence_bullish and leading_bullish)
-        or leading_bullish
-        or kline_bullish
-        or flow_conflict
-        or external_bullish
-    )
+
+    return bool(strong_bullish_evidence or strong_kline_conflict or flow_conflict or leading_bullish_conflict)
 
 
 def single_signal_direction_conflict_for_display(
