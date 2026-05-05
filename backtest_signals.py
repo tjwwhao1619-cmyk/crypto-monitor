@@ -2,14 +2,18 @@ import argparse
 import contextlib
 import csv
 import datetime as dt
+import json
 import io
 import statistics
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import requests
 import yaml
+
+import derivatives_monitor as live_routes
 
 BASE = "https://fapi.binance.com"
 BULL = {"discovery", "hot_breakout", "bottom_reversal", "main_trend_watch", "main_momentum_watch"}
@@ -59,6 +63,92 @@ LEADING_SCORE_GROUPS = (
 LEADING_DIRECTION_GROUPS = ("long", "short", "neutral")
 
 
+class DataMissingError(Exception):
+    def __init__(self, symbol, kind, reason):
+        super().__init__(reason)
+        self.symbol = symbol
+        self.kind = kind
+        self.reason = reason
+
+
+class BacktestKlineContext:
+    def __init__(self, cache_dir=".cache/backtest_klines", no_network=False, sleep_seconds=0.25, max_retries=5):
+        self.cache_dir = Path(cache_dir)
+        self.no_network = bool(no_network)
+        self.sleep_seconds = max(0.0, float(sleep_seconds or 0))
+        self.max_retries = max(1, int(max_retries or 1))
+        self.last_request_at = 0.0
+        self.cache_hit = 0
+        self.cache_miss = 0
+        self.stale_cache_used = 0
+        self.request_429 = 0
+        self.data_missing = []
+        self.total_rows = 0
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def cache_path(self, symbol, interval, start_ms, end_ms):
+        safe_symbol = "".join(ch for ch in str(symbol).upper() if ch.isalnum() or ch in "_-")
+        return self.cache_dir / f"{safe_symbol}_{interval}_{start_ms}_{end_ms}.json"
+
+    def read_cache_file(self, path):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            rows = payload.get("rows") if isinstance(payload, dict) else payload
+            return rows if isinstance(rows, list) else None
+        except Exception:
+            return None
+
+    def read_exact_cache(self, symbol, interval, start_ms, end_ms):
+        rows = self.read_cache_file(self.cache_path(symbol, interval, start_ms, end_ms))
+        if rows is not None:
+            self.cache_hit += 1
+            return rows
+        self.cache_miss += 1
+        return None
+
+    def stale_cache(self, symbol, interval, start_ms=None):
+        safe_symbol = "".join(ch for ch in str(symbol).upper() if ch.isalnum() or ch in "_-")
+        if start_ms is not None:
+            pattern = f"{safe_symbol}_{interval}_{start_ms}_*.json"
+        else:
+            pattern = f"{safe_symbol}_{interval}_*.json"
+        candidates = sorted(self.cache_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in candidates:
+            rows = self.read_cache_file(path)
+            if rows:
+                self.stale_cache_used += 1
+                return rows
+        return None
+
+    def write_cache(self, symbol, interval, start_ms, end_ms, rows):
+        path = self.cache_path(symbol, interval, start_ms, end_ms)
+        payload = {
+            "symbol": symbol,
+            "interval": interval,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "cached_at": dt.datetime.now(dt.UTC).isoformat(),
+            "rows": rows,
+        }
+        path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+    def throttle(self):
+        if self.sleep_seconds <= 0:
+            return
+        elapsed = time.time() - self.last_request_at
+        if elapsed < self.sleep_seconds:
+            time.sleep(self.sleep_seconds - elapsed)
+        self.last_request_at = time.time()
+
+    def note_missing(self, row, reason):
+        item = {
+            "symbol": (row.get("symbol") or "").upper(),
+            "kind": row.get("kind") or "",
+            "reason": reason,
+        }
+        self.data_missing.append(item)
+
+
 def parse_time(value):
     if not value:
         return None
@@ -81,20 +171,56 @@ def direction(kind):
     return "neutral"
 
 
-def get_klines(session, symbol, start, end):
-    r = session.get(
-        BASE + "/fapi/v1/klines",
-        params={
-            "symbol": symbol,
-            "interval": "5m",
-            "startTime": int(start * 1000),
-            "endTime": int(end * 1000),
-            "limit": 500,
-        },
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json()
+def get_klines(session, symbol, start, end, ctx: BacktestKlineContext | None = None, interval="5m"):
+    ctx = ctx or BacktestKlineContext()
+    start_ms = int(start * 1000)
+    end_ms = int(end * 1000)
+    cached = ctx.read_exact_cache(symbol, interval, start_ms, end_ms)
+    if cached is not None:
+        return cached
+    if ctx.no_network:
+        stale = ctx.stale_cache(symbol, interval, start_ms)
+        if stale is not None:
+            return stale
+        raise DataMissingError(symbol, "", "no cache and --no-network")
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "limit": 500,
+    }
+    delays = [1, 2, 5, 10]
+    last_error = "request failed"
+    for attempt in range(ctx.max_retries):
+        ctx.throttle()
+        try:
+            response = session.get(BASE + "/fapi/v1/klines", params=params, timeout=10)
+            if response.status_code == 429:
+                ctx.request_429 += 1
+                retry_after = response.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else delays[min(attempt, len(delays) - 1)]
+                last_error = f"429 Too Many Requests"
+                time.sleep(max(0.0, delay))
+                continue
+            response.raise_for_status()
+            rows = response.json()
+            ctx.write_cache(symbol, interval, start_ms, end_ms, rows)
+            return rows
+        except requests.HTTPError as exc:
+            last_error = f"HTTPError: {exc}"
+            if attempt + 1 < ctx.max_retries:
+                time.sleep(delays[min(attempt, len(delays) - 1)])
+        except requests.RequestException as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt + 1 < ctx.max_retries:
+                time.sleep(delays[min(attempt, len(delays) - 1)])
+
+    stale = ctx.stale_cache(symbol, interval, start_ms)
+    if stale is not None:
+        return stale
+    raise DataMissingError(symbol, "", last_error)
 
 
 def close_before(rows, ts):
@@ -108,7 +234,7 @@ def close_before(rows, ts):
     return float(last[4]) if last else None
 
 
-def eval_signal(session, row):
+def eval_signal(session, row, ctx: BacktestKlineContext | None = None):
     symbol = (row.get("symbol") or "").upper()
     kind = row.get("kind") or ""
     t = parse_time(row.get("time") or "")
@@ -121,12 +247,16 @@ def eval_signal(session, row):
 
     start = t.timestamp()
     now_ts = time.time()
-    rows = get_klines(session, symbol, start, min(now_ts, start + HORIZONS["24h"] + 600))
+    rows = get_klines(session, symbol, start, min(now_ts, start + HORIZONS["24h"] + 600), ctx=ctx)
     if not rows:
         return None
 
     side = direction(kind)
     out = {"symbol": symbol, "kind": kind, "side": side, "time": t, "time_ts": start}
+    out["price_change_percent"] = parse_float(row.get("price_change_percent"))
+    out["oi_change_percent"] = parse_float(row.get("oi_change_percent"))
+    out["confirm_price_change_percent"] = parse_float(row.get("confirm_price_change_percent"))
+    out["confirm_oi_change_percent"] = parse_float(row.get("confirm_oi_change_percent"))
     out["long_flow_alignment_score"] = parse_int(row.get("long_flow_alignment_score"))
     out["main_asset_score"] = parse_int(row.get("main_asset_score"))
     out["trap_risk_score"] = parse_int(row.get("trap_risk_score"))
@@ -161,6 +291,15 @@ def eval_signal(session, row):
         out[f"flow_{name}"] = parse_float(row.get(f"net_flow_{name}_usd"))
         out[f"flow_{name}_ratio"] = parse_float(row.get(f"net_flow_{name}_ratio"))
     for name, sec in HORIZONS.items():
+        horizon_rows = [item for item in rows if int(item[0]) <= int((start + sec) * 1000)]
+        if horizon_rows:
+            high = max(float(item[2]) for item in horizon_rows)
+            low = min(float(item[3]) for item in horizon_rows)
+            out[f"mfe_{name}"] = pct(entry, high) if side != "short" else pct(low, entry)
+            out[f"mae_{name}"] = pct(low, entry) if side != "short" else pct(entry, high)
+        else:
+            out[f"mfe_{name}"] = None
+            out[f"mae_{name}"] = None
         if now_ts < start + sec:
             out[name] = None
             continue
@@ -175,7 +314,46 @@ def eval_signal(session, row):
     low = min(float(x[3]) for x in rows)
     out["mfe"] = pct(entry, high)
     out["mae"] = pct(entry, low)
+    add_kline_feature_proxy(out)
     return out
+
+
+def kline_proxy_score(value):
+    if value is None:
+        return 5
+    if value >= 6:
+        return 10
+    if value >= 3:
+        return 8
+    if value >= 1:
+        return 6
+    if value > -1:
+        return 5
+    if value > -3:
+        return 3
+    return 1
+
+
+def add_kline_feature_proxy(out):
+    short_score = kline_proxy_score(out.get("15m"))
+    mid_score = kline_proxy_score(out.get("1h"))
+    long_score = kline_proxy_score(out.get("4h"))
+    out["kline_short_score"] = short_score
+    out["kline_mid_score"] = mid_score
+    out["kline_long_score"] = long_score
+    if short_score >= 8 and mid_score >= 8 and long_score >= 6:
+        label = "短中线突破延续"
+    elif short_score >= 8 and mid_score < 6:
+        label = "短线突破未延续"
+    elif short_score >= 6 and mid_score >= 6 and long_score < 5:
+        label = "短中线转强大周期未确认"
+    elif short_score <= 3 and mid_score <= 3:
+        label = "短线承压"
+    elif long_score >= 8:
+        label = "4h延续强"
+    else:
+        label = "结构中性"
+    out["kline_label"] = label
 
 
 def fmt(v):
@@ -909,6 +1087,370 @@ def print_duplicates_report(results):
     print("")
 
 
+def route_simulation_decision(row, disable_breakout_watch=False):
+    # Backtest rows do not persist live multi_timeframe_price_action. Reuse the
+    # live Discord route rules with price_action=None so non-Kline gates stay
+    # consistent. Risk realtime uses evidence_direction/evidence_score as a
+    # backtest-only proxy when live Kline bearish confirmation is unavailable.
+    return live_routes.discord_route_decision(
+        row,
+        context={
+            "load_price_action": False,
+            "risk_realtime_proxy": True,
+            "disable_breakout_watch": disable_breakout_watch,
+        },
+    )
+
+
+def route_eval_score(x):
+    vals = [x.get("1h"), x.get("4h")]
+    vals = [v for v in vals if v is not None]
+    return max(vals) if vals else None
+
+
+def route_bad_score(x):
+    adverse = x.get("mae")
+    if x.get("side") == "short" and x.get("mfe") is not None:
+        adverse = -x.get("mfe")
+    vals = [x.get("1h"), x.get("4h"), adverse]
+    vals = [v for v in vals if v is not None]
+    return min(vals) if vals else None
+
+
+def route_detail_line(x, decision, score):
+    tags = ",".join(decision.route_tags) if decision.route_tags else "-"
+    return (
+        f"{x['symbol']} {x['kind']} {x['side']} route={decision.route} score={fmt(score)} "
+        f"1h={fmt(x.get('1h'))} 4h={fmt(x.get('4h'))} 12h={fmt(x.get('12h'))} "
+        f"MFE={fmt(x.get('mfe'))} MAE={fmt(x.get('mae'))} adverse={fmt(route_bad_score(x))} "
+        f"conv={x.get('conviction_score') if x.get('conviction_score') is not None else '-'} "
+        f"q={x.get('signal_priority') or '-'}/{x.get('signal_quality_score') if x.get('signal_quality_score') is not None else '-'} "
+        f"lead={x.get('leading_score') if x.get('leading_score') is not None else '-'} "
+        f"ev={x.get('evidence_direction') or '-'}/{x.get('evidence_score') if x.get('evidence_score') is not None else '-'} "
+        f"flow={x.get('flow_trend_label') or '-'} kline={x.get('kline_label') or '-'} tags={tags} reason={decision.reason}"
+    )
+
+
+def print_route_simulation_report(results):
+    routed = [(x, route_simulation_decision(x), route_simulation_decision(x, disable_breakout_watch=True)) for x in results]
+    print("[ROUTE SIMULATION] Discord 路由模拟")
+    print("说明: 路由统计只基于可评估样本；如 [DATA COVERAGE] data_missing>0，漏网/噪声榜会受缺失样本影响。")
+    for route in ("realtime", "priority_observe", "risk_realtime", "observe", "digest", "suppress"):
+        rows = [x for x, decision, _base_decision in routed if decision.route == route]
+        print(f"{route}: 样本={len(rows)}")
+        for horizon in ("1h", "4h"):
+            print_horizon_stat_line("  ", rows, horizon, include_worst=True)
+    breakout_rows = [x for x, decision, _base_decision in routed if "breakout_watch" in decision.route_tags]
+    breakout_migrated = [
+        x for x, decision, base_decision in routed
+        if "breakout_watch" in decision.route_tags and base_decision.route == "digest"
+    ]
+    fallback_rows = [x for x, decision, _base_decision in routed if "breakout_watch_fallback" in decision.route_tags]
+    fallback_migrated = [
+        x for x, decision, base_decision in routed
+        if "breakout_watch_fallback" in decision.route_tags and base_decision.route in {"digest", "observe"}
+    ]
+    print(f"breakout_watch: 样本={len(breakout_rows)}")
+    for horizon in ("1h", "4h"):
+        print_horizon_stat_line("  ", breakout_rows, horizon, include_worst=True)
+    print(f"breakout_watch 从 digest 迁移: 样本={len(breakout_migrated)}")
+    print(f"breakout_watch_fallback: 样本={len(fallback_rows)}")
+    for horizon in ("1h", "4h"):
+        print_horizon_stat_line("  ", fallback_rows, horizon, include_worst=True)
+    print(f"breakout_watch_fallback 从 digest/observe 迁移: 样本={len(fallback_migrated)}")
+    realtime_priority_rows = [
+        x for x, decision, _base_decision in routed if decision.route in {"realtime", "risk_realtime", "priority_observe"}
+    ]
+    print(f"realtime+priority_observe: 样本={len(realtime_priority_rows)}")
+    for horizon in ("1h", "4h"):
+        print_horizon_stat_line("  ", realtime_priority_rows, horizon, include_worst=True)
+    print("")
+
+    realtime_routes = {"realtime", "risk_realtime"}
+    visible_routes = {"realtime", "risk_realtime", "priority_observe"}
+    missed = []
+    missed_before = []
+    bad_realtime = []
+    bad_priority = []
+    bad_breakout = []
+    bad_breakout_fallback = []
+    focus_symbols = {"LABUSDT", "TAGUSDT", "TSTUSDT", "BSBUSDT"}
+    focus_after = Counter()
+    focus_before = Counter()
+    for x, decision, base_decision in routed:
+        best = route_eval_score(x)
+        if decision.route not in visible_routes and best is not None and best >= 5:
+            missed.append((best, x, decision))
+            if x.get("symbol") in focus_symbols:
+                focus_after[x.get("symbol")] += 1
+        if base_decision.route not in visible_routes and best is not None and best >= 5:
+            missed_before.append((best, x, base_decision))
+            if x.get("symbol") in focus_symbols:
+                focus_before[x.get("symbol")] += 1
+        worst = route_bad_score(x)
+        if decision.route in realtime_routes and worst is not None and worst <= -3:
+            bad_realtime.append((worst, x, decision))
+        if decision.route == "priority_observe" and worst is not None and worst <= -3:
+            bad_priority.append((worst, x, decision))
+        if "breakout_watch" in decision.route_tags and worst is not None and worst <= -3:
+            bad_breakout.append((worst, x, decision))
+        if "breakout_watch_fallback" in decision.route_tags and worst is not None and worst <= -3:
+            bad_breakout_fallback.append((worst, x, decision))
+    missed.sort(key=lambda item: item[0], reverse=True)
+    missed_before.sort(key=lambda item: item[0], reverse=True)
+    bad_realtime.sort(key=lambda item: item[0])
+    bad_priority.sort(key=lambda item: item[0])
+    bad_breakout.sort(key=lambda item: item[0])
+    bad_breakout_fallback.sort(key=lambda item: item[0])
+    before_focus_total = sum(focus_before.values())
+    after_focus_total = sum(focus_after.values())
+    print(
+        "LAB/TAG/TST/BSB 漏网对比: "
+        f"before={before_focus_total} after={after_focus_total} reduced={before_focus_total - after_focus_total}"
+    )
+    for symbol in sorted(focus_symbols):
+        print(f"  {symbol}: before={focus_before.get(symbol, 0)} after={focus_after.get(symbol, 0)}")
+    print("")
+
+    print("[MISSED WINNERS] Discord 路由漏网 TOP30")
+    for index, (score, x, decision) in enumerate(missed[:30], start=1):
+        print(f"{index:02d}. {route_detail_line(x, decision, score)}")
+    print("")
+
+    print("[BAD REALTIME] Discord 实时噪声 TOP30")
+    for index, (score, x, decision) in enumerate(bad_realtime[:30], start=1):
+        print(f"{index:02d}. {route_detail_line(x, decision, score)}")
+    print("")
+
+    print("[BAD PRIORITY OBSERVE] Discord 重点观察噪声 TOP20")
+    for index, (score, x, decision) in enumerate(bad_priority[:20], start=1):
+        print(f"{index:02d}. {route_detail_line(x, decision, score)}")
+    print("")
+
+    print("[BAD BREAKOUT WATCH] Discord 爆发观察噪声 TOP20")
+    for index, (score, x, decision) in enumerate(bad_breakout[:20], start=1):
+        print(f"{index:02d}. {route_detail_line(x, decision, score)}")
+    print("")
+
+    print("[BAD BREAKOUT WATCH FALLBACK] Discord 爆发观察兜底噪声 TOP20")
+    for index, (score, x, decision) in enumerate(bad_breakout_fallback[:20], start=1):
+        print(f"{index:02d}. {route_detail_line(x, decision, score)}")
+    print("")
+
+
+def feature_bucket(value, buckets, default="-"):
+    if value is None:
+        return default
+    for label, low, high in buckets:
+        if (low is None or value >= low) and (high is None or value <= high):
+            return label
+    return default
+
+
+def funding_bucket(value):
+    if value is None:
+        return "-"
+    if value <= -0.03:
+        return "极端负费率"
+    if value < -0.005:
+        return "负费率"
+    if value < 0.01:
+        return "费率中性"
+    if value < 0.03:
+        return "正费率"
+    return "极端正费率"
+
+
+def trap_bucket(value):
+    return feature_bucket(value, [("0-2低", 0, 2), ("3-5中", 3, 5), ("6-7高", 6, 7), ("8-10极高", 8, 10)])
+
+
+def conviction_bucket(value):
+    return feature_bucket(value, [("0-49低", 0, 49), ("50-64中低", 50, 64), ("65-79中高", 65, 79), ("80+高", 80, None)])
+
+
+def leading_bucket(value):
+    return feature_bucket(value, [("0无", 0, 0), ("1-2弱", 1, 2), ("3-5中", 3, 5), ("6+强", 6, None)])
+
+
+def evidence_bucket(value):
+    return feature_bucket(value, [("<=0弱/风险", None, 0), ("1-4偏弱", 1, 4), ("5-7中", 5, 7), ("8+强", 8, None)])
+
+
+def quality_bucket(value):
+    return feature_bucket(value, [("0-24极低", 0, 24), ("25-39低", 25, 39), ("40-54中低", 40, 54), ("55-69中", 55, 69), ("70+高", 70, None)])
+
+
+def missed_winner_mfe_score(row):
+    checks = (("1h", 3), ("4h", 6), ("12h", 10))
+    scores = []
+    for horizon, threshold in checks:
+        value = row.get(f"mfe_{horizon}")
+        if row.get(horizon) is not None and value is not None:
+            scores.append((value / threshold, horizon, value))
+    if not scores:
+        return None
+    best = max(scores, key=lambda item: item[0])
+    return best if best[0] >= 1 else None
+
+
+def is_digest_or_suppressed(row, decision):
+    return decision.route == "digest" or row.get("suppressed_from_telegram") == 1
+
+
+def print_counter_block(title, rows, getter, limit=20):
+    counts = Counter(getter(row) or "-" for row in rows)
+    print(title)
+    if not counts:
+        print("  -")
+        return
+    for key, count in counts.most_common(limit):
+        pct_text = count / len(rows) * 100 if rows else 0
+        print(f"  {key}: {count} ({pct_text:.1f}%)")
+
+
+def feature_lift_rows(winners, baseline, getter, min_count=3):
+    winner_counts = Counter(getter(row) or "-" for row in winners)
+    base_counts = Counter(getter(row) or "-" for row in baseline)
+    rows = []
+    for key, count in winner_counts.items():
+        if count < min_count:
+            continue
+        winner_rate = count / len(winners) if winners else 0
+        base_rate = base_counts.get(key, 0) / len(baseline) if baseline else 0
+        lift = winner_rate / base_rate if base_rate > 0 else 99
+        rows.append((lift, winner_rate, base_rate, key, count, base_counts.get(key, 0)))
+    return sorted(rows, reverse=True)
+
+
+def print_feature_lifts(title, winners, baseline, getter, limit=8):
+    rows = feature_lift_rows(winners, baseline, getter)
+    print(title)
+    if not rows:
+        print("  -")
+        return
+    for lift, winner_rate, base_rate, key, count, base_count in rows[:limit]:
+        print(
+            f"  {key}: 漏网赢家 {count}/{len(winners)} {winner_rate*100:.1f}% | "
+            f"非赢家 {base_count}/{len(baseline)} {base_rate*100:.1f}% | lift {lift:.2f}x"
+        )
+
+
+def print_missed_winner_features_report(results):
+    routed = [(x, route_simulation_decision(x)) for x in results]
+    candidate_rows = [(x, decision) for x, decision in routed if is_digest_or_suppressed(x, decision)]
+    winners = []
+    baseline = []
+    for row, decision in candidate_rows:
+        score = missed_winner_mfe_score(row)
+        if score is not None:
+            winners.append((score, row, decision))
+        else:
+            baseline.append(row)
+    winner_rows = [row for _score, row, _decision in winners]
+    winners.sort(key=lambda item: item[0][0], reverse=True)
+
+    print("[MISSED WINNER FEATURES] 低分漏网赢家特征")
+    print("定义: route=digest 或 suppressed=1，且 1h MFE>=3% / 4h MFE>=6% / 12h MFE>=10%，只统计可评估样本。")
+    print(f"漏网候选样本: {len(candidate_rows)}")
+    print(f"漏网赢家样本: {len(winner_rows)}")
+    print(f"非赢家 digest/suppressed 对照样本: {len(baseline)}")
+    print("")
+
+    print("漏网赢家 TOP20")
+    for index, (score, row, decision) in enumerate(winners[:20], start=1):
+        _ratio, horizon, value = score
+        print(
+            f"{index:02d}. {row['symbol']} {row['kind']} route={decision.route} "
+            f"winner={horizon} MFE={fmt(value)} 1hMFE={fmt(row.get('mfe_1h'))} "
+            f"4hMFE={fmt(row.get('mfe_4h'))} 12hMFE={fmt(row.get('mfe_12h'))} "
+            f"conv={row.get('conviction_score') if row.get('conviction_score') is not None else '-'} "
+            f"q={row.get('signal_priority') or '-'}/{row.get('signal_quality_score') if row.get('signal_quality_score') is not None else '-'} "
+            f"lead={row.get('leading_score') if row.get('leading_score') is not None else '-'} "
+            f"ev={row.get('evidence_score') if row.get('evidence_score') is not None else '-'} "
+            f"flow={row.get('flow_trend_label') or '-'} kline={row.get('kline_label') or '-'}"
+        )
+    print("")
+
+    print_counter_block("symbol TOP20", winner_rows, lambda row: row.get("symbol"), 20)
+    print_counter_block("kind 分布", winner_rows, lambda row: row.get("kind"), 20)
+    print_counter_block("priority 分布", winner_rows, lambda row: row.get("signal_priority"), 20)
+    print_counter_block("quality 分布", winner_rows, lambda row: quality_bucket(row.get("signal_quality_score")), 20)
+    print_counter_block("conviction 分布", winner_rows, lambda row: conviction_bucket(row.get("conviction_score")), 20)
+    print_counter_block("leading_score 分布", winner_rows, lambda row: leading_bucket(row.get("leading_score")), 20)
+    print_counter_block("evidence_score 分布", winner_rows, lambda row: evidence_bucket(row.get("evidence_score")), 20)
+    print_counter_block("flow_label 分布", winner_rows, lambda row: row.get("flow_trend_label"), 20)
+    print_counter_block("entry_label 分布", winner_rows, lambda row: row.get("entry_timing_label"), 20)
+    print_counter_block("trap_risk 分布", winner_rows, lambda row: trap_bucket(row.get("trap_risk_score")), 20)
+    print_counter_block("funding 状态", winner_rows, lambda row: funding_bucket(row.get("funding_rate_percent")), 20)
+    print_counter_block("basis_state 分布", winner_rows, lambda row: row.get("basis_state"), 20)
+    print_counter_block("squeeze_state 分布", winner_rows, lambda row: row.get("squeeze_state_label"), 20)
+    print_counter_block("K线结构 label 分布", winner_rows, lambda row: row.get("kline_label"), 20)
+    print_counter_block("K线 short 分布", winner_rows, lambda row: str(row.get("kline_short_score")), 20)
+    print_counter_block("K线 mid 分布", winner_rows, lambda row: str(row.get("kline_mid_score")), 20)
+    print_counter_block("K线 long 分布", winner_rows, lambda row: str(row.get("kline_long_score")), 20)
+    print("")
+
+    print("与非赢家 digest/suppressed 对比: 显著更高特征")
+    print_feature_lifts("kind lift", winner_rows, baseline, lambda row: row.get("kind"))
+    print_feature_lifts("priority lift", winner_rows, baseline, lambda row: row.get("signal_priority"))
+    print_feature_lifts("conviction lift", winner_rows, baseline, lambda row: conviction_bucket(row.get("conviction_score")))
+    print_feature_lifts("leading lift", winner_rows, baseline, lambda row: leading_bucket(row.get("leading_score")))
+    print_feature_lifts("evidence lift", winner_rows, baseline, lambda row: evidence_bucket(row.get("evidence_score")))
+    print_feature_lifts("flow lift", winner_rows, baseline, lambda row: row.get("flow_trend_label"))
+    print_feature_lifts("entry lift", winner_rows, baseline, lambda row: row.get("entry_timing_label"))
+    print_feature_lifts("trap lift", winner_rows, baseline, lambda row: trap_bucket(row.get("trap_risk_score")))
+    print_feature_lifts("K线 label lift", winner_rows, baseline, lambda row: row.get("kline_label"))
+    print_feature_lifts("K线 short lift", winner_rows, baseline, lambda row: str(row.get("kline_short_score")))
+    print("")
+
+    print("噪声里也很多，不能单独用")
+    noisy_features = (
+        ("priority", lambda row: row.get("signal_priority")),
+        ("conviction", lambda row: conviction_bucket(row.get("conviction_score"))),
+        ("quality", lambda row: quality_bucket(row.get("signal_quality_score"))),
+        ("flow", lambda row: row.get("flow_trend_label")),
+        ("trap", lambda row: trap_bucket(row.get("trap_risk_score"))),
+        ("funding", lambda row: funding_bucket(row.get("funding_rate_percent"))),
+    )
+    for label, getter in noisy_features:
+        rows = feature_lift_rows(winner_rows, baseline, getter, min_count=5)
+        common_noise = [
+            item for item in rows
+            if item[2] >= 0.15 and item[0] < 1.5
+        ][:5]
+        if common_noise:
+            print(f"{label}: " + "; ".join(f"{key} 非赢家占比{base_rate*100:.1f}% lift{lift:.2f}x" for lift, _wr, base_rate, key, _count, _bc in common_noise))
+    print("")
+
+    print("候选提升规则（仅建议，未改线上路由）")
+    print("1. D/C 质量但 leading>=6 + K线短线分>=8 + kind in discovery/bottom_reversal，可提升到 priority_observe。")
+    print("2. conviction<50 但 evidence>=8 + flow_label=短强中弱/资金分歧 + 1h OI增仓，可进入观察层，不直接实时。")
+    print("3. D priority 但 entry_label=启动前/启动初期/启动观察 + trap<=5 + K线短中线同时>=6，可提升为重点观察。")
+    print("4. discovery 低分但 evidence_direction=看多 + evidence_score>=8 + basis 正常/贴水 + squeeze 非强挤压，可从 digest 拉到 priority_observe。")
+    print("5. bottom_reversal 低分但 flow_label 非中长线派发 + 15m/1h MFE早期突破代理强，可进观察摘要前排，仍要求等待承接确认。")
+    print("")
+
+
+def print_data_coverage(total_rows, results, ctx: BacktestKlineContext):
+    print("[DATA COVERAGE] 回测数据覆盖")
+    print(f"总样本: {total_rows}")
+    print(f"可评估样本: {len(results)}")
+    print(f"data_missing 样本: {len(ctx.data_missing)}")
+    print(f"429 次数: {ctx.request_429}")
+    print(f"cache_hit: {ctx.cache_hit}")
+    print(f"cache_miss: {ctx.cache_miss}")
+    print(f"stale_cache_used: {ctx.stale_cache_used}")
+    if ctx.data_missing:
+        print("data_missing by symbol TOP20")
+        for symbol, count in Counter(item["symbol"] for item in ctx.data_missing).most_common(20):
+            print(f"  {symbol}: {count}")
+        print("data_missing by kind TOP20")
+        for kind, count in Counter(item["kind"] for item in ctx.data_missing).most_common(20):
+            print(f"  {kind}: {count}")
+    print("")
+
+
 def run_backtest(args):
     cfg = yaml.safe_load(Path(args.config).read_text()) or {}
     path = Path(str(cfg.get("signal_log_path", "signals.csv")))
@@ -917,19 +1459,29 @@ def run_backtest(args):
     rows = list(csv.DictReader(path.open("r", encoding="utf-8")))[-args.limit:][::-1]
 
     session = requests.Session()
+    ctx = BacktestKlineContext(
+        cache_dir=args.cache_dir,
+        no_network=args.no_network,
+        sleep_seconds=args.sleep_seconds,
+        max_retries=args.max_retries,
+    )
+    ctx.total_rows = len(rows)
     results = []
     for row in rows:
         try:
-            item = eval_signal(session, row)
+            item = eval_signal(session, row, ctx=ctx)
             if item:
                 results.append(item)
-            time.sleep(0.08)
+        except DataMissingError as e:
+            ctx.note_missing(row, e.reason)
         except Exception as e:
             print(f"skip {row.get('symbol','-')}: {type(e).__name__}: {e}")
+            ctx.note_missing(row, f"{type(e).__name__}: {e}")
 
     if not results:
         raise SystemExit("no backtestable signals")
 
+    print_data_coverage(len(rows), results, ctx)
     print("[BACKTEST] 最近信号回测")
     print("说明: discovery/hot/main_trend_watch/main_momentum_watch 按看多计算，top_risk/distribution/main_risk_watch 按看空/风险计算")
     print("")
@@ -989,6 +1541,8 @@ def run_backtest(args):
     print_bad_signals_report(results)
     print_combo_filter_report(results)
     print_duplicates_report(results)
+    print_missed_winner_features_report(results)
+    print_route_simulation_report(results)
 
 
 class Tee:
@@ -1010,6 +1564,10 @@ def main():
     ap.add_argument("-c", "--config", default="derivatives_config.yaml")
     ap.add_argument("--limit", type=int, default=80)
     ap.add_argument("--export-report")
+    ap.add_argument("--cache-dir", default=".cache/backtest_klines")
+    ap.add_argument("--no-network", action="store_true")
+    ap.add_argument("--sleep-seconds", type=float, default=0.25)
+    ap.add_argument("--max-retries", type=int, default=5)
     args = ap.parse_args()
 
     if not args.export_report:
