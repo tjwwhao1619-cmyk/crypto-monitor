@@ -48,6 +48,7 @@ DEFILLAMA_DEX_OVERVIEW_URL = "https://api.llama.fi/overview/dexs"
 DEFILLAMA_FEES_OVERVIEW_URL = "https://api.llama.fi/overview/fees"
 DEFAULT_EXTERNAL_DATA_DB_PATH = "external_data.sqlite"
 DEFAULT_ONCHAIN_ADDRESS_CONFIG_PATH = "onchain_addresses.yaml"
+DEFAULT_STOCK_TOKEN_CONFIG_PATH = "stock_token_config.yaml"
 DEFILLAMA_STABLECOIN_TTL_SECONDS = 2700
 DEFILLAMA_EXTENDED_TTL_SECONDS = 3600
 DEXSCREENER_MARKET_TTL_SECONDS = 900
@@ -107,6 +108,7 @@ DISCORD_CHANNEL_ENV_KEYS = {
     "debug": "DISCORD_DEBUG_CHANNEL_ID",
     "alt_watch": "DISCORD_ALT_WATCH_CHANNEL_ID",
     "onchain": "DISCORD_ONCHAIN_CHANNEL_ID",
+    "stock_token": "DISCORD_STOCK_TOKEN_CHANNEL_ID",
 }
 DISCORD_COLOR_BULLISH = 0x2ECC71
 DISCORD_COLOR_RISK = 0xE74C3C
@@ -298,6 +300,59 @@ class DiscordAltWatchItem:
     reason: str
     sort_score: int
     route: str = "observe"
+
+
+@dataclass(frozen=True)
+class StockTokenInstrument:
+    token_symbol: str
+    underlying_symbol: str
+    name: str
+    sector: str
+    provider: str
+    chain: str | None = None
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class StockKlineStructure:
+    symbol: str
+    score: int
+    short_score: int
+    mid_score: int
+    long_score: int
+    summary: str
+    patterns: list[str]
+    support_levels: list[float]
+    resistance_levels: list[float]
+    trend_state: str
+    data_quality: str
+
+
+@dataclass(frozen=True)
+class StockTokenSnapshot:
+    token_symbol: str
+    underlying_symbol: str
+    token_price: float | None
+    underlying_price: float | None
+    premium_pct: float | None
+    token_volume_24h: float | None
+    token_liquidity_usd: float | None
+    spread_pct: float | None
+    underlying_change_5m: float | None
+    underlying_change_15m: float | None
+    underlying_change_1h: float | None
+    underlying_change_1d: float | None
+    underlying_volume_ratio: float | None
+    index_regime: str
+    sector_regime: str
+    risk_score: int
+    momentum_score: int
+    liquidity_score: int
+    basis_score: int
+    final_score: int
+    updated_at: float
+    source_notes: str
+    kline_structure: StockKlineStructure | None = None
 
 
 @dataclass
@@ -556,6 +611,7 @@ class DerivativesMonitor:
         self.last_stablecoin_liquidity_hour_key: int | None = None
         self.last_coinglass_summary_hour_key: int | None = None
         self.last_external_funds_overview_hour_key: int | None = None
+        self.last_stock_token_summary_hour_key: int | None = None
         self.last_market_summary_text = ""
         self.last_market_summary_ts = 0.0
         self.last_market_summary_source = ""
@@ -588,11 +644,19 @@ class DerivativesMonitor:
         self.coinglass_market_context_cache: dict[str, tuple[float, str]] = {}
         self.external_data_db_path = str(config.get("external_data_db_path", DEFAULT_EXTERNAL_DATA_DB_PATH))
         self.onchain_address_config_path = str(config.get("onchain_address_config_path", DEFAULT_ONCHAIN_ADDRESS_CONFIG_PATH))
+        self.stock_token_config_path = str(config.get("stock_token_config_path", DEFAULT_STOCK_TOKEN_CONFIG_PATH))
         self.external_data_lock = threading.Lock()
         self.data_sources = self.build_data_source_specs()
         self.onchain_address_labels: list[OnchainAddressLabel] = []
         self.onchain_address_candidates: list[OnchainAddressCandidate] = []
         self.last_external_stablecoin_collect_at = 0.0
+        self.stock_token_config = load_stock_token_config(self.stock_token_config_path)
+        self.stock_token_instruments = stock_token_instruments_from_config(self.stock_token_config)
+        self.stock_token_snapshots: dict[str, StockTokenSnapshot] = {}
+        self.stock_token_source_health: dict[str, dict[str, Any]] = {}
+        self.stock_token_yahoo_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.stock_token_last_yahoo_request_at = 0.0
+        self.last_stock_token_collect_at = 0.0
         self.last_defillama_extended_collect_at = 0.0
         self.last_dexscreener_collect_at = 0.0
         self.dexscreener_symbol_collect_cache: dict[str, float] = {}
@@ -911,6 +975,54 @@ class DerivativesMonitor:
                     );
                     CREATE INDEX IF NOT EXISTS idx_futures_only_liquidity_symbol_time
                         ON futures_only_liquidity_watch(symbol, timestamp);
+                    CREATE TABLE IF NOT EXISTS stock_token_instruments (
+                        token_symbol TEXT PRIMARY KEY,
+                        underlying_symbol TEXT NOT NULL,
+                        name TEXT,
+                        sector TEXT,
+                        provider TEXT,
+                        chain TEXT,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_stock_token_instruments_underlying
+                        ON stock_token_instruments(underlying_symbol);
+                    CREATE TABLE IF NOT EXISTS stock_token_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        token_symbol TEXT NOT NULL,
+                        underlying_symbol TEXT NOT NULL,
+                        token_price REAL,
+                        underlying_price REAL,
+                        premium_pct REAL,
+                        token_volume_24h REAL,
+                        token_liquidity_usd REAL,
+                        spread_pct REAL,
+                        underlying_change_5m REAL,
+                        underlying_change_15m REAL,
+                        underlying_change_1h REAL,
+                        underlying_change_1d REAL,
+                        underlying_volume_ratio REAL,
+                        index_regime TEXT,
+                        sector_regime TEXT,
+                        risk_score INTEGER,
+                        momentum_score INTEGER,
+                        liquidity_score INTEGER,
+                        basis_score INTEGER,
+                        final_score INTEGER,
+                        source_notes TEXT,
+                        updated_at REAL NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_stock_token_snapshots_symbol_time
+                        ON stock_token_snapshots(token_symbol, updated_at);
+                    CREATE TABLE IF NOT EXISTS stock_token_source_health (
+                        source TEXT PRIMARY KEY,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        last_success REAL,
+                        last_error TEXT,
+                        fetched_count INTEGER NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL
+                    );
                     """
                 )
                 self.ensure_source_health_scan_columns(conn)
@@ -2605,6 +2717,562 @@ class DerivativesMonitor:
         self.collect_dexscreener_market_snapshots_if_due()
         self.collect_futures_only_liquidity_watch_if_due()
         self.collect_onchain_scan_transfers_if_due()
+        self.collect_stock_token_snapshots_if_due()
+
+    def stock_token_enabled(self) -> bool:
+        return bool(self.stock_token_config.get("enabled", False))
+
+    def stock_token_channel_key(self) -> str:
+        if self.discord_config.channel_ids.get("stock_token"):
+            return "stock_token"
+        return "onchain" if self.discord_config.channel_ids.get("onchain") else "summary"
+
+    def update_stock_token_source_health(
+        self,
+        source: str,
+        success: bool = False,
+        error: str = "",
+        fetched_count: int = 0,
+        enabled: bool = True,
+        debug: Any = None,
+    ) -> None:
+        now = time.time()
+        current = self.stock_token_source_health.get(source, {})
+        last_success = now if success else current.get("last_success")
+        record = {
+            "source": source,
+            "enabled": enabled,
+            "success": bool(success),
+            "last_success": last_success,
+            "last_error": str(error or "") if success else str(error or current.get("last_error") or ""),
+            "fetched_count": int(fetched_count if success else 0),
+            "debug": debug if debug is not None else current.get("debug"),
+            "updated_at": now,
+        }
+        self.stock_token_source_health[source] = record
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO stock_token_source_health (
+                        source, enabled, last_success, last_error, fetched_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source) DO UPDATE SET
+                        enabled=excluded.enabled,
+                        last_success=excluded.last_success,
+                        last_error=excluded.last_error,
+                        fetched_count=excluded.fetched_count,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        source,
+                        1 if enabled else 0,
+                        record["last_success"],
+                        record["last_error"],
+                        record["fetched_count"],
+                        now,
+                    ),
+                )
+
+    def persist_stock_token_instruments(self) -> None:
+        now = time.time()
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                for instrument in self.stock_token_instruments:
+                    conn.execute(
+                        """
+                        INSERT INTO stock_token_instruments (
+                            token_symbol, underlying_symbol, name, sector, provider, chain, enabled, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(token_symbol) DO UPDATE SET
+                            underlying_symbol=excluded.underlying_symbol,
+                            name=excluded.name,
+                            sector=excluded.sector,
+                            provider=excluded.provider,
+                            chain=excluded.chain,
+                            enabled=excluded.enabled,
+                            updated_at=excluded.updated_at
+                        """,
+                        (
+                            instrument.token_symbol,
+                            instrument.underlying_symbol,
+                            instrument.name,
+                            instrument.sector,
+                            instrument.provider,
+                            instrument.chain,
+                            1 if instrument.enabled else 0,
+                            now,
+                        ),
+                    )
+
+    def persist_stock_token_snapshots(self, snapshots: list[StockTokenSnapshot]) -> None:
+        if not snapshots:
+            return
+        created_at = time.time()
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                for snapshot in snapshots:
+                    conn.execute(
+                        """
+                        INSERT INTO stock_token_snapshots (
+                            token_symbol, underlying_symbol, token_price, underlying_price, premium_pct,
+                            token_volume_24h, token_liquidity_usd, spread_pct,
+                            underlying_change_5m, underlying_change_15m, underlying_change_1h, underlying_change_1d,
+                            underlying_volume_ratio, index_regime, sector_regime, risk_score, momentum_score,
+                            liquidity_score, basis_score, final_score, source_notes, updated_at, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            snapshot.token_symbol,
+                            snapshot.underlying_symbol,
+                            snapshot.token_price,
+                            snapshot.underlying_price,
+                            snapshot.premium_pct,
+                            snapshot.token_volume_24h,
+                            snapshot.token_liquidity_usd,
+                            snapshot.spread_pct,
+                            snapshot.underlying_change_5m,
+                            snapshot.underlying_change_15m,
+                            snapshot.underlying_change_1h,
+                            snapshot.underlying_change_1d,
+                            snapshot.underlying_volume_ratio,
+                            snapshot.index_regime,
+                            snapshot.sector_regime,
+                            snapshot.risk_score,
+                            snapshot.momentum_score,
+                            snapshot.liquidity_score,
+                            snapshot.basis_score,
+                            snapshot.final_score,
+                            snapshot.source_notes,
+                            snapshot.updated_at,
+                            created_at,
+                        ),
+                    )
+
+    def load_recent_stock_token_snapshots(self, max_age_seconds: int | None = None) -> list[StockTokenSnapshot]:
+        max_age = int(max_age_seconds or self.stock_token_config.get("ttl_seconds", 3600) * 4)
+        cutoff = time.time() - max_age
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT s.*
+                    FROM stock_token_snapshots s
+                    JOIN (
+                        SELECT token_symbol, MAX(updated_at) AS updated_at
+                        FROM stock_token_snapshots
+                        WHERE updated_at >= ?
+                        GROUP BY token_symbol
+                    ) latest
+                      ON latest.token_symbol = s.token_symbol AND latest.updated_at = s.updated_at
+                    ORDER BY s.final_score DESC, s.updated_at DESC
+                    """,
+                    (cutoff,),
+                ).fetchall()
+                columns = [str(item[1]) for item in conn.execute("PRAGMA table_info(stock_token_snapshots)").fetchall()]
+        snapshots: list[StockTokenSnapshot] = []
+        for row in rows:
+            payload = dict(zip(columns, row))
+            snapshots.append(stock_token_snapshot_from_row(payload))
+        return snapshots
+
+    def collect_backed_xstocks_quotes(self, instruments: list[StockTokenInstrument]) -> dict[str, dict[str, Any]]:
+        quotes: dict[str, dict[str, Any]] = {}
+        source = "Backed/xStocks"
+        try:
+            response = self.session.get("https://api.backed.fi/api-docs/", timeout=8)
+            if response.status_code >= 400:
+                raise ValueError(f"HTTP {response.status_code}")
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("paths"), dict):
+                raise ValueError("OpenAPI paths unavailable")
+            self.update_stock_token_source_health(source, True, fetched_count=0)
+        except Exception:
+            self.update_stock_token_source_health(source, False, "backed_openapi_unavailable", 0)
+        return quotes
+
+    def collect_kraken_stock_token_quotes(self, instruments: list[StockTokenInstrument]) -> dict[str, dict[str, Any]]:
+        source = "Kraken public"
+        quotes: dict[str, dict[str, Any]] = {}
+        try:
+            pairs_response = self.session.get("https://api.kraken.com/0/public/AssetPairs", timeout=8)
+            pairs_payload = pairs_response.json()
+            pairs = pairs_payload.get("result") if isinstance(pairs_payload, dict) else {}
+            if not isinstance(pairs, dict):
+                raise ValueError("unexpected AssetPairs payload")
+            pair_by_token: dict[str, str] = {}
+            for pair_id, row in pairs.items():
+                if not isinstance(row, dict):
+                    continue
+                for instrument in instruments:
+                    token = instrument.token_symbol.upper()
+                    if kraken_pair_matches_stock_token(str(pair_id), row, token):
+                        pair_by_token[token] = str(pair_id)
+            if not pair_by_token:
+                debug_candidates = kraken_stock_token_debug_candidates(pairs, instruments)
+                self.update_stock_token_source_health(source, False, "no xStocks pairs found", 0, debug=debug_candidates)
+                return quotes
+            ticker_response = self.session.get(
+                "https://api.kraken.com/0/public/Ticker",
+                params={"pair": ",".join(sorted(set(pair_by_token.values())))},
+                timeout=8,
+            )
+            ticker_payload = ticker_response.json()
+            tickers = ticker_payload.get("result") if isinstance(ticker_payload, dict) else {}
+            if not isinstance(tickers, dict):
+                raise ValueError("unexpected Ticker payload")
+            for token, pair_id in pair_by_token.items():
+                row = tickers.get(pair_id)
+                if not isinstance(row, dict):
+                    continue
+                ask = parse_float((row.get("a") or [None])[0])
+                bid = parse_float((row.get("b") or [None])[0])
+                last = parse_float((row.get("c") or [None])[0])
+                volume = parse_float((row.get("v") or [None, None])[1])
+                spread = stock_token_spread_pct(bid, ask)
+                quotes[token] = {
+                    "pair_name": pair_id,
+                    "bid": bid,
+                    "ask": ask,
+                    "last": last,
+                    "volume": volume,
+                    "token_price": last,
+                    "token_volume_24h": (volume * last) if volume is not None and last is not None else None,
+                    "token_liquidity_usd": None,
+                    "spread_pct": spread,
+                    "source": source,
+                }
+            self.update_stock_token_source_health(source, bool(quotes), "" if quotes else "ticker empty", len(quotes))
+        except Exception as exc:
+            self.update_stock_token_source_health(source, False, f"{type(exc).__name__}: {exc}", 0)
+        return quotes
+
+    def collect_dexscreener_stock_token_quotes(self, instruments: list[StockTokenInstrument]) -> dict[str, dict[str, Any]]:
+        source = "DexScreener xStocks"
+        quotes: dict[str, dict[str, Any]] = {}
+        errors: list[str] = []
+        debug_candidates: list[str] = []
+        wanted = {item.token_symbol.upper(): item for item in instruments}
+        for token in sorted(wanted):
+            if token not in {"NVDAX", "TSLAX", "AAPLX", "SPYX", "QQQX", "MSTRX"}:
+                continue
+            try:
+                response = self.session.get(
+                    "https://api.dexscreener.com/latest/dex/search",
+                    params={"q": token},
+                    timeout=8,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                pairs = payload.get("pairs") if isinstance(payload, dict) else None
+                if not isinstance(pairs, list):
+                    errors.append(f"{token}: unexpected payload")
+                    continue
+                for pair in pairs[:5]:
+                    if not isinstance(pair, dict):
+                        continue
+                    base_token = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+                    debug_candidates.append(f"{token}:{base_token.get('symbol') or '-'}:{base_token.get('name') or '-'}")
+                match = next((pair for pair in pairs if isinstance(pair, dict) and dexscreener_pair_matches_stock_token(pair, token)), None)
+                if match:
+                    quote = stock_token_quote_from_dexscreener_pair(match, source)
+                    if quote.get("token_price") is not None:
+                        quotes[token] = quote
+                else:
+                    errors.append(f"{token}: no confirmed xStocks pair")
+            except Exception as exc:
+                errors.append(f"{token}: {type(exc).__name__}: {exc}")
+        if quotes:
+            error = "; ".join(errors[:3]) if errors else ""
+            self.update_stock_token_source_health(source, True, error, len(quotes), debug=debug_candidates[:20])
+        else:
+            self.update_stock_token_source_health(source, False, "; ".join(errors[:3]) or "no confirmed xStocks pairs", 0, debug=debug_candidates[:20])
+        return quotes
+
+    def cached_yahoo_stock_token_data(self, symbol: str, max_age_seconds: int | None = None) -> dict[str, Any] | None:
+        cache = getattr(self, "stock_token_yahoo_cache", {})
+        cached = cache.get(str(symbol or "").upper()) if isinstance(cache, dict) else None
+        if not cached:
+            return None
+        cached_at, payload = cached
+        if max_age_seconds is not None and time.time() - cached_at > max_age_seconds:
+            return None
+        return dict(payload)
+
+    def fetch_yahoo_chart_data(self, symbol: str) -> dict[str, Any] | None:
+        now = time.time()
+        cache_ttl = int(self.stock_token_config.get("yahoo_cache_ttl_seconds", 900) or 900)
+        cached = self.cached_yahoo_stock_token_data(symbol, cache_ttl)
+        if cached:
+            return cached
+        last_request_at = float(getattr(self, "stock_token_last_yahoo_request_at", 0.0) or 0.0)
+        min_gap = float(self.stock_token_config.get("yahoo_request_min_gap_seconds", 0.8) or 0.8)
+        wait_seconds = min_gap - (now - last_request_at)
+        if wait_seconds > 0:
+            time.sleep(min(wait_seconds, 2.0))
+        self.stock_token_last_yahoo_request_at = time.time()
+        response = self.session.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.upper()}",
+            params={"range": "5d", "interval": "5m"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "application/json,text/plain,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": f"https://finance.yahoo.com/quote/{symbol.upper()}/",
+            },
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            raise ValueError(f"HTTP {response.status_code}")
+        parsed = parse_yahoo_chart_underlying(response.json())
+        if parsed:
+            if not hasattr(self, "stock_token_yahoo_cache"):
+                self.stock_token_yahoo_cache = {}
+            self.stock_token_yahoo_cache[str(symbol or "").upper()] = (time.time(), dict(parsed))
+        return parsed
+
+    def fetch_stooq_intraday_history(self, symbol: str, limit: int = 90) -> list[dict[str, float]]:
+        response = self.session.get(
+            "https://stooq.com/q/d/l/",
+            params={"s": stooq_us_symbol(symbol), "i": "5"},
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            raise ValueError(f"HTTP {response.status_code}")
+        rows = list(csv.DictReader(response.text.splitlines()))
+        parsed: list[dict[str, float]] = []
+        for row in rows[-limit:]:
+            close = parse_float(row.get("Close"))
+            open_price = parse_float(row.get("Open"))
+            volume = parse_float(row.get("Volume"))
+            if close is None:
+                continue
+            parsed.append({"close": close, "open": open_price or close, "volume": volume or 0.0})
+        return parsed
+
+    def fetch_stooq_daily_history(self, symbol: str, limit: int = 90) -> list[dict[str, float]]:
+        try:
+            response = self.session.get(
+                "https://stooq.com/q/d/l/",
+                params={"s": stooq_us_symbol(symbol), "i": "d"},
+                timeout=8,
+            )
+            if response.status_code >= 400:
+                raise ValueError(f"HTTP {response.status_code}")
+            rows = list(csv.DictReader(response.text.splitlines()))
+            parsed: list[dict[str, float]] = []
+            for row in rows[-limit:]:
+                close = parse_float(row.get("Close"))
+                open_price = parse_float(row.get("Open"))
+                high = parse_float(row.get("High"))
+                low = parse_float(row.get("Low"))
+                volume = parse_float(row.get("Volume"))
+                if close is None:
+                    continue
+                parsed.append({"close": close, "open": open_price or close, "high": high or close, "low": low or close, "volume": volume or 0.0})
+            if not parsed and "Get your apikey" in response.text:
+                realtime_response = self.session.get(
+                    "https://stooq.com/q/l/",
+                    params={"s": stooq_us_symbol(symbol), "f": "sd2t2ohlcvp", "h": "", "e": "csv"},
+                    timeout=8,
+                )
+                if realtime_response.status_code >= 400:
+                    raise ValueError(f"HTTP {realtime_response.status_code}")
+                realtime_rows = list(csv.DictReader(realtime_response.text.splitlines()))
+                if realtime_rows:
+                    row = realtime_rows[-1]
+                    close = parse_float(row.get("Close"))
+                    prev = parse_float(row.get("Prev"))
+                    open_price = parse_float(row.get("Open"))
+                    volume = parse_float(row.get("Volume"))
+                    if prev is not None:
+                        parsed.append({"close": prev, "open": prev, "high": prev, "low": prev, "volume": 0.0})
+                    if close is not None:
+                        parsed.append({"close": close, "open": open_price or close, "high": close, "low": close, "volume": volume or 0.0})
+            return parsed
+        except Exception:
+            raise
+
+    def collect_underlying_market_data(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        data: dict[str, dict[str, Any]] = {}
+        yahoo_errors: list[str] = []
+        stooq_errors: list[str] = []
+        yahoo_fetched = 0
+        stooq_fetched = 0
+        yahoo_rate_limited = False
+        stale_cache_used = 0
+        stooq_intraday_used = 0
+        stooq_daily_only = 0
+        for symbol in sorted(set(symbols)):
+            normalized = str(symbol or "").strip().upper()
+            if not normalized:
+                continue
+            try:
+                yahoo = self.fetch_yahoo_chart_data(normalized)
+                if yahoo:
+                    data[normalized] = yahoo
+                    yahoo_fetched += 1
+                    continue
+                yahoo_errors.append(f"{normalized}: empty")
+            except Exception as exc:
+                error_text = f"{type(exc).__name__}: {exc}"
+                if "HTTP 429" in error_text:
+                    yahoo_rate_limited = True
+                    cached = self.cached_yahoo_stock_token_data(normalized)
+                    if cached:
+                        cached["stale_cache_used"] = True
+                        data[normalized] = cached
+                        stale_cache_used += 1
+                        continue
+                    yahoo_errors.append(f"{normalized}: yahoo_rate_limited")
+                else:
+                    yahoo_errors.append(f"{normalized}: {error_text}")
+            try:
+                stooq_intraday = None
+                intraday_rows: list[dict[str, float]] = []
+                try:
+                    intraday_rows = self.fetch_stooq_intraday_history(normalized)
+                    stooq_intraday = stooq_intraday_underlying_from_history(intraday_rows)
+                except Exception:
+                    stooq_intraday = None
+                daily_rows = self.fetch_stooq_daily_history(normalized)
+                daily = stooq_daily_underlying_from_history(daily_rows)
+                if stooq_intraday and daily:
+                    stooq_intraday["change_1d"] = daily.get("change_1d")
+                    stooq_intraday["daily_only"] = False
+                    stooq_intraday["daily_rows"] = daily_rows
+                    stooq_intraday["intraday_rows"] = intraday_rows
+                    stooq = stooq_intraday
+                    stooq_intraday_used += 1
+                elif stooq_intraday:
+                    stooq_intraday["daily_only"] = False
+                    stooq_intraday["intraday_rows"] = intraday_rows
+                    stooq = stooq_intraday
+                    stooq_intraday_used += 1
+                else:
+                    stooq = daily
+                    if stooq:
+                        stooq["daily_only"] = True
+                        stooq["daily_rows"] = daily_rows
+                        stooq_daily_only += 1
+                if stooq:
+                    data[normalized] = stooq
+                    stooq_fetched += 1
+                else:
+                    stooq_errors.append(f"{normalized}: empty")
+            except Exception as exc:
+                stooq_errors.append(f"{normalized}: {type(exc).__name__}: {exc}")
+        if yahoo_fetched or stale_cache_used or yahoo_rate_limited:
+            status_parts = []
+            if yahoo_rate_limited:
+                status_parts.append("yahoo_rate_limited")
+            if stale_cache_used:
+                status_parts.append(f"stale_cache_used={stale_cache_used}")
+            if yahoo_errors:
+                status_parts.append(f"yahoo_failed: {'; '.join(yahoo_errors[:3])}")
+            yahoo_success = bool(yahoo_fetched or stale_cache_used)
+            self.update_stock_token_source_health("Yahoo underlying", yahoo_success, "; ".join(status_parts), yahoo_fetched + stale_cache_used)
+        elif yahoo_errors:
+            self.update_stock_token_source_health("Yahoo underlying", False, f"yahoo_failed: {'; '.join(yahoo_errors[:3])}", 0)
+        else:
+            self.update_stock_token_source_health("Yahoo underlying", False, "yahoo_failed: no symbols", 0)
+        if stooq_fetched:
+            stooq_status = [f"intraday={stooq_intraday_used}", f"daily_only={stooq_daily_only}"]
+            if stooq_errors:
+                stooq_status.append(f"stooq_failed: {'; '.join(stooq_errors[:3])}")
+            stooq_error = "; ".join(stooq_status)
+            self.update_stock_token_source_health("Stooq fallback", True, stooq_error, stooq_fetched)
+        elif stooq_errors:
+            self.update_stock_token_source_health("Stooq fallback", False, f"stooq_failed: {'; '.join(stooq_errors[:3])}", 0)
+        else:
+            self.update_stock_token_source_health("Stooq fallback", False, "stooq_not_used", 0)
+        return data
+
+    def collect_stock_token_snapshots_if_due(self, now: float | None = None, force: bool = False) -> list[StockTokenSnapshot]:
+        if not self.stock_token_enabled():
+            return []
+        current_time = time.time() if now is None else now
+        ttl = int(self.stock_token_config.get("ttl_seconds", 3600))
+        if not force and current_time - self.last_stock_token_collect_at < ttl:
+            return list(self.stock_token_snapshots.values())
+        self.last_stock_token_collect_at = current_time
+        instruments = [item for item in self.stock_token_instruments if item.enabled]
+        if not instruments:
+            return []
+        self.persist_stock_token_instruments()
+        token_quotes = self.collect_backed_xstocks_quotes(instruments)
+        kraken_quotes = self.collect_kraken_stock_token_quotes(instruments)
+        for token, quote in kraken_quotes.items():
+            token_quotes.setdefault(token, quote)
+        dexscreener_quotes = self.collect_dexscreener_stock_token_quotes(instruments)
+        for token, quote in dexscreener_quotes.items():
+            token_quotes.setdefault(token, quote)
+        underlyings = self.collect_underlying_market_data([item.underlying_symbol for item in instruments])
+        qqq = underlyings.get("QQQ", {})
+        spy = underlyings.get("SPY", {})
+        index_regime = stock_token_index_regime(qqq.get("change_1d"), spy.get("change_1d"))
+        snapshots = []
+        for instrument in instruments:
+            underlying = underlyings.get(instrument.underlying_symbol, {})
+            quote = token_quotes.get(instrument.token_symbol.upper(), {})
+            snapshot = build_stock_token_snapshot(
+                instrument,
+                quote,
+                underlying,
+                index_regime,
+                stock_token_sector_regime(instrument.sector, underlyings),
+                self.stock_token_config,
+                current_time,
+            )
+            snapshots.append(snapshot)
+        self.stock_token_snapshots = {snapshot.token_symbol.upper(): snapshot for snapshot in snapshots}
+        self.persist_stock_token_snapshots(snapshots)
+        return snapshots
+
+    def stock_token_snapshot_rows_for_display(self, force_collect: bool = False) -> list[StockTokenSnapshot]:
+        snapshots = self.collect_stock_token_snapshots_if_due(force=force_collect)
+        if snapshots:
+            return sorted(snapshots, key=lambda item: (stock_token_display_rank(item), item.final_score), reverse=True)
+        return sorted(self.load_recent_stock_token_snapshots(), key=lambda item: (stock_token_display_rank(item), item.final_score), reverse=True)
+
+    def stock_token_overview_embed(self, target: str | None = None) -> DiscordOutboundMessage:
+        if target:
+            snapshots = self.stock_token_snapshot_rows_for_display(force_collect=True)
+            normalized = stock_token_normalize_query(target)
+            match = next(
+                (
+                    item
+                    for item in snapshots
+                    if item.token_symbol.upper() == normalized or item.underlying_symbol.upper() == normalized
+                ),
+                None,
+            )
+            if match is None:
+                return discord_summary_embed_v2("美股代币诊断", f"暂无 {target} 的美股代币数据。", self.stock_token_channel_key())
+            return stock_token_detail_embed(match, self.stock_token_channel_key())
+        snapshots = self.stock_token_snapshot_rows_for_display(force_collect=True)
+        return stock_token_overview_embed(snapshots[:10], self.stock_token_channel_key())
+
+    def stock_token_source_health_embed(self) -> DiscordOutboundMessage:
+        self.collect_stock_token_snapshots_if_due(force=True)
+        return discord_summary_embed_v2("美股代币数据源", format_stock_token_source_health(self.stock_token_source_health), self.stock_token_channel_key())
+
+    def stock_token_risk_embed(self) -> DiscordOutboundMessage:
+        snapshots = self.stock_token_snapshot_rows_for_display(force_collect=True)
+        risky = [item for item in snapshots if stock_token_is_risk_alert(item, self.stock_token_config)]
+        return stock_token_risk_embed(risky[:10], self.stock_token_channel_key(), all_snapshots=snapshots, config=self.stock_token_config)
+
+    def send_stock_token_summary_if_due(self, now: float | None = None) -> None:
+        if not self.discord_config.enabled or not self.discord_config.bot_token or not self.stock_token_enabled():
+            return
+        current_time = time.time() if now is None else now
+        hour_key = int(current_time // 3600)
+        if self.last_stock_token_summary_hour_key == hour_key:
+            return
+        self.last_stock_token_summary_hour_key = hour_key
+        self.save_state()
+        snapshots = self.stock_token_snapshot_rows_for_display(force_collect=True)
+        self.enqueue_discord_message(stock_token_overview_embed(snapshots[:10], self.stock_token_channel_key(), title="美股代币观察摘要"))
 
     def persist_external_confirmation_metrics(
         self,
@@ -3379,6 +4047,7 @@ class DerivativesMonitor:
                 self.send_stablecoin_liquidity_summary_if_due()
                 self.send_coinglass_summary_if_due()
                 self.send_external_funds_overview_if_due()
+                self.send_stock_token_summary_if_due()
                 self.flush_telegram_signal_digest_if_due()
                 self.flush_discord_alt_watch_digest_if_due()
                 self.flush_discord_suppressed_digest_if_due()
@@ -4901,6 +5570,8 @@ class DerivativesMonitor:
             self.last_coinglass_summary_hour_key = int(loaded_coinglass_key) if loaded_coinglass_key is not None else None
             loaded_overview_key = payload.get("last_external_funds_overview_hour_key")
             self.last_external_funds_overview_hour_key = int(loaded_overview_key) if loaded_overview_key is not None else None
+            loaded_stock_token_key = payload.get("last_stock_token_summary_hour_key")
+            self.last_stock_token_summary_hour_key = int(loaded_stock_token_key) if loaded_stock_token_key is not None else None
         except Exception:
             logging.warning("Failed to load monitor state", exc_info=True)
 
@@ -4913,6 +5584,7 @@ class DerivativesMonitor:
             "last_stablecoin_liquidity_hour_key": self.last_stablecoin_liquidity_hour_key,
             "last_coinglass_summary_hour_key": self.last_coinglass_summary_hour_key,
             "last_external_funds_overview_hour_key": self.last_external_funds_overview_hour_key,
+            "last_stock_token_summary_hour_key": self.last_stock_token_summary_hour_key,
         }
         try:
             with path.open("w", encoding="utf-8") as file:
@@ -6287,6 +6959,13 @@ class DerivativesMonitor:
             return discord_topq_embed_v2(self.format_topq_response(discord_view=True), "digest")
         if command == "!山寨":
             return self.discord_alt_watch_command_response()
+        if command == "!美股代币":
+            target = parts[1] if len(parts) >= 2 else None
+            return self.stock_token_overview_embed(target)
+        if command == "!美股代币来源":
+            return self.stock_token_source_health_embed()
+        if command == "!美股代币风险":
+            return self.stock_token_risk_embed()
         if command == "!数据源":
             return discord_summary_embed_v2("数据源健康检查", self.format_external_source_health(), "debug")
         if command == "!采集统计":
@@ -8493,6 +9172,10 @@ def discord_channel_for_route(
         if channel_ids.get("observe"):
             return "observe"
         return "alerts"
+    if route == DISCORD_ROUTE_CONFLICT_OBSERVE:
+        if channel_ids.get("observe"):
+            return "observe"
+        return "alerts"
     if route == DISCORD_ROUTE_REALTIME:
         if normalized_kind in {"main_momentum_watch", "main_trend_watch"}:
             return "main"
@@ -8530,13 +9213,13 @@ def discord_correct_route_channel_mismatch(
 ) -> str:
     route = str(route or "")
     channel_ids = channel_ids or {}
-    if "多空分歧观察" in str(title or "") and channel_key in {"main", "risk", "digest", "alt_watch"}:
+    if "多空分歧观察" in str(title or "") and channel_key in {"main", "high-confidence", "high_confidence", "risk", "digest", "alt_watch"}:
         corrected = "observe" if channel_ids.get("observe") else "alerts"
         logging.warning(
-            "Discord route/channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+            "Discord conflict channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
             symbol or (signal.symbol if signal else "-"),
             kind or (signal.kind if signal else "-"),
-            route or DISCORD_ROUTE_OBSERVE,
+            route or DISCORD_ROUTE_CONFLICT_OBSERVE,
             channel_key,
             corrected,
             title or "-",
@@ -9972,6 +10655,905 @@ def discord_summary_embed_v2(title: str, message: str, channel_key: str = "summa
     )
 
 
+DEFAULT_STOCK_TOKEN_UNIVERSE = [
+    "NVDAx",
+    "TSLAx",
+    "AAPLx",
+    "MSFTx",
+    "AMZNx",
+    "METAx",
+    "GOOGLx",
+    "PLTRx",
+    "MSTRx",
+    "SPYx",
+    "QQQx",
+]
+DEFAULT_STOCK_TOKEN_UNDERLYINGS = ["NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "PLTR", "MSTR", "SPY", "QQQ"]
+DEFAULT_STOCK_TOKEN_SECTORS = {
+    "NVDA": "semis",
+    "TSLA": "mega_cap",
+    "AAPL": "mega_cap",
+    "MSFT": "ai",
+    "AMZN": "mega_cap",
+    "META": "mega_cap",
+    "GOOGL": "tech",
+    "PLTR": "ai",
+    "MSTR": "crypto_equity",
+    "SPY": "index",
+    "QQQ": "index",
+}
+STOCK_TOKEN_RISK_WORDS = ("买入", "卖出", "强烈建议")
+
+
+def load_stock_token_config(path: str | None = None) -> dict[str, Any]:
+    defaults = {
+        "enabled": False,
+        "default_universe": DEFAULT_STOCK_TOKEN_UNIVERSE,
+        "underlying_symbols": DEFAULT_STOCK_TOKEN_UNDERLYINGS,
+        "sectors": ["tech", "ai", "semis", "mega_cap", "crypto_equity", "index"],
+        "ttl_seconds": 3600,
+        "min_liquidity_usd": 100000,
+        "premium_alert_threshold_pct": 3.0,
+        "spread_alert_threshold_pct": 1.0,
+    }
+    config_path = Path(path or DEFAULT_STOCK_TOKEN_CONFIG_PATH)
+    if config_path.exists():
+        try:
+            with config_path.open("r", encoding="utf-8") as file:
+                loaded = yaml.safe_load(file) or {}
+            if isinstance(loaded, dict):
+                defaults.update(loaded)
+        except Exception:
+            logging.exception("Failed to read stock token config: %s", config_path)
+    return defaults
+
+
+def stock_token_instruments_from_config(config: dict[str, Any]) -> list[StockTokenInstrument]:
+    universe = list(config.get("default_universe") or DEFAULT_STOCK_TOKEN_UNIVERSE)
+    underlyings = list(config.get("underlying_symbols") or DEFAULT_STOCK_TOKEN_UNDERLYINGS)
+    instruments_config = config.get("instruments") if isinstance(config.get("instruments"), list) else []
+    by_token: dict[str, StockTokenInstrument] = {}
+    for row in instruments_config:
+        if not isinstance(row, dict):
+            continue
+        token = str(row.get("token_symbol") or "").strip()
+        underlying = str(row.get("underlying_symbol") or "").strip().upper()
+        if not token or not underlying:
+            continue
+        by_token[token.upper()] = StockTokenInstrument(
+            token_symbol=token,
+            underlying_symbol=underlying,
+            name=str(row.get("name") or f"{underlying} token"),
+            sector=str(row.get("sector") or DEFAULT_STOCK_TOKEN_SECTORS.get(underlying, "tech")),
+            provider=str(row.get("provider") or "manual"),
+            chain=str(row.get("chain") or "") or None,
+            enabled=bool(row.get("enabled", True)),
+        )
+    result: list[StockTokenInstrument] = []
+    for index, token in enumerate(universe):
+        underlying = str(underlyings[index] if index < len(underlyings) else str(token).removesuffix("x")).upper()
+        existing = by_token.get(str(token).upper())
+        result.append(
+            existing
+            or StockTokenInstrument(
+                token_symbol=str(token),
+                underlying_symbol=underlying,
+                name=f"{underlying} xStock",
+                sector=DEFAULT_STOCK_TOKEN_SECTORS.get(underlying, "tech"),
+                provider="xStocks",
+                chain=None,
+                enabled=True,
+            )
+        )
+    return result
+
+
+def stock_token_normalize_query(value: str | None) -> str:
+    normalized = str(value or "").strip().upper()
+    if not normalized:
+        return ""
+    return normalized if normalized.endswith("X") else normalized
+
+
+def stock_token_spread_pct(bid: float | None, ask: float | None) -> float | None:
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return None
+    mid = (bid + ask) / 2
+    return (ask - bid) / mid * 100 if mid > 0 else None
+
+
+def stock_token_premium_pct(token_price: float | None, underlying_price: float | None) -> float | None:
+    if token_price is None or underlying_price is None or underlying_price <= 0:
+        return None
+    return (token_price - underlying_price) / underlying_price * 100
+
+
+def stooq_us_symbol(symbol: str) -> str:
+    return f"{str(symbol or '').strip().lower()}.us"
+
+
+def stock_token_change_from_series(values: list[Any], latest_index: int, periods: int) -> float | None:
+    if latest_index - periods < 0:
+        return None
+    previous = parse_float(values[latest_index - periods])
+    latest = parse_float(values[latest_index])
+    if previous is None or latest is None or previous <= 0:
+        return None
+    return percent_change(previous, latest)
+
+
+def kraken_pair_matches_stock_token(pair_id: str, row: dict[str, Any], token_symbol: str) -> bool:
+    token = str(token_symbol or "").strip().upper()
+    base = token[:-1] if token.endswith("X") else token
+    fields = [str(pair_id or ""), *(str(row.get(key) or "") for key in ("altname", "wsname", "name"))]
+    variants = {
+        token,
+        f"{token}USD",
+        f"{token}USDT",
+        f"{token}/USD",
+        f"{base}.X",
+        f"X{base}",
+        f"{base}/USD",
+    }
+    normalized_fields = {field.upper().replace("-", "").strip() for field in fields if field}
+    compact_fields = {field.replace("/", "") for field in normalized_fields}
+    return any(variant in normalized_fields or variant.replace("/", "") in compact_fields for variant in variants)
+
+
+def kraken_stock_token_debug_candidates(pairs: dict[str, Any], instruments: list[StockTokenInstrument], limit: int = 20) -> list[str]:
+    bases = {item.underlying_symbol.upper() for item in instruments}
+    tokens = {item.token_symbol.upper() for item in instruments}
+    candidates: list[str] = []
+    for pair_id, row in pairs.items():
+        if not isinstance(row, dict):
+            continue
+        text = " ".join(str(row.get(key) or "") for key in ("altname", "wsname", "name"))
+        upper = f"{pair_id} {text}".upper()
+        if any(token in upper for token in tokens) or any(base in upper for base in bases):
+            candidates.append(f"{pair_id}:{row.get('altname') or '-'}:{row.get('wsname') or '-'}")
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def dexscreener_pair_matches_stock_token(pair: dict[str, Any], token_symbol: str) -> bool:
+    token = str(token_symbol or "").strip().upper()
+    if not token:
+        return False
+    base = token[:-1] if token.endswith("X") else token
+    base_token = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+    quote_token = pair.get("quoteToken") if isinstance(pair.get("quoteToken"), dict) else {}
+    text = " ".join(
+        str(part or "")
+        for part in (
+            base_token.get("symbol"),
+            base_token.get("name"),
+            quote_token.get("symbol"),
+            quote_token.get("name"),
+            pair.get("labels"),
+            pair.get("url"),
+        )
+    ).upper()
+    compact = re.sub(r"[^A-Z0-9]", "", text)
+    symbol_match = token in compact or f"{base}X" in compact
+    stock_context = any(term in text for term in ("XSTOCK", "XSTOCKS", "STOCK TOKEN", "STOCKTOKEN", "BACKED"))
+    return bool(symbol_match and stock_context)
+
+
+def stock_token_quote_from_dexscreener_pair(pair: dict[str, Any], source: str = "DexScreener xStocks") -> dict[str, Any]:
+    volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
+    liquidity = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
+    return {
+        "pair_name": str(pair.get("pairAddress") or pair.get("url") or ""),
+        "token_price": parse_float(pair.get("priceUsd")),
+        "token_volume_24h": parse_float(volume.get("h24")),
+        "token_liquidity_usd": parse_float(liquidity.get("usd")),
+        "spread_pct": None,
+        "source": source,
+    }
+
+
+def ema_from_values(values: list[float], period: int) -> float | None:
+    clean = [float(value) for value in values if value is not None]
+    if not clean:
+        return None
+    alpha = 2 / (period + 1)
+    ema = clean[0]
+    for value in clean[1:]:
+        ema = value * alpha + ema * (1 - alpha)
+    return ema
+
+
+def parse_yahoo_chart_underlying(payload: dict[str, Any]) -> dict[str, Any] | None:
+    chart = payload.get("chart") if isinstance(payload, dict) else None
+    result = chart.get("result") if isinstance(chart, dict) else None
+    if not isinstance(result, list) or not result or not isinstance(result[0], dict):
+        return None
+    item = result[0]
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    indicators = item.get("indicators") if isinstance(item.get("indicators"), dict) else {}
+    quotes = indicators.get("quote") if isinstance(indicators.get("quote"), list) else []
+    quote = quotes[0] if quotes and isinstance(quotes[0], dict) else {}
+    closes = quote.get("close") if isinstance(quote.get("close"), list) else []
+    opens = quote.get("open") if isinstance(quote.get("open"), list) else []
+    volumes = quote.get("volume") if isinstance(quote.get("volume"), list) else []
+    latest_index = next((idx for idx in range(len(closes) - 1, -1, -1) if parse_float(closes[idx]) is not None), None)
+    if latest_index is None:
+        latest_price = parse_float(meta.get("regularMarketPrice"))
+        if latest_price is None:
+            return None
+        latest_index = len(closes) - 1
+    else:
+        latest_price = parse_float(closes[latest_index])
+    previous_close = parse_float(meta.get("chartPreviousClose") or meta.get("previousClose"))
+    clean_closes = [float(value) for value in closes if parse_float(value) is not None]
+    clean_volumes = [float(value) for value in volumes if parse_float(value) is not None]
+    latest_volume = parse_float(volumes[latest_index]) if latest_index < len(volumes) else None
+    avg_volume = sum(clean_volumes[-79:-1]) / max(1, len(clean_volumes[-79:-1])) if clean_volumes else None
+    open_price = parse_float(opens[latest_index]) if latest_index < len(opens) else None
+    return {
+        "price": latest_price,
+        "change_5m": stock_token_change_from_series(closes, latest_index, 1),
+        "change_15m": stock_token_change_from_series(closes, latest_index, 3),
+        "change_1h": stock_token_change_from_series(closes, latest_index, 12),
+        "change_1d": percent_change(previous_close, latest_price) if previous_close and latest_price is not None else None,
+        "volume": latest_volume,
+        "volume_ratio": latest_volume / avg_volume if latest_volume is not None and avg_volume and avg_volume > 0 else None,
+        "ema20": ema_from_values(clean_closes, 20),
+        "ema60": ema_from_values(clean_closes, 60),
+        "open": open_price or latest_price,
+    }
+
+
+def stooq_daily_underlying_from_history(history: list[dict[str, float]]) -> dict[str, Any] | None:
+    if not history:
+        return None
+    latest = history[-1]
+    prev = history[-2] if len(history) >= 2 else latest
+    close = parse_float(latest.get("close"))
+    prev_close = parse_float(prev.get("close"))
+    if close is None:
+        return None
+    return {
+        "price": close,
+        "change_5m": None,
+        "change_15m": None,
+        "change_1h": None,
+        "change_1d": percent_change(prev_close, close) if prev_close else None,
+        "volume": parse_float(latest.get("volume")),
+        "volume_ratio": None,
+        "ema20": ema_from_values([row["close"] for row in history], 20),
+        "ema60": ema_from_values([row["close"] for row in history], 60),
+        "open": parse_float(latest.get("open")) or close,
+    }
+
+
+def stooq_intraday_underlying_from_history(history: list[dict[str, float]]) -> dict[str, Any] | None:
+    if not history:
+        return None
+    latest = history[-1]
+    close = parse_float(latest.get("close"))
+    if close is None:
+        return None
+    closes = [parse_float(row.get("close")) for row in history]
+    latest_index = len(closes) - 1
+    return {
+        "price": close,
+        "change_5m": stock_token_change_from_series(closes, latest_index, 1),
+        "change_15m": stock_token_change_from_series(closes, latest_index, 3),
+        "change_1h": stock_token_change_from_series(closes, latest_index, 12),
+        "change_1d": None,
+        "volume": parse_float(latest.get("volume")),
+        "volume_ratio": None,
+        "ema20": ema_from_values([float(value) for value in closes if value is not None], 20),
+        "ema60": ema_from_values([float(value) for value in closes if value is not None], 60),
+        "open": parse_float(latest.get("open")) or close,
+    }
+
+
+def build_stock_kline_structure(
+    symbol: str,
+    daily_rows: list[dict[str, Any]] | None,
+    intraday_rows: list[dict[str, Any]] | None = None,
+) -> StockKlineStructure | None:
+    daily = [row for row in (daily_rows or []) if parse_float(row.get("close")) is not None]
+    intraday = [row for row in (intraday_rows or []) if parse_float(row.get("close")) is not None]
+    if not daily and not intraday:
+        return None
+    if intraday and len(intraday) >= 20:
+        closes = [float(parse_float(row.get("close")) or 0) for row in intraday]
+        close = closes[-1]
+        ema20 = ema_from_values(closes, 20)
+        ema60 = ema_from_values(closes, 60)
+        recent_high = max(parse_float(row.get("high")) or parse_float(row.get("close")) or close for row in intraday[-20:])
+        recent_low = min(parse_float(row.get("low")) or parse_float(row.get("close")) or close for row in intraday[-20:])
+        patterns: list[str] = []
+        trend_state = "range"
+        short_score = 5
+        if ema20 is not None and ema60 is not None and close > ema20 > ema60:
+            summary = "短线结构偏强"
+            trend_state = "bullish"
+            short_score = 7
+        elif ema20 is not None and ema60 is not None and close < ema20 < ema60:
+            summary = "短线结构偏弱"
+            trend_state = "bearish"
+            short_score = 3
+        else:
+            summary = "区间震荡"
+        if recent_high > 0 and (recent_high - close) / recent_high <= 0.02:
+            patterns.append("接近压力")
+        if close > 0 and (close - recent_low) / close <= 0.02:
+            patterns.append("接近支撑")
+        return StockKlineStructure(
+            symbol=str(symbol or "").upper(),
+            score=short_score,
+            short_score=short_score,
+            mid_score=short_score,
+            long_score=5,
+            summary=summary,
+            patterns=patterns,
+            support_levels=[round(float(recent_low), 2)],
+            resistance_levels=[round(float(recent_high), 2)],
+            trend_state=trend_state,
+            data_quality="intraday",
+        )
+    if len(daily) < 2:
+        return StockKlineStructure(
+            symbol=str(symbol or "").upper(),
+            score=0,
+            short_score=0,
+            mid_score=0,
+            long_score=0,
+            summary="数据不足",
+            patterns=[],
+            support_levels=[],
+            resistance_levels=[],
+            trend_state="unknown",
+            data_quality="insufficient",
+        )
+    closes = [float(parse_float(row.get("close")) or 0) for row in daily]
+    close = closes[-1]
+    ema20 = ema_from_values(closes, 20)
+    ema60 = ema_from_values(closes, 60)
+    recent = daily[-20:]
+    recent_high = max(parse_float(row.get("high")) or parse_float(row.get("close")) or close for row in recent)
+    recent_low = min(parse_float(row.get("low")) or parse_float(row.get("close")) or close for row in recent)
+    patterns: list[str] = []
+    trend_state = "range"
+    long_score = 5
+    summary = "区间震荡"
+    if ema20 is not None and ema60 is not None and close > ema20 > ema60:
+        summary = "日线偏强"
+        trend_state = "bullish"
+        long_score = 7
+    elif ema20 is not None and ema60 is not None and close < ema20 < ema60:
+        summary = "日线偏弱"
+        trend_state = "bearish"
+        long_score = 3
+    if recent_high > 0 and (recent_high - close) / recent_high <= 0.02:
+        patterns.append("接近压力")
+    if close > 0 and (close - recent_low) / close <= 0.02:
+        patterns.append("接近支撑")
+    return StockKlineStructure(
+        symbol=str(symbol or "").upper(),
+        score=long_score,
+        short_score=0,
+        mid_score=0,
+        long_score=long_score,
+        summary=summary,
+        patterns=patterns,
+        support_levels=[round(float(recent_low), 2)],
+        resistance_levels=[round(float(recent_high), 2)],
+        trend_state=trend_state,
+        data_quality="daily_only",
+    )
+
+
+def stock_token_index_regime(qqq_change: float | None, spy_change: float | None) -> str:
+    qqq = qqq_change or 0
+    spy = spy_change or 0
+    if qqq > 0 and spy > 0:
+        return "指数同步偏强"
+    if qqq < 0 and spy < 0:
+        return "指数同步偏弱"
+    return "指数分歧"
+
+
+def stock_token_sector_regime(sector: str, underlyings: dict[str, dict[str, Any]]) -> str:
+    sector = str(sector or "")
+    if sector == "index":
+        return "指数自身"
+    sector_symbols = {
+        "semis": ("NVDA",),
+        "ai": ("NVDA", "MSFT", "PLTR"),
+        "tech": ("AAPL", "MSFT", "GOOGL", "META"),
+        "mega_cap": ("AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA"),
+        "crypto_equity": ("MSTR",),
+    }.get(sector, ())
+    changes = [underlyings.get(symbol, {}).get("change_1d") for symbol in sector_symbols]
+    valid = [float(value) for value in changes if value is not None]
+    if not valid:
+        return "板块数据不足"
+    avg = sum(valid) / len(valid)
+    if avg > 0.5:
+        return "板块同步偏强"
+    if avg < -0.5:
+        return "板块同步偏弱"
+    return "板块中性"
+
+
+def score_stock_token_snapshot(
+    underlying: dict[str, Any],
+    premium_pct: float | None,
+    token_volume_24h: float | None,
+    token_liquidity_usd: float | None,
+    spread_pct: float | None,
+    index_regime: str,
+    sector_regime: str,
+    config: dict[str, Any],
+    updated_at: float | None = None,
+) -> tuple[int, int, int, int, int, int]:
+    price = parse_float(underlying.get("price"))
+    change_1h = parse_float(underlying.get("change_1h"))
+    change_1d = parse_float(underlying.get("change_1d"))
+    ema20 = parse_float(underlying.get("ema20"))
+    ema60 = parse_float(underlying.get("ema60"))
+    volume_ratio = parse_float(underlying.get("volume_ratio"))
+    trend = 0
+    if change_1h is not None and change_1d is not None and change_1h * change_1d > 0 and change_1d > 0:
+        trend += 10
+    if price is not None and ema20 is not None and price >= ema20:
+        trend += 7
+    if price is not None and ema60 is not None and price >= ema60:
+        trend += 7
+    if volume_ratio is not None and volume_ratio >= 1.2 and (change_1d or 0) > 0:
+        trend += 6
+    trend = min(30, trend)
+
+    resonance = 0
+    if "偏强" in index_regime:
+        resonance += 10
+    elif "分歧" in index_regime:
+        resonance += 5
+    if "偏强" in sector_regime or "自身" in sector_regime:
+        resonance += 10
+    elif "中性" in sector_regime:
+        resonance += 5
+    resonance = min(20, resonance)
+
+    premium_threshold = float(config.get("premium_alert_threshold_pct", 3.0) or 3.0)
+    basis = 8 if premium_pct is None else 12
+    if premium_pct is not None:
+        if abs(premium_pct) <= 1:
+            basis = 18
+        elif premium_pct < 0 and token_liquidity_usd is not None and token_liquidity_usd >= float(config.get("min_liquidity_usd", 100000)):
+            basis = 16
+        elif premium_pct > premium_threshold:
+            basis = 6
+        else:
+            basis = 12
+    basis = min(20, max(0, basis))
+
+    min_liquidity = float(config.get("min_liquidity_usd", 100000) or 100000)
+    spread_threshold = float(config.get("spread_alert_threshold_pct", 1.0) or 1.0)
+    liquidity = 0
+    if token_volume_24h is not None and token_volume_24h >= min_liquidity:
+        liquidity += 7
+    elif token_volume_24h is not None and token_volume_24h >= min_liquidity * 0.25:
+        liquidity += 4
+    if token_liquidity_usd is not None and token_liquidity_usd >= min_liquidity:
+        liquidity += 7
+    elif token_liquidity_usd is not None and token_liquidity_usd >= min_liquidity * 0.25:
+        liquidity += 4
+    if spread_pct is not None and spread_pct <= spread_threshold:
+        liquidity += 4
+    elif spread_pct is not None and spread_pct <= spread_threshold * 2:
+        liquidity += 2
+    if updated_at is None or time.time() - updated_at <= int(config.get("ttl_seconds", 3600) or 3600) * 2:
+        liquidity += 2
+    liquidity = min(20, liquidity)
+
+    risk = 0
+    if premium_pct is not None and premium_pct > premium_threshold:
+        risk += 6
+    if spread_pct is not None and spread_pct > spread_threshold:
+        risk += 5
+    if token_liquidity_usd is not None and token_liquidity_usd < min_liquidity:
+        risk += 5
+    if "偏弱" in index_regime:
+        risk += 4
+    open_price = parse_float(underlying.get("open"))
+    if price is not None and open_price is not None and open_price > 0 and percent_change(open_price, price) < -1 and (change_1d or 0) > 1:
+        risk += 4
+    risk = min(20, risk)
+    final = max(0, min(100, trend + resonance + basis + liquidity - risk))
+    return trend, resonance, basis, liquidity, risk, final
+
+
+def build_stock_token_snapshot(
+    instrument: StockTokenInstrument,
+    quote: dict[str, Any],
+    underlying: dict[str, Any],
+    index_regime: str,
+    sector_regime: str,
+    config: dict[str, Any],
+    updated_at: float | None = None,
+) -> StockTokenSnapshot:
+    now = time.time() if updated_at is None else updated_at
+    token_price = parse_float(quote.get("token_price"))
+    underlying_price = parse_float(underlying.get("price"))
+    premium_pct = stock_token_premium_pct(token_price, underlying_price)
+    token_volume_24h = parse_float(quote.get("token_volume_24h"))
+    token_liquidity_usd = parse_float(quote.get("token_liquidity_usd"))
+    spread_pct = parse_float(quote.get("spread_pct"))
+    momentum, resonance, basis, liquidity, risk, final = score_stock_token_snapshot(
+        underlying,
+        premium_pct,
+        token_volume_24h,
+        token_liquidity_usd,
+        spread_pct,
+        index_regime,
+        sector_regime,
+        config,
+        now,
+    )
+    notes = quote.get("source") or "underlying fallback"
+    if quote.get("pair_name"):
+        notes = f"{notes}; pair={quote.get('pair_name')}"
+    if token_price is None:
+        notes = f"{notes}; token quote unavailable"
+    if underlying_price is None:
+        notes = f"{notes}; underlying unavailable"
+    kline_structure = build_stock_kline_structure(
+        instrument.underlying_symbol,
+        underlying.get("daily_rows") if isinstance(underlying.get("daily_rows"), list) else None,
+        underlying.get("intraday_rows") if isinstance(underlying.get("intraday_rows"), list) else None,
+    )
+    return StockTokenSnapshot(
+        token_symbol=instrument.token_symbol,
+        underlying_symbol=instrument.underlying_symbol,
+        token_price=token_price,
+        underlying_price=underlying_price,
+        premium_pct=premium_pct,
+        token_volume_24h=token_volume_24h,
+        token_liquidity_usd=token_liquidity_usd,
+        spread_pct=spread_pct,
+        underlying_change_5m=parse_float(underlying.get("change_5m")),
+        underlying_change_15m=parse_float(underlying.get("change_15m")),
+        underlying_change_1h=parse_float(underlying.get("change_1h")),
+        underlying_change_1d=parse_float(underlying.get("change_1d")),
+        underlying_volume_ratio=parse_float(underlying.get("volume_ratio")),
+        index_regime=index_regime,
+        sector_regime=sector_regime,
+        risk_score=risk,
+        momentum_score=momentum + resonance,
+        liquidity_score=liquidity,
+        basis_score=basis,
+        final_score=final,
+        updated_at=now,
+        source_notes=str(notes),
+        kline_structure=kline_structure,
+    )
+
+
+def stock_token_snapshot_from_row(row: dict[str, Any]) -> StockTokenSnapshot:
+    return StockTokenSnapshot(
+        token_symbol=str(row.get("token_symbol") or ""),
+        underlying_symbol=str(row.get("underlying_symbol") or ""),
+        token_price=parse_float(row.get("token_price")),
+        underlying_price=parse_float(row.get("underlying_price")),
+        premium_pct=parse_float(row.get("premium_pct")),
+        token_volume_24h=parse_float(row.get("token_volume_24h")),
+        token_liquidity_usd=parse_float(row.get("token_liquidity_usd")),
+        spread_pct=parse_float(row.get("spread_pct")),
+        underlying_change_5m=parse_float(row.get("underlying_change_5m")),
+        underlying_change_15m=parse_float(row.get("underlying_change_15m")),
+        underlying_change_1h=parse_float(row.get("underlying_change_1h")),
+        underlying_change_1d=parse_float(row.get("underlying_change_1d")),
+        underlying_volume_ratio=parse_float(row.get("underlying_volume_ratio")),
+        index_regime=str(row.get("index_regime") or ""),
+        sector_regime=str(row.get("sector_regime") or ""),
+        risk_score=int(parse_float(row.get("risk_score")) or 0),
+        momentum_score=int(parse_float(row.get("momentum_score")) or 0),
+        liquidity_score=int(parse_float(row.get("liquidity_score")) or 0),
+        basis_score=int(parse_float(row.get("basis_score")) or 0),
+        final_score=int(parse_float(row.get("final_score")) or 0),
+        updated_at=float(parse_float(row.get("updated_at")) or 0),
+        source_notes=str(row.get("source_notes") or ""),
+    )
+
+
+def stock_token_is_risk_alert(snapshot: StockTokenSnapshot, config: dict[str, Any]) -> bool:
+    premium_watch_threshold = float(config.get("premium_watch_threshold_pct", 1.5) or 1.5)
+    spread_threshold = float(config.get("spread_alert_threshold_pct", 1.0) or 1.0)
+    min_liquidity = float(config.get("min_liquidity_usd", 100000) or 100000)
+    return (
+        (snapshot.premium_pct is not None and abs(snapshot.premium_pct) >= premium_watch_threshold)
+        or (snapshot.spread_pct is not None and snapshot.spread_pct >= spread_threshold)
+        or (snapshot.token_liquidity_usd is None and snapshot.token_price is not None)
+        or (snapshot.token_liquidity_usd is not None and snapshot.token_liquidity_usd < min_liquidity)
+    )
+
+
+def stock_token_display_level(snapshot: StockTokenSnapshot, config: dict[str, Any] | None = None) -> tuple[str, str]:
+    config = config or load_stock_token_config()
+    if snapshot.underlying_price is None:
+        return "⚪", "数据不足"
+    if snapshot.token_price is None:
+        return "⚪", "Token报价不足"
+    if snapshot.underlying_change_1h is None and snapshot.underlying_change_1d is not None:
+        return "⚪", "日线观察"
+    if stock_token_is_risk_alert(snapshot, config):
+        return "🔴", "溢价/流动性风险"
+    if snapshot.final_score >= 80:
+        return "🟢", "美股代币强势观察"
+    if snapshot.final_score >= 60:
+        return "🟡", "美股代币观察"
+    return "⚪", "数据不足"
+
+
+def stock_token_display_rank(snapshot: StockTokenSnapshot) -> int:
+    icon, label = stock_token_display_level(snapshot)
+    if icon == "🟢":
+        return 4
+    if icon == "🟡":
+        return 3
+    if icon == "🔴":
+        return 2
+    return 1
+
+
+def stock_token_trend_text(snapshot: StockTokenSnapshot) -> str:
+    if snapshot.underlying_change_1h is None and snapshot.underlying_change_5m is None and snapshot.underlying_change_15m is None and snapshot.underlying_change_1d is not None:
+        return f"{snapshot.underlying_symbol} 短线暂无，日线 {snapshot.underlying_change_1d:+.2f}%"
+    short = f"{snapshot.underlying_change_1h:+.2f}%" if snapshot.underlying_change_1h is not None else "数据不足"
+    daily = f"{snapshot.underlying_change_1d:+.2f}%" if snapshot.underlying_change_1d is not None else "数据不足"
+    return f"{snapshot.underlying_symbol} 短线 {short} / 日线 {daily}"
+
+
+def stock_token_resonance_text(snapshot: StockTokenSnapshot) -> str:
+    if "偏强" in snapshot.sector_regime and "偏强" in snapshot.index_regime:
+        return "板块/指数同步"
+    if "偏强" in snapshot.sector_regime:
+        return f"{snapshot.sector_regime}"
+    return snapshot.sector_regime or snapshot.index_regime or "共振数据不足"
+
+
+def stock_token_status_text(snapshot: StockTokenSnapshot) -> str:
+    if snapshot.token_price is None:
+        return "Token报价不足，先按底层美股观察；溢价 n/a，spread n/a"
+    premium = "n/a" if snapshot.premium_pct is None else f"{snapshot.premium_pct:+.2f}%"
+    spread = "数据不足" if snapshot.spread_pct is None else f"{snapshot.spread_pct:.2f}%"
+    liquidity = "数据不足"
+    if snapshot.token_liquidity_usd is not None:
+        liquidity = "流动性正常" if snapshot.liquidity_score >= 12 else "流动性偏弱"
+    return f"溢价 {premium}，{liquidity}，spread {spread}"
+
+
+def stock_token_risk_text(snapshot: StockTokenSnapshot, config: dict[str, Any] | None = None) -> str:
+    config = config or load_stock_token_config()
+    risks: list[str] = []
+    premium_threshold = float(config.get("premium_alert_threshold_pct", 3.0) or 3.0)
+    premium_watch_threshold = float(config.get("premium_watch_threshold_pct", 1.5) or 1.5)
+    spread_threshold = float(config.get("spread_alert_threshold_pct", 1.0) or 1.0)
+    min_liquidity = float(config.get("min_liquidity_usd", 100000) or 100000)
+    if snapshot.premium_pct is not None and abs(snapshot.premium_pct) >= premium_threshold:
+        risks.append("严重溢价/折价风险")
+    elif snapshot.premium_pct is not None and abs(snapshot.premium_pct) >= premium_watch_threshold:
+        risks.append("溢价/折价偏离观察")
+    if snapshot.spread_pct is None and snapshot.token_price is not None:
+        risks.append("spread 数据不足")
+    elif snapshot.spread_pct is not None and snapshot.spread_pct > spread_threshold:
+        risks.append("spread 偏大")
+    if snapshot.token_liquidity_usd is None and snapshot.token_price is not None:
+        risks.append("liquidity 数据不足")
+    elif snapshot.token_liquidity_usd is not None and snapshot.token_liquidity_usd < min_liquidity:
+        risks.append("token 流动性不足")
+    if "偏弱" in snapshot.index_regime:
+        risks.append("QQQ/SPY 风险偏弱")
+    if not risks:
+        risks.append("美股盘后流动性可能下降，追价风险")
+    return "，".join(risks)
+
+
+def stock_token_conclusion_text(snapshot: StockTokenSnapshot) -> str:
+    if snapshot.underlying_price is None:
+        return "底层数据不足，先等待数据源恢复。"
+    if snapshot.token_price is None:
+        return "先按底层美股观察，等待 token 报价恢复。"
+    if snapshot.underlying_change_1h is None and snapshot.underlying_change_1d is not None:
+        return "当前仅按日线和 token 溢价观察，等待短线数据恢复。"
+    if snapshot.premium_pct is not None and snapshot.premium_pct > 0:
+        return "等待 token 溢价回落或美股开盘确认。"
+    if snapshot.final_score >= 80:
+        return "底层和板块较强，继续观察 token 流动性和溢价是否稳定。"
+    if snapshot.final_score >= 60:
+        return "有观察价值，但等待底层趋势、指数和 token 状态重新一致。"
+    return "数据或共振不足，等待确认。"
+
+
+def stock_kline_data_quality_text(structure: StockKlineStructure | None) -> str:
+    if structure is None or structure.data_quality == "insufficient":
+        return "数据不足"
+    if structure.data_quality == "daily_only":
+        return "仅日线"
+    if structure.data_quality == "intraday":
+        return "含短线"
+    return "数据不足"
+
+
+def stock_kline_overview_text(structure: StockKlineStructure | None) -> str:
+    if structure is None:
+        return "数据不足"
+    if structure.patterns:
+        if "接近压力" in structure.patterns:
+            return "接近压力"
+        if "接近支撑" in structure.patterns:
+            return "接近支撑"
+    summary = str(structure.summary or "")
+    if "日线偏强" in summary:
+        return "日线偏强"
+    if "日线偏弱" in summary:
+        return "日线偏弱"
+    if "震荡" in summary:
+        return "区间震荡"
+    return summary or "数据不足"
+
+
+def stock_kline_summary_text(structure: StockKlineStructure | None) -> str:
+    if structure is None:
+        return "K线：数据不足"
+    return f"K线：{stock_kline_overview_text(structure)}"
+
+
+def stock_kline_levels_text(levels: list[float]) -> str:
+    values = [f"{float(value):.2f}" for value in levels[:2] if value is not None]
+    return " / ".join(values) if values else "-"
+
+
+def stock_kline_detail_text(structure: StockKlineStructure | None) -> str:
+    if structure is None:
+        return "K线结构：数据不足"
+    patterns = " / ".join(structure.patterns[:3]) if structure.patterns else "-"
+    lines = [
+        "K线结构：",
+        f"- 结构：{structure.summary or '数据不足'}",
+        f"- 支撑：{stock_kline_levels_text(structure.support_levels)}",
+        f"- 压力：{stock_kline_levels_text(structure.resistance_levels)}",
+        f"- 数据质量：{stock_kline_data_quality_text(structure)}",
+        f"- 形态：{patterns}",
+    ]
+    return "\n".join(lines)
+
+
+def sanitize_stock_token_discord_text(text: str) -> str:
+    value = str(text or "")
+    replacements = {"买入": "参与", "卖出": "退出", "强烈建议": "建议"}
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    return value
+
+
+def stock_token_field_value(snapshot: StockTokenSnapshot) -> str:
+    lines = [
+        f"底层趋势：{stock_token_trend_text(snapshot)}",
+        stock_kline_summary_text(snapshot.kline_structure),
+        f"板块共振：{stock_token_resonance_text(snapshot)}",
+        f"Token状态：{stock_token_status_text(snapshot)}",
+        f"风险：{stock_token_risk_text(snapshot)}",
+        f"结论：{stock_token_conclusion_text(snapshot)}",
+        f"评分：{snapshot.final_score}/100 | 动量{snapshot.momentum_score} 流动性{snapshot.liquidity_score} 溢价{snapshot.basis_score} 风险扣{snapshot.risk_score}",
+    ]
+    if snapshot.underlying_change_1h is None and snapshot.underlying_change_1d is not None:
+        lines.insert(1, "短线数据不足，当前仅按日线观察")
+    return sanitize_stock_token_discord_text("\n".join(lines))
+
+
+def stock_token_overview_embed(
+    snapshots: list[StockTokenSnapshot],
+    channel_key: str,
+    title: str = "美股代币观察",
+) -> DiscordOutboundMessage:
+    fields: list[tuple[str, str, bool]] = []
+    for snapshot in snapshots[:10]:
+        icon, label = stock_token_display_level(snapshot)
+        fields.append(
+            (
+                f"{icon} {snapshot.token_symbol} / {snapshot.underlying_symbol} {label}",
+                discord_field_value(stock_token_field_value(snapshot)),
+                False,
+            )
+        )
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=f"🟡 {title}",
+        color=DISCORD_COLOR_WATCH,
+        fields=fields or [("状态", "当前暂无美股代币数据。", False)],
+        kind="stock_token",
+    )
+
+
+def stock_token_detail_embed(snapshot: StockTokenSnapshot, channel_key: str) -> DiscordOutboundMessage:
+    icon, label = stock_token_display_level(snapshot)
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title=f"{icon} {snapshot.token_symbol} / {snapshot.underlying_symbol} {label}",
+        color=DISCORD_COLOR_WATCH if icon != "🔴" else DISCORD_COLOR_RISK,
+        fields=[
+            ("诊断", discord_field_value(stock_token_field_value(snapshot)), False),
+            ("K线结构", discord_field_value(stock_kline_detail_text(snapshot.kline_structure)), False),
+            ("数据源", discord_field_value(snapshot.source_notes or "-"), False),
+        ],
+        kind="stock_token",
+        symbol=snapshot.token_symbol,
+    )
+
+
+def stock_token_risk_embed(
+    snapshots: list[StockTokenSnapshot],
+    channel_key: str,
+    all_snapshots: list[StockTokenSnapshot] | None = None,
+    config: dict[str, Any] | None = None,
+) -> DiscordOutboundMessage:
+    config = config or load_stock_token_config()
+    premium_watch_threshold = float(config.get("premium_watch_threshold_pct", 1.5) or 1.5)
+    fields = []
+    for snapshot in snapshots:
+        premium_line = ""
+        if snapshot.premium_pct is not None and abs(snapshot.premium_pct) >= premium_watch_threshold:
+            premium_line = f"{snapshot.token_symbol} 溢价 {snapshot.premium_pct:+.2f}%，等待溢价回落，避免追价\n"
+        fields.append(
+            (
+                f"🔴 {snapshot.token_symbol} / {snapshot.underlying_symbol}",
+                discord_field_value(
+                    sanitize_stock_token_discord_text(
+                        f"{premium_line}{stock_token_status_text(snapshot)}\n风险：{stock_token_risk_text(snapshot)}\n结论：等待溢价、spread 或流动性恢复正常。"
+                    )
+                ),
+                False,
+            )
+        )
+    fallback_field = ("状态", "当前暂无 premium/spread/liquidity 异常。", False)
+    universe = all_snapshots if all_snapshots is not None else snapshots
+    if universe and all(item.token_price is None for item in universe):
+        fallback_field = ("状态", "暂无 token 报价，暂不能计算 premium/spread/liquidity 风险。", False)
+    return DiscordOutboundMessage(
+        channel_key=channel_key,
+        title="🔴 美股代币风险榜",
+        color=DISCORD_COLOR_RISK,
+        fields=fields or [fallback_field],
+        kind="stock_token",
+    )
+
+
+def format_stock_token_source_health(health: dict[str, dict[str, Any]]) -> str:
+    if not health:
+        return "暂无美股代币数据源健康记录。"
+    lines = []
+    source_order = ["Backed/xStocks", "Kraken public", "DexScreener xStocks", "Yahoo underlying", "Stooq fallback"]
+    ordered_sources = [source for source in source_order if source in health] + sorted(source for source in health if source not in source_order)
+    for source in ordered_sources:
+        row = health[source]
+        last_success = format_ts_short(row.get("last_success")) if row.get("last_success") else "-"
+        error = row.get("last_error") or "-"
+        success = "true" if row.get("success") else "false"
+        lines.append(
+            f"- {source}: success={success} fetched={row.get('fetched_count', 0)} "
+            f"error={truncate_text(str(error), 120)} last_success={last_success}"
+        )
+        if row.get("debug"):
+            lines.append(f"  debug={format_stock_token_debug_candidates(row.get('debug'))}")
+    return "\n".join(lines)
+
+
+def format_stock_token_debug_candidates(debug: Any, limit: int = 3) -> str:
+    if not isinstance(debug, list):
+        return truncate_text(json.dumps(debug, ensure_ascii=False), 120)
+    shown = [str(item) for item in debug[:limit]]
+    suffix = f" ... +{len(debug) - limit}" if len(debug) > limit else ""
+    return truncate_text(", ".join(shown) + suffix, 180)
+
+
 def discord_candidate_kind_text(kind: str | None, route: str) -> str:
     normalized = topq_kind_normalized(kind)
     if normalized == "discovery":
@@ -10283,6 +11865,10 @@ def discord_help_text() -> str:
         "!摘要 - 返回缓存市场摘要，不触发全市场实时生成\n"
         "!候选 - 等同 /topq，把握候选排行\n"
         "!山寨 - 查看最近山寨观察队列 Top10\n"
+        "!美股代币 - 查看 xStocks/美股代币观察 Top10\n"
+        "!美股代币 NVDA - 查看单个美股代币诊断\n"
+        "!美股代币来源 - 查看美股代币数据源健康\n"
+        "!美股代币风险 - 查看 premium/spread/liquidity 异常榜\n"
         "!数据源 - 查看采集层数据源健康状态\n"
         "!采集统计 - 查看外部数据最近24h采集数量\n"
         "!合约先行 - 查看合约先上、主流现货未上、DEX流动性变化观察\n"
@@ -13240,6 +14826,7 @@ DISCORD_BEARISH_PRICE_ACTION_PATTERNS = ("长上影", "阴包阳", "放量滞涨
 DISCORD_ROUTE_REALTIME = "realtime"
 DISCORD_ROUTE_RISK_REALTIME = "risk_realtime"
 DISCORD_ROUTE_PRIORITY_OBSERVE = "priority_observe"
+DISCORD_ROUTE_CONFLICT_OBSERVE = "conflict_observe"
 DISCORD_ROUTE_OBSERVE = "observe"
 DISCORD_ROUTE_DIGEST = "digest"
 DISCORD_ROUTE_SUPPRESS = "suppress"
@@ -13247,6 +14834,7 @@ DISCORD_ROUTE_ORDER = {
     DISCORD_ROUTE_RISK_REALTIME: 4,
     DISCORD_ROUTE_REALTIME: 3,
     DISCORD_ROUTE_PRIORITY_OBSERVE: 2.5,
+    DISCORD_ROUTE_CONFLICT_OBSERVE: 2,
     DISCORD_ROUTE_OBSERVE: 2,
     DISCORD_ROUTE_DIGEST: 1,
     DISCORD_ROUTE_SUPPRESS: 0,
@@ -14475,13 +16063,19 @@ def discord_side_for_signal(
 
 
 def discord_is_conflict_observe(route_decision: RouteDecision | None) -> bool:
-    return bool(route_decision and DISCORD_CONFLICT_OBSERVE_TAG in (route_decision.route_tags or []))
+    return bool(
+        route_decision
+        and (
+            route_decision.route == DISCORD_ROUTE_CONFLICT_OBSERVE
+            or DISCORD_CONFLICT_OBSERVE_TAG in (route_decision.route_tags or [])
+        )
+    )
 
 
 def discord_conflict_route_decision(score: int = 0) -> RouteDecision:
     return RouteDecision(
-        DISCORD_ROUTE_OBSERVE,
-        "观察",
+        DISCORD_ROUTE_CONFLICT_OBSERVE,
+        "多空分歧观察",
         "多空证据冲突，等待方向确认",
         max(0, int(score or 0)),
         True,

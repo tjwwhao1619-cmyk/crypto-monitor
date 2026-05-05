@@ -1,0 +1,36 @@
+enabled: true
+default_universe:
+  - NVDAx
+  - TSLAx
+  - AAPLx
+  - MSFTx
+  - AMZNx
+  - METAx
+  - GOOGLx
+  - PLTRx
+  - MSTRx
+  - SPYx
+  - QQQx
+underlying_symbols:
+  - NVDA
+  - TSLA
+  - AAPL
+  - MSFT
+  - AMZN
+  - META
+  - GOOGL
+  - PLTR
+  - MSTR
+  - SPY
+  - QQQ
+sectors:
+  - tech
+  - ai
+  - semis
+  - mega_cap
+  - crypto_equity
+  - index
+ttl_seconds: 3600
+min_liquidity_usd: 100000
+premium_alert_threshold_pct: 3.0
+spread_alert_threshold_pct: 1.0

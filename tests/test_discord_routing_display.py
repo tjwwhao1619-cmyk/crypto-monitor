@@ -222,7 +222,8 @@ def test_discord_symbol_long_then_risk_merges_conflict_observe(monkeypatch):
     assert len(items) == 1
     item = items[0]
     assert item.kind == "conflict_observe"
-    assert item.final_route == m.DISCORD_ROUTE_OBSERVE
+    assert item.final_route == m.DISCORD_ROUTE_CONFLICT_OBSERVE
+    assert item.channel_key == "alerts"
     assert "conflict_observe" in item.route_tags
 
 
@@ -233,7 +234,50 @@ def test_conflict_observe_channel_is_not_main_or_risk():
     channel = m.discord_channel_for_route(decision, sig, {"main": "1", "risk": "2", "alerts": "3"})
 
     assert channel == "alerts"
-    assert channel not in {"main", "risk"}
+    assert channel not in {"main", "risk", "high-confidence", "high_confidence"}
+
+
+def test_conflict_observe_channel_prefers_observe_when_configured():
+    decision = m.discord_conflict_route_decision(80)
+    sig = m.Signal("ADAUSDT", "top_risk", 1, "risk", "", "k", snapshot("ADAUSDT"))
+
+    channel = m.discord_channel_for_route(decision, sig, {"main": "1", "risk": "2", "alerts": "3", "observe": "4"})
+
+    assert channel == "observe"
+    assert channel != "main"
+
+
+def test_conflict_title_channel_fallback_alerts_without_observe():
+    corrected = m.discord_correct_route_channel_mismatch(
+        m.DISCORD_ROUTE_CONFLICT_OBSERVE,
+        "main",
+        {"main": "1", "alerts": "3"},
+        symbol="ADAUSDT",
+        kind="conflict_observe",
+        title="🟡 多空分歧观察 ADA/USDT",
+    )
+
+    assert corrected == "alerts"
+
+
+def test_conflict_title_channel_defense_corrects_main_to_alerts(caplog):
+    item = m.DiscordOutboundMessage(
+        channel_key="main",
+        title="🟡 多空分歧观察 TST/USDT",
+        symbol="TSTUSDT",
+        kind="conflict_observe",
+        final_route=m.DISCORD_ROUTE_CONFLICT_OBSERVE,
+    )
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    monitor.discord_config = m.DiscordConfig(True, "token", {"main": "1", "alerts": "3"})
+    monitor.discord_outbound_queue = queue.Queue()
+
+    with caplog.at_level("WARNING"):
+        assert monitor.enqueue_discord_message(item)
+
+    queued = monitor.discord_outbound_queue.get_nowait()
+    assert queued.channel_key == "alerts"
+    assert "Discord conflict channel mismatch corrected: symbol=TSTUSDT" in caplog.text
 
 
 def test_conflict_observe_copy_and_long_evidence_sanitized(monkeypatch):
