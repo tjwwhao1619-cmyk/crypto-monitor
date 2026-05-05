@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -99,6 +99,7 @@ ONCHAIN_SUMMARY_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT
 DISCORD_CHANNEL_ENV_KEYS = {
     "main": "DISCORD_MAIN_CHANNEL_ID",
     "alerts": "DISCORD_ALERTS_CHANNEL_ID",
+    "observe": "DISCORD_OBSERVE_CHANNEL_ID",
     "risk": "DISCORD_RISK_CHANNEL_ID",
     "summary": "DISCORD_SUMMARY_CHANNEL_ID",
     "digest": "DISCORD_DIGEST_CHANNEL_ID",
@@ -253,6 +254,8 @@ class DiscordOutboundMessage:
     fields: list[tuple[str, str, bool]] | None = None
     symbol: str | None = None
     kind: str | None = None
+    final_route: str | None = None
+    route_tags: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -4969,31 +4972,19 @@ class DerivativesMonitor:
         key = self.discord_signal_key(signal)
         last = self.discord_signal_cooldowns.get(key)
         duplicate = bool(last and now - last[0] < 1800)
-        decision = discord_route_decision(signal, signal.snapshot, {"duplicate": duplicate})
+        final_decision = discord_route_decision(signal, signal.snapshot, {"duplicate": duplicate})
         logging.info(
             "Discord route_decision: %s %s route=%s score=%s reason=%s tags=%s",
             signal.symbol,
             signal.kind,
-            decision.route,
-            decision.score,
-            decision.reason,
-            ",".join(decision.route_tags),
+            final_decision.route,
+            final_decision.score,
+            final_decision.reason,
+            ",".join(final_decision.route_tags),
         )
-        if decision.route in {DISCORD_ROUTE_REALTIME, DISCORD_ROUTE_RISK_REALTIME, DISCORD_ROUTE_PRIORITY_OBSERVE}:
-            channel = "risk" if decision.route == DISCORD_ROUTE_RISK_REALTIME else discord_channel_for_signal(signal, priority)
-            if channel == "digest":
-                channel = "alerts"
-            self.enqueue_discord_signal(signal, priority, quality_score, quality_reason, route_decision=decision, channel_key=channel)
-            self.discord_signal_cooldowns[key] = (now, decision.route)
+        if final_decision.route == DISCORD_ROUTE_SUPPRESS:
             return
-        if decision.route == DISCORD_ROUTE_OBSERVE:
-            if signal.symbol in MAINSTREAM_WATCH_SYMBOLS or topq_kind_normalized(signal.kind) in {"main_momentum_watch", "main_trend_watch", "main_risk_watch"}:
-                channel = "risk" if topq_kind_normalized(signal.kind) == "main_risk_watch" else "main"
-                self.enqueue_discord_signal(signal, priority, quality_score, quality_reason, route_decision=decision, channel_key=channel)
-                return
-            self.enqueue_discord_alt_watch_signal(signal, priority, quality_score, quality_reason, route_decision=decision)
-            return
-        if decision.route in {DISCORD_ROUTE_DIGEST, DISCORD_ROUTE_SUPPRESS}:
+        if final_decision.route == DISCORD_ROUTE_DIGEST:
             conviction = 0
             if signal.snapshot:
                 conviction, _conv_label, _conv_reason = conviction_score(signal.snapshot, signal)
@@ -5002,9 +4993,20 @@ class DerivativesMonitor:
                 priority,
                 quality_score,
                 int(conviction),
-                humanize_route_reason(decision, signal),
-                {"route": decision.route, "evidence_summary": humanize_route_reason(decision, signal)},
+                humanize_route_reason(final_decision, signal),
+                {"route": final_decision.route, "evidence_summary": humanize_route_reason(final_decision, signal)},
             )
+            return
+        channel = discord_channel_for_route(final_decision, signal, self.discord_config.channel_ids)
+        self.enqueue_discord_signal(
+            signal,
+            priority,
+            quality_score,
+            quality_reason,
+            route_decision=final_decision,
+            channel_key=channel,
+        )
+        self.discord_signal_cooldowns[key] = (now, final_decision.route)
 
     def update_signal_quality_stats(self, signal: Signal, priority: str, suppressed: bool) -> None:
         with self.signal_quality_stats_lock:
@@ -5740,7 +5742,7 @@ class DerivativesMonitor:
             self.last_discord_suppressed_digest_flush_status = "empty"
             logging.debug("Discord suppressed digest flush skipped: empty")
             return False, "静默摘要队列为空", 0
-        channel_key = "digest" if self.discord_config.channel_ids.get("digest") else "main"
+        channel_key = "digest" if self.discord_config.channel_ids.get("digest") else "alerts"
         try:
             enqueued = self.enqueue_discord_message(discord_suppressed_digest_embed_v2(items, channel_key))
             if not enqueued:
@@ -6100,11 +6102,28 @@ class DerivativesMonitor:
             return False
         if not self.discord_config.bot_token:
             return False
+        corrected_channel = discord_correct_route_channel_mismatch(
+            item.final_route,
+            item.channel_key,
+            self.discord_config.channel_ids,
+            symbol=item.symbol,
+            kind=item.kind,
+            title=item.title,
+        )
+        if corrected_channel != item.channel_key:
+            item = replace(item, channel_key=corrected_channel)
+        if item.channel_key == "suppress":
+            return False
         try:
             self.discord_outbound_queue.put_nowait(item)
+            channel_suffix = discord_channel_id_suffix(self.discord_config.channel_ids, item.channel_key)
             logging.info(
-                "Discord enqueue: channel=%s title=%s",
+                "Discord enqueue: symbol=%s kind=%s final_route=%s channel_key=%s channel_id=%s title=%s",
+                item.symbol or "-",
+                item.kind or "-",
+                item.final_route or "-",
                 item.channel_key,
+                channel_suffix,
                 item.title or item.kind or item.symbol or "-",
             )
             return True
@@ -6122,9 +6141,19 @@ class DerivativesMonitor:
         channel_key: str | None = None,
         route_decision: RouteDecision | None = None,
     ) -> None:
-        channel = channel_key or discord_channel_for_signal(signal, priority)
+        final_decision = route_decision or discord_route_decision(signal, signal.snapshot, {"load_price_action": False})
+        channel = channel_key or discord_channel_for_route(final_decision, signal, self.discord_config.channel_ids)
+        channel = discord_correct_route_channel_mismatch(
+            final_decision.route,
+            channel,
+            self.discord_config.channel_ids,
+            signal=signal,
+            title=discord_signal_title_for_route(signal, priority, final_decision),
+        )
+        if channel == "suppress":
+            return
         self.enqueue_discord_message(
-            discord_signal_embed_v2(signal, priority, quality_score, quality_reason, channel, route_decision)
+            discord_signal_embed_v2(signal, priority, quality_score, quality_reason, channel, final_decision)
         )
 
     def enqueue_discord_status(self, title: str, message: str) -> None:
@@ -8325,6 +8354,66 @@ def discord_channel_for_signal(signal: Signal, priority: str) -> str:
     return "digest"
 
 
+def discord_channel_for_route(
+    route_decision: RouteDecision | None,
+    signal: Signal | None = None,
+    channel_ids: dict[str, str] | None = None,
+) -> str:
+    route = route_decision.route if route_decision else DISCORD_ROUTE_OBSERVE
+    channel_ids = channel_ids or {}
+    normalized_kind = topq_kind_normalized(signal.kind if signal else "")
+    if route == DISCORD_ROUTE_REALTIME:
+        if normalized_kind in {"main_momentum_watch", "main_trend_watch"}:
+            return "main"
+        return "alerts" if channel_ids.get("alerts") else "main"
+    if route == DISCORD_ROUTE_RISK_REALTIME:
+        return "risk"
+    if route == DISCORD_ROUTE_PRIORITY_OBSERVE:
+        if channel_ids.get("observe"):
+            return "observe"
+        if channel_ids.get("alerts"):
+            return "alerts"
+        if channel_ids.get("alt_watch"):
+            return "alt_watch"
+        return "alerts"
+    if route == DISCORD_ROUTE_OBSERVE:
+        return "alt_watch" if channel_ids.get("alt_watch") else "alerts"
+    if route == DISCORD_ROUTE_DIGEST:
+        return "digest" if channel_ids.get("digest") else "alerts"
+    return "suppress"
+
+
+def discord_channel_id_suffix(channel_ids: dict[str, str], channel_key: str | None) -> str:
+    value = str(channel_ids.get(str(channel_key or "")) or "")
+    return value[-4:] if value else "-"
+
+
+def discord_correct_route_channel_mismatch(
+    route: str | None,
+    channel_key: str,
+    channel_ids: dict[str, str] | None = None,
+    signal: Signal | None = None,
+    symbol: str | None = None,
+    kind: str | None = None,
+    title: str | None = None,
+) -> str:
+    route = str(route or "")
+    channel_ids = channel_ids or {}
+    if route == DISCORD_ROUTE_PRIORITY_OBSERVE and channel_key in {"main", "high-confidence", "high_confidence"}:
+        corrected = "observe" if channel_ids.get("observe") else ("alerts" if channel_ids.get("alerts") else "alt_watch")
+        logging.warning(
+            "Discord route/channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+            symbol or (signal.symbol if signal else "-"),
+            kind or (signal.kind if signal else "-"),
+            route,
+            channel_key,
+            corrected,
+            title or "-",
+        )
+        return corrected
+    return channel_key
+
+
 def discord_channel_for_pending_signal(pending: PendingTelegramSignalMerge) -> str:
     priorities = [str(priority or "").strip().upper() for priority in pending.priorities]
     best_priority = best_priority_label(priorities)
@@ -8472,7 +8561,97 @@ def discord_risk_tip_field(
     return None
 
 
-def discord_flow_field_value(snapshot: MarketSnapshot) -> str:
+DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION = "短线承接有迹象，但资金和外部确认分歧，等回踩确认。"
+DISCORD_CONSERVATIVE_OBSERVE_FLOW = "资金分歧，长线有支撑但短线未确认"
+DISCORD_CONSERVATIVE_OBSERVE_KLINE = "短线有承接，大周期未确认"
+
+
+def discord_conservative_observe_sanitize(text: str | None) -> str:
+    value = str(text or "")
+    replacements = {
+        "中长线吸筹": DISCORD_CONSERVATIVE_OBSERVE_FLOW,
+        "中长周期有吸筹迹象": "长线有支撑，短线仍需确认",
+        "主力建仓，现货确认": DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION,
+        "主力建仓，等待现货确认": DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION,
+        "主力建仓/资金支持/现货不弱": DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION,
+        "主力持续建仓": "长线有支撑，短线仍需确认",
+        "中线持续建仓": "中线有支撑，短线仍需确认",
+        "中周期持续建仓": "中线有支撑，短线仍需确认",
+        "大户偏多建仓": "大户偏多但仍需确认",
+        "主力建仓": "长线有支撑，短线仍需确认",
+        "多周期共振流入": DISCORD_CONSERVATIVE_OBSERVE_FLOW,
+        "多周期资金共振流入": DISCORD_CONSERVATIVE_OBSERVE_FLOW,
+        "多周期资金回流": DISCORD_CONSERVATIVE_OBSERVE_FLOW,
+        "强势流入": "长线有支撑，短线仍需确认",
+        "多周期结构偏强": "短线转强，中期偏强，大周期未确认",
+        "等待逼空确认": "等回踩确认",
+        "空头拥挤，等待逼空确认": DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION,
+        "强烈建议关注买入": DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION,
+        "1w K线数据不足": "大周期确认不足",
+        "1w数据不足": "大周期确认不足",
+    }
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    return value
+
+
+def discord_priority_observe_conservative_display(
+    route_decision: RouteDecision | None,
+    signal: Signal | dict[str, Any] | None = None,
+    snapshot: MarketSnapshot | None = None,
+    price_action: MultiTimeframePriceAction | None = None,
+    action: str | None = None,
+    reason: str | None = None,
+) -> bool:
+    if not route_decision or route_decision.route != DISCORD_ROUTE_PRIORITY_OBSERVE:
+        return False
+    kind = topq_kind_normalized(signal.kind if isinstance(signal, Signal) else (signal or {}).get("kind") if isinstance(signal, dict) else "")
+    if kind in DISCORD_RISK_KINDS or is_risk_structure_kind(kind):
+        return False
+    data = discord_route_metrics(signal, snapshot, price_action) if signal is not None else {}
+    leading_direction = str(data.get("leading_direction") or "").strip().lower()
+    leading_label = str(data.get("leading_label") or "")
+    if isinstance(signal, Signal) and (snapshot or signal.snapshot):
+        leading_items = " ".join(leading_signal_score(snapshot or signal.snapshot, signal).leading_items)
+    elif isinstance(signal, dict):
+        leading_items = " ".join(str(signal.get(key) or "") for key in ("leading_items", "leading_reason", "leading_label"))
+    else:
+        leading_items = str(data.get("leading_items") or "")
+    evidence_summary = str(data.get("evidence_summary") or "")
+    external_text = " ".join(
+        str(data.get(key) or "")
+        for key in (
+            "spot_onchain_label",
+            "spot_onchain_reason",
+            "contract_spot_divergence_label",
+            "contract_spot_divergence_reason",
+            "spot_absorption_label",
+            "spot_absorption_reason",
+            "external_confirmation_text",
+        )
+    )
+    combined = " ".join(
+        [
+            leading_label,
+            leading_items,
+            evidence_summary,
+            external_text,
+            str(action or ""),
+            str(reason or ""),
+            str(route_decision.reason or ""),
+            " ".join(route_decision.route_tags or []),
+        ]
+    )
+    return (
+        leading_direction in {"neutral", "risk", "bear", "bearish", "short", "看空", "看空/风险", ""}
+        or text_has_any(leading_label, ("分歧观察", "资金分歧", "方向不明确"))
+        or text_has_any(leading_items, ("疑似主力出货", "派发"))
+        or text_has_any(external_text, DISCORD_WEAK_EXTERNAL_CONFIRMATION_KEYWORDS)
+        or text_has_any(combined, ("先观察", "不追高", "等确认", "资金分歧", "领先信号偏风险", "外部确认偏弱", "现货/DEX/外部确认偏弱"))
+    )
+
+
+def discord_flow_field_value(snapshot: MarketSnapshot, conservative: bool = False) -> str:
     short_flow, mid_flow, long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
 
     def flow_part(period: str) -> str:
@@ -8480,7 +8659,8 @@ def discord_flow_field_value(snapshot: MarketSnapshot) -> str:
 
     short_line = " / ".join(flow_part(period) for period in ("5m", "15m", "1h"))
     mid_line = " / ".join(flow_part(period) for period in ("4h", "12h", "24h", "72h"))
-    structure = f"短{short_flow}/中{mid_flow}/长{long_flow} | {flow_label}"
+    label = DISCORD_CONSERVATIVE_OBSERVE_FLOW if conservative and flow_label in {"中长线吸筹", "多周期共振流入"} else flow_label
+    structure = f"短{short_flow}/中{mid_flow}/长{long_flow} | {label}"
     return f"{short_line}\n{mid_line}\n{structure}"
 
 
@@ -8634,6 +8814,7 @@ def discord_risk_field_value(
     snapshot: MarketSnapshot,
     signal: Signal | None,
     price_action: MultiTimeframePriceAction | None,
+    conservative: bool = False,
 ) -> str:
     trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
     squeeze_label, squeeze_score, squeeze_reason = squeeze_state(snapshot)
@@ -8642,6 +8823,11 @@ def discord_risk_field_value(
     risk_items = [item.label for item in ev_items if item.polarity == "risk"]
     if price_action:
         risk_items.extend(price_action.risk_items)
+    if conservative:
+        risk_items = [
+            "大周期确认不足" if text_has_any(item, ("1w K线数据不足", "1w数据不足", "1w 数据不足")) else item
+            for item in risk_items
+        ]
     risk_items = list(dict.fromkeys(risk_items))[:6]
     risk_header = f"风险 {trap_score}/10 {trap_label} | 挤压 {squeeze_label} {squeeze_score}/10 | 基差 {basis_label}"
     if is_risk_structure_kind(signal.kind if signal else None):
@@ -8654,7 +8840,10 @@ def discord_risk_field_value(
         risk_items = ["暂无明显结构风险"]
     lines = [risk_header, f"{trap_reason}; {squeeze_reason}; {basis_reason}"]
     lines.extend(f"- {item}" for item in risk_items)
-    return discord_field_value("\n".join(lines))
+    text = "\n".join(lines)
+    if conservative:
+        text = discord_conservative_observe_sanitize(text)
+    return discord_field_value(text)
 
 
 def discord_signal_action(
@@ -8683,16 +8872,18 @@ def discord_signal_action(
     return action, action_reason, False
 
 
-def discord_price_action_field_value(price_action: MultiTimeframePriceAction | None) -> str:
+def discord_price_action_field_value(price_action: MultiTimeframePriceAction | None, conservative: bool = False) -> str:
     if price_action is None or price_action.label == "K线数据不足":
         return "暂无多周期K线确认，仅资金/OI观察"
-    lines = [humanize_kline_summary(price_action)]
+    lines = [DISCORD_CONSERVATIVE_OBSERVE_KLINE if conservative else humanize_kline_summary(price_action)]
     if price_action.patterns:
         lines.append("形态：")
-        lines.extend(f"- {pattern}" for pattern in price_action.patterns[:5])
+        lines.extend(f"- {discord_conservative_observe_sanitize(pattern) if conservative else pattern}" for pattern in price_action.patterns[:5])
     else:
         for item in price_action.items[:3] + price_action.risk_items[:2]:
-            lines.append(f"- {item}")
+            if conservative and text_has_any(item, ("1w K线数据不足", "1w数据不足", "1w 数据不足")):
+                item = "大周期确认不足"
+            lines.append(f"- {discord_conservative_observe_sanitize(item) if conservative else item}")
     return truncate_text("\n".join(lines), 900)
 
 
@@ -9122,8 +9313,22 @@ def discord_signal_fields(
         else:
             action = "重点观察，等待K线/资金确认，不追高"
             action_reason = "观察层高分组合"
+    conservative_observe = discord_priority_observe_conservative_display(
+        route_decision,
+        signal,
+        snapshot,
+        price_action,
+        action,
+        action_reason,
+    )
+    if conservative_observe:
+        action = "重点观察，等回踩确认，不追高"
+        action_reason = DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION
     human_route_reason = humanize_route_reason(route_decision, signal, {"price_action": price_action})
     human_action = humanize_action(route_decision, signal, price_action, action, action_reason)
+    if conservative_observe:
+        human_route_reason = discord_conservative_observe_sanitize(human_route_reason)
+        human_action = "重点观察，等回踩确认，不追高"
     observe_conflict_explanation = discord_priority_observe_conflict_explanation(route_decision, snapshot, signal, price_action)
     display_route_label = discord_route_display_label(route_decision)
     if breakout_entry_is_high_risk_display(snapshot, price_action, signal, route_decision):
@@ -9134,6 +9339,7 @@ def discord_signal_fields(
     level_text = f"{priority} / 质量 {quality_score} / 把握 {conviction} {conviction_label}"
     if display_downgraded:
         level_text = f"{level_text}\n资金/结构未共振，观察为主"
+    conclusion_text = DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION if conservative_observe else clean_discord_reason(conflict_summary)
     fields = [
         ("币种/方向", discord_field_value(f"{signal.symbol} / {direction}"), True),
         ("等级/把握", discord_field_value(level_text), True),
@@ -9144,17 +9350,22 @@ def discord_signal_fields(
         ),
         ("价格/OI", discord_price_oi_field_value(snapshot), False),
         ("衍生品状态", discord_derivatives_field_value(snapshot), False),
-        ("资金流", discord_field_value(discord_flow_field_value(snapshot)), False),
+        ("资金流", discord_field_value(discord_flow_field_value(snapshot, conservative_observe)), False),
         ("领先信号", discord_leading_field_value(snapshot, signal), False),
         ("证据", discord_evidence_field_value(snapshot, signal), False),
-        ("风险提示", discord_risk_field_value(snapshot, signal, price_action), False),
-        ("K线结构", discord_price_action_field_value(price_action), False),
-        ("结论", discord_field_value(clean_discord_reason(conflict_summary)), False),
+        ("风险提示", discord_risk_field_value(snapshot, signal, price_action, conservative_observe), False),
+        ("K线结构", discord_price_action_field_value(price_action, conservative_observe), False),
+        ("结论", discord_field_value(conclusion_text), False),
         ("操作建议", discord_field_value(human_action), False),
     ]
     if breakout_entry_confirmation_enabled(route_decision):
         entry = breakout_entry_confirmation(snapshot, price_action, signal, route_decision)
         fields.insert(10, breakout_entry_confirmation_field(entry))
+    if conservative_observe:
+        fields = [
+            (name, discord_field_value(discord_conservative_observe_sanitize(value)), inline)
+            for name, value, inline in fields
+        ]
     return fields[:12]
 
 
@@ -9189,6 +9400,8 @@ def discord_main_momentum_watch_embed_v2(
         fields=discord_signal_fields(signal, priority, quality_score, quality_reason, route_decision),
         symbol=signal.symbol,
         kind=signal.kind,
+        final_route=route_decision.route if route_decision else None,
+        route_tags=route_decision.route_tags if route_decision else None,
     )
 
 
@@ -9207,6 +9420,8 @@ def discord_main_risk_watch_embed_v2(
         fields=discord_signal_fields(signal, priority, quality_score, quality_reason, route_decision),
         symbol=signal.symbol,
         kind=signal.kind,
+        final_route=route_decision.route if route_decision else None,
+        route_tags=route_decision.route_tags if route_decision else None,
     )
 
 
@@ -9225,6 +9440,8 @@ def discord_realtime_signal_embed_v2(
         fields=discord_signal_fields(signal, priority, quality_score, quality_reason, route_decision),
         symbol=signal.symbol,
         kind=signal.kind,
+        final_route=route_decision.route if route_decision else None,
+        route_tags=route_decision.route_tags if route_decision else None,
     )
 
 
@@ -9317,18 +9534,30 @@ def discord_alt_watch_embed_v2(
             )
             else ""
         )
+        conservative_observe = item.route == DISCORD_ROUTE_PRIORITY_OBSERVE and text_has_any(
+            f"{item.reason} {conclusion} {flow_label} {kline_line}",
+            ("偏风险", "出货", "派发", "资金分歧", "方向不明确", "外部确认偏弱", "现货/DEX/外部确认偏弱", "1w K线数据不足", "先观察", "不追高", "等确认"),
+        )
+        if conservative_observe:
+            conclusion = DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION
+            flow_label = DISCORD_CONSERVATIVE_OBSERVE_FLOW
+            kline_line = "K线：大周期确认不足"
+            observe_explanation = f"\n说明：{DISCORD_PRIORITY_OBSERVE_CONFLICT_EXPLANATION}"
+        value = (
+            f"{item.symbol} {signal_kind_label(item.kind)} | 把握{item.conviction_score} 质量{item.quality_score} | "
+            f"领先{item.leading_score} 证据{discord_compact_score_10_text(item.evidence_score)} 风险{item.trap_score} | 路由={discord_route_human_label(item.route)}\n"
+            f"价格 {format_percent_optional(item.price_change_percent)} | OI {format_percent_optional(item.oi_change_percent)} | 费率 {funding_text} | 基差 {basis_text}\n"
+            f"资金 15m {flow_15m} / 1h {flow_1h} / 4h {flow_4h} | 短{short_flow}/中{mid_flow}/长{long_flow} | {humanize_flow_label(flow_label)}\n"
+            f"{kline_line}\n"
+            f"结论：{clean_discord_reason(conclusion)}"
+            f"{observe_explanation}"
+        )
+        if conservative_observe:
+            value = discord_conservative_observe_sanitize(value)
         fields.append(
             (
                 f"🟡 山寨观察 {discord_symbol_pair(item.symbol)}",
-                discord_field_value(
-                    f"{item.symbol} {signal_kind_label(item.kind)} | 把握{item.conviction_score} 质量{item.quality_score} | "
-                    f"领先{item.leading_score} 证据{discord_compact_score_10_text(item.evidence_score)} 风险{item.trap_score} | 路由={discord_route_human_label(item.route)}\n"
-                    f"价格 {format_percent_optional(item.price_change_percent)} | OI {format_percent_optional(item.oi_change_percent)} | 费率 {funding_text} | 基差 {basis_text}\n"
-                    f"资金 15m {flow_15m} / 1h {flow_1h} / 4h {flow_4h} | 短{short_flow}/中{mid_flow}/长{long_flow} | {humanize_flow_label(flow_label)}\n"
-                    f"{kline_line}\n"
-                    f"结论：{clean_discord_reason(conclusion)}"
-                    f"{observe_explanation}"
-                ),
+                discord_field_value(value),
                 False,
             )
         )
@@ -9703,6 +9932,9 @@ def discord_candidate_action_text(decision: RouteDecision, risk_text: str, kline
 
 
 def discord_candidate_watch_reason(row: dict[str, str], decision: RouteDecision, price_action: MultiTimeframePriceAction | None) -> str:
+    conservative_observe = discord_priority_observe_conservative_display(decision, row, None, price_action)
+    if conservative_observe:
+        return DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION
     risk_kind = discord_candidate_is_risk_kind(row.get("kind"))
     high_score_unfocused = (
         (parse_float(row.get("conviction_score")) or 0) >= 90
@@ -9754,6 +9986,11 @@ def discord_candidate_brief_lines(
     risk = discord_candidate_risk_text(row, decision, price_action)
     kline = discord_candidate_kline_text(price_action)
     flow = discord_candidate_flow_text(row.get("flow_trend_label"))
+    conservative_observe = discord_priority_observe_conservative_display(decision, row, None, price_action)
+    if conservative_observe:
+        flow = DISCORD_CONSERVATIVE_OBSERVE_FLOW
+        kline = DISCORD_CONSERVATIVE_OBSERVE_KLINE
+        risk = "资金和外部确认分歧"
     entry_text = ""
     if entry is not None:
         entry_text = f"｜入场: {breakout_entry_confirmation_short(entry)}"
@@ -9763,8 +10000,8 @@ def discord_candidate_brief_lines(
         action = "等跌破确认，不追空" if discord_candidate_is_risk_kind(row.get("kind")) else discord_candidate_action_text(decision, risk, kline)
     return [
         f"{icon} {symbol} {kind_text}｜把握{conviction}｜质量{quality}",
-        f"{why} 主要风险：{risk}。",
-        f"K线: {kline}｜资金: {flow}{entry_text}｜操作: {action}",
+        discord_conservative_observe_sanitize(f"{why} 主要风险：{risk}。"),
+        discord_conservative_observe_sanitize(f"K线: {kline}｜资金: {flow}{entry_text}｜操作: {action}"),
     ]
 
 
