@@ -1408,10 +1408,10 @@ class DerivativesMonitor:
             return "数据源未配置。"
         status_rows = scan_rows or configured
         if any("no configured onchain address labels" in str(row.get("last_error") or "") for row in status_rows):
-            return "尚未扫描或没有有效地址标签。"
+            return "已加载地址标签，最近24h暂无匹配大额链上事件。"
         any_scan = bool(scan_rows)
         if not any_scan:
-            return "尚未扫描或没有有效地址标签。"
+            return "已加载地址标签，最近24h暂无匹配大额链上事件。"
         if all(str(row.get("last_error") or "").strip() for row in status_rows):
             return "最近扫描失败，请查看 Scan 状态。"
         fetched_total = sum(int(row.get("fetched_events") or 0) for row in status_rows)
@@ -3762,7 +3762,7 @@ class DerivativesMonitor:
 
     def format_coinglass_panel(self, target: str | None = None) -> str:
         symbols = [normalize_usdt_symbol(target)] if target else ONCHAIN_SUMMARY_SYMBOLS
-        lines = ["说明: CoinGlass 是外部聚合数据，不是钱包级链上流；仅用于外部资金确认。"]
+        lines = ["说明: CoinGlass 是外部聚合数据，不是钱包级链上流；仅用于外部资金诊断。"]
         for symbol in symbols:
             if not is_valid_binance_usdt_symbol(symbol):
                 return "用法: !coinglass 或 !coinglass BTCUSDT"
@@ -4002,13 +4002,13 @@ class DerivativesMonitor:
         try:
             if normalized in {"USDT", "USDC"}:
                 return discord_onchain_embed_v2(
-                    f"{normalized} 外部资金确认",
+                    f"{normalized} 外部资金诊断",
                     self.format_stablecoin_external_funds(normalized),
                     "onchain",
                 )
             symbol = normalize_usdt_symbol(normalized)
             if symbol in {"USDT", "USDC"} or not is_valid_binance_usdt_symbol(symbol):
-                return discord_onchain_embed_v2("外部资金确认", "暂无该资产外部资金数据", "onchain")
+                return discord_onchain_embed_v2("外部资金诊断", "暂无该资产外部资金数据", "onchain")
             snapshot, data_source_text, degradation_text = self.telegram_command_snapshot(symbol)
             coinglass_text = self.format_coinglass_market_context(symbol)
             spot_text = cached_spot_alpha_confirmation(symbol) or spot_alpha_confirmation(symbol)
@@ -4018,10 +4018,10 @@ class DerivativesMonitor:
             if degradation_text:
                 response_parts.append(degradation_text)
             response_parts.append(format_onchain_brief(snapshot, coinglass_text, spot_text))
-            return discord_onchain_embed_v2(f"{symbol} 外部资金确认", "\n".join(response_parts), "onchain")
+            return discord_onchain_embed_v2(f"{symbol} 外部资金诊断", "\n".join(response_parts), "onchain")
         except Exception:
             logging.exception("Discord external funds command failed: target=%s", normalized)
-            return discord_onchain_embed_v2("外部资金确认", "暂无该资产外部资金数据", "onchain")
+            return discord_onchain_embed_v2("外部资金诊断", "暂无该资产外部资金数据", "onchain")
 
 
     def run_forever(self) -> None:
@@ -6927,7 +6927,7 @@ class DerivativesMonitor:
                 ("summary", "市场摘要频道", "测试 市场摘要"),
                 ("digest", "静默摘要频道", "测试 静默摘要"),
                 ("debug", "机器人调试频道", "测试 调试"),
-                ("onchain", "外部资金频道", "测试 外部资金确认"),
+                ("onchain", "外部资金频道", "测试 外部资金诊断"),
             ]
             failures: list[str] = []
             for channel_key, label, test_text in test_targets:
@@ -7202,7 +7202,7 @@ class DerivativesMonitor:
         if command == "!稳定币":
             target = parts[1] if len(parts) >= 2 else None
             if target and str(target).strip().upper() not in {"USDT", "USDC"}:
-                return discord_onchain_embed_v2("稳定币流动性雷达", "用法: !稳定币 或 !稳定币 USDT / !稳定币 USDC", "onchain")
+                return discord_onchain_embed_v2("稳定币流动性背景", "用法: !稳定币 或 !稳定币 USDT / !稳定币 USDC", "onchain")
             title = f"🟠 稳定币流动性背景 {str(target).upper()}" if target else "🟠 稳定币流动性背景"
             return discord_onchain_embed_v2(title, self.format_stablecoin_liquidity_radar(target), "onchain")
         if command == "!coinglass":
@@ -7256,7 +7256,7 @@ class DerivativesMonitor:
                 "alt_watch: 山寨观察摘要、普通观察、route=observe 的非主流非风险实时；futures-only DEX watch 走 onchain。",
                 "digest: suppressed_digest、静默信号摘要、route=digest。",
                 "summary: 每小时市场简报、市场温度摘要；不放单币信号。",
-                "onchain: 外部资金确认摘要、稳定币、CoinGlass、DEX流动性、链上事件、数据源/采集统计自动摘要。",
+                "onchain: 主流外部资金观察、稳定币流动性背景、CoinGlass主流资金、DEX流动性、链上事件、数据源/采集统计自动摘要。",
                 "stock_token: 美股代币观察摘要、美股代币风险、美股代币来源；未配置时 fallback summary。",
                 "command: Discord 命令回复只回当前命令频道，不参与自动推送频道治理。",
             ]
@@ -9913,6 +9913,40 @@ def discord_flow_field_value(snapshot: MarketSnapshot, conservative: bool = Fals
     return f"{short_line}\n{mid_line}\n{structure}"
 
 
+
+# --- Discord outbound text sanitizer ---
+def sanitize_discord_outbound_text(value) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("外部资金诊断", "外部资金诊断")
+    text = text.replace("7d 暂无数据", "7d 暂无数据")
+    text = text.replace("1d 暂无数据", "1d 暂无数据")
+    text = text.replace("30d 暂无数据", "30d 暂无数据")
+    text = text.replace(" n/a", " 暂无数据")
+    text = text.replace("/ n/a", "/ 暂无数据")
+    text = text.replace("n/a /", "暂无数据 /")
+    text = text.replace("n/a；", "暂无数据；")
+    text = text.replace("n/a，", "暂无数据，")
+    text = re.sub(r"(?<![A-Za-z0-9])n/a(?![A-Za-z0-9])", "暂无数据", text)
+    return text
+
+
+def sanitize_discord_embed_object(embed):
+    try:
+        if getattr(embed, "title", None):
+            embed.title = sanitize_discord_outbound_text(embed.title)
+        if getattr(embed, "description", None):
+            embed.description = sanitize_discord_outbound_text(embed.description)
+        if getattr(embed, "_fields", None):
+            for field in embed._fields:
+                if "name" in field:
+                    field["name"] = sanitize_discord_outbound_text(field["name"])
+                if "value" in field:
+                    field["value"] = sanitize_discord_outbound_text(field["value"])
+    except Exception:
+        pass
+    return embed
+# --- end Discord outbound text sanitizer ---
+
 def discord_field_value(text: str) -> str:
     return truncate_text(str(text or ""), 900)
 
@@ -10849,8 +10883,8 @@ def discord_chunk_fields(text: str, field_prefix: str = "内容", chunk_size: in
 def discord_external_data_text(text: str | None) -> str:
     value = str(text or "")
     replacements = (
-        ("链上资金摘要", "外部资金确认摘要"),
-        ("链上资金", "外部资金确认"),
+        ("链上资金摘要", "主流外部资金观察"),
+        ("链上资金", "外部资金诊断"),
         ("链上雷达", "外部资金雷达"),
         ("现货/链上确认", "现货/DEX/外部确认"),
         ("现货/链上同步确认", "现货/DEX/外部同步确认"),
@@ -12246,6 +12280,10 @@ def discord_suppressed_digest_embed_v2(
 
 
 def discord_onchain_embed_v2(title: str, message: str, channel_key: str = "onchain") -> DiscordOutboundMessage:
+    try:
+        title = sanitize_external_funds_text(title)
+    except Exception:
+        pass
     text = discord_clean_summary_text(discord_external_data_text(message), title=title, remove_title=True)
     fields = discord_chunk_fields(text, "外部资金")
     return DiscordOutboundMessage(
@@ -12311,8 +12349,8 @@ def discord_help_text() -> str:
         "!链上事件 - 查看最近24h已标记地址链上转账事件\n"
         "!稳定币 - 查看 DefiLlama 稳定币供应聚合变化\n"
         "!coinglass BTCUSDT - 查看 CoinGlass 聚合外部资金面板\n"
-        "!外部资金 - 查看 BTC/ETH/SOL/BNB/DOGE 现货/DEX/CoinGlass 外部资金确认\n"
-        "!外部资金 BTCUSDT - 单币现货/DEX/CoinGlass 外部资金确认\n"
+        "!外部资金 - 查看 BTC/ETH/SOL/BNB/DOGE 现货/DEX/CoinGlass 外部资金诊断\n"
+        "!外部资金 BTCUSDT - 单币现货/DEX/CoinGlass 外部资金诊断\n"
         "!链上 BTCUSDT - 旧别名，当前不代表真实钱包流\n"
         "!链上摘要 - 旧别名，当前不代表真实钱包流\n"
         "!诊断 BTCUSDT - 单币诊断简版\n"
@@ -13065,7 +13103,25 @@ def format_major_long_cycle_one_line(snapshot: MarketSnapshot, coinglass_text: s
     return f"主流长周期: {oi_text}; {balance_text}; 资金共振 {long_flow_alignment_score(snapshot)}/9"
 
 
+
+def sanitize_external_funds_text(value) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("外部资金诊断", "外部资金诊断")
+    text = text.replace("7d 暂无数据", "7d 暂无数据")
+    text = text.replace("1d 暂无数据", "1d 暂无数据")
+    text = text.replace("30d 暂无数据", "30d 暂无数据")
+    text = text.replace(" n/a", " 暂无数据")
+    text = text.replace("/ n/a", "/ 暂无数据")
+    text = text.replace("n/a /", "暂无数据 /")
+    text = text.replace("n/a；", "暂无数据；")
+    text = text.replace("n/a，", "暂无数据，")
+    return text
+
 def extract_labeled_segment(text: str | None, start: str, end: str) -> str | None:
+    try:
+        text = sanitize_external_funds_text(text)
+    except Exception:
+        pass
     if not text:
         return None
     index = text.find(start)
@@ -13081,7 +13137,7 @@ def extract_labeled_segment(text: str | None, start: str, end: str) -> str | Non
 def coinglass_balance_text_from_context(coinglass_text: str | None) -> str:
     text = str(coinglass_text or "")
     balance_text = extract_labeled_segment(text, "交易所余额", "；") or ""
-    if not balance_text or "n/a / 7d n/a" in balance_text or balance_text.endswith("n/a"):
+    if not balance_text or "n/a / 7d 暂无数据" in balance_text or balance_text.endswith("n/a"):
         return "暂无数据"
     if balance_text.startswith("交易所余额"):
         balance_text = balance_text.replace("交易所余额", "", 1).strip(":： ")
@@ -13217,7 +13273,7 @@ def onchain_conclusion(snapshot: MarketSnapshot, spot_score: int, divergence_sco
     if balance_30d is not None and balance_30d < 0 and "下方承接偏强" in orderbook_text:
         bullish.append("30d交易所余额下降、订单簿下方承接偏强")
     if any(value is not None and value > 0 for value in (balance_1d, balance_7d)):
-        risk.append("1d/7d交易所余额回流")
+        risk.append("1d余额流出、7d余额回流，交易所余额信号分歧")
     if buy_ratio is not None and buy_ratio > 52:
         bullish.append("主动买盘略占优")
     elif sell_ratio is not None and sell_ratio > 52:
@@ -13250,7 +13306,7 @@ def onchain_conclusion(snapshot: MarketSnapshot, spot_score: int, divergence_sco
 
 def onchain_brief_has_confirmation_data(text: str) -> bool:
     normalized = discord_external_data_text(text)
-    if "CoinGlass交易所余额: 1d n/a / 7d n/a / 30d n/a" not in normalized:
+    if "CoinGlass交易所余额: 暂无数据" not in normalized:
         return True
     if "CoinGlass主动买卖" in normalized or "CoinGlass订单簿" in normalized or "近1h 买盘" in normalized:
         return True
