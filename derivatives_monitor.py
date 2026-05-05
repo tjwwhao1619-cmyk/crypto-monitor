@@ -93,6 +93,8 @@ MAINSTREAM_WATCH_SYMBOLS = {
     "DOGEUSDT",
     "ADAUSDT",
     "XRPUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
     "TONUSDT",
     "OPUSDT",
     "ARBUSDT",
@@ -100,6 +102,7 @@ MAINSTREAM_WATCH_SYMBOLS = {
 ONCHAIN_SUMMARY_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"]
 DISCORD_CHANNEL_ENV_KEYS = {
     "main": "DISCORD_MAIN_CHANNEL_ID",
+    "main_asset": "DISCORD_MAIN_ASSET_CHANNEL_ID",
     "alerts": "DISCORD_ALERTS_CHANNEL_ID",
     "observe": "DISCORD_OBSERVE_CHANNEL_ID",
     "risk": "DISCORD_RISK_CHANNEL_ID",
@@ -114,6 +117,18 @@ DISCORD_COLOR_BULLISH = 0x2ECC71
 DISCORD_COLOR_RISK = 0xE74C3C
 DISCORD_COLOR_WATCH = 0xF1C40F
 DISCORD_COLOR_SUMMARY = 0x95A5A6
+DISCORD_ROUTE_AUDIT_LIMIT = 20
+DISCORD_VISIBLE_DEDUPE_SECONDS = 15 * 60
+DISCORD_MAIN_ALLOWED_TITLES = ("🟢 高把握信号", "🟢 实时重点")
+DISCORD_MAIN_FORBIDDEN_TITLE_KEYWORDS = (
+    "重点观察",
+    "爆发观察",
+    "高位观察",
+    "多空分歧观察",
+    "观察信号",
+    "静默",
+)
+DISCORD_SUMMARY_ONCHAIN_TITLE_KEYWORDS = ("链上", "DEX", "CoinGlass", "稳定币", "外部资金", "数据源", "采集统计")
 
 
 @dataclass(frozen=True)
@@ -259,6 +274,7 @@ class DiscordOutboundMessage:
     kind: str | None = None
     final_route: str | None = None
     route_tags: list[str] | None = None
+    channel_corrected: bool = False
 
 
 @dataclass(frozen=True)
@@ -686,6 +702,10 @@ class DerivativesMonitor:
         self.discord_signal_cooldowns: dict[str, tuple[float, str]] = {}
         self.discord_symbol_signal_memory: dict[str, DiscordSymbolSignalMemory] = {}
         self.discord_symbol_signal_memory_lock = threading.Lock()
+        self.discord_route_audit: deque[dict[str, Any]] = deque(maxlen=DISCORD_ROUTE_AUDIT_LIMIT)
+        self.discord_route_audit_lock = threading.Lock()
+        self.discord_visible_signal_recent: deque[dict[str, Any]] = deque(maxlen=500)
+        self.discord_visible_signal_lock = threading.Lock()
         self.last_discord_suppressed_digest_flush_at = 0.0
         self.last_discord_suppressed_digest_flush_attempt_at = 0.0
         self.last_discord_suppressed_digest_flush_status = "not attempted"
@@ -2723,9 +2743,7 @@ class DerivativesMonitor:
         return bool(self.stock_token_config.get("enabled", False))
 
     def stock_token_channel_key(self) -> str:
-        if self.discord_config.channel_ids.get("stock_token"):
-            return "stock_token"
-        return "onchain" if self.discord_config.channel_ids.get("onchain") else "summary"
+        return discord_stock_token_channel_key(self.discord_config.channel_ids)
 
     def update_stock_token_source_health(
         self,
@@ -3639,13 +3657,11 @@ class DerivativesMonitor:
         normalized = str(target or "").strip().upper()
         assets = (normalized,) if normalized in {"USDT", "USDC"} else ("USDT", "USDC")
         rows_by_asset = self.latest_stablecoin_supply_rows(assets)
-        lines = [
-            "数据源: DefiLlama 稳定币供应聚合",
-            "说明: 仅代表稳定币供应聚合变化，不代表交易所买盘或钱包净流。",
-        ]
-        for asset in assets:
-            snapshot = self.stablecoin_snapshot_from_rows(asset, rows_by_asset.get(asset, []))
+        snapshots = [self.stablecoin_snapshot_from_rows(asset, rows_by_asset.get(asset, [])) for asset in assets]
+        lines = [f"稳定币整体：{stablecoin_overall_label([str(snapshot.get('conclusion') or '') for snapshot in snapshots])}"]
+        for snapshot in snapshots:
             lines.extend(self.format_stablecoin_liquidity_asset_lines(snapshot, detail=len(assets) == 1))
+        lines.append("说明：稳定币供应变化不等于交易所买盘，只作流动性背景。")
         return "\n".join(lines)
 
     def format_stablecoin_liquidity_asset_lines(self, snapshot: dict[str, Any], detail: bool = False) -> list[str]:
@@ -3653,23 +3669,18 @@ class DerivativesMonitor:
         supply = parse_float(snapshot.get("supply"))
         changes = snapshot.get("changes") if isinstance(snapshot.get("changes"), dict) else {}
         chain_top = snapshot.get("chain_top") if isinstance(snapshot.get("chain_top"), list) else []
-        chain_limit = 5 if detail else 3
-        chains_text = stablecoin_chain_distribution_text(chain_top, chain_limit)
+        conclusion = str(snapshot.get("conclusion") or "稳定币供应数据不足，等待下次采集")
+        short = stablecoin_conclusion_short(conclusion)
         lines = [
-            "",
-            f"{asset}",
-            f"当前供应/市值: {format_usd_plain(supply)}",
-            (
-                "变化: "
-                f"24h {format_percent_optional(changes.get('24h'))} / "
-                f"7d {format_percent_optional(changes.get('7d'))} / "
-                f"30d {format_percent_optional(changes.get('30d'))}"
-            ),
-            f"链分布 Top{chain_limit}: {chains_text}",
+            f"{asset}: {format_usd_plain(supply)}，24h {format_percent_optional(changes.get('24h'))}，"
+            f"7d {format_percent_optional(changes.get('7d'))}，{short}",
         ]
         if detail:
+            chain_limit = 5
+            chains_text = stablecoin_chain_distribution_text(chain_top, chain_limit)
+            lines.append(f"链分布 Top{chain_limit}: {chains_text}")
             lines.append(f"最近更新时间: {format_ts_short(parse_float(snapshot.get('timestamp')))}")
-        lines.append(f"结论: {snapshot.get('conclusion') or '稳定币供应数据不足，等待下次采集'}")
+            lines.append(f"结论: {conclusion}")
         return lines
 
     def send_stablecoin_liquidity_summary_if_due(self) -> None:
@@ -3683,7 +3694,7 @@ class DerivativesMonitor:
         self.last_stablecoin_liquidity_hour_key = hour_key
         self.save_state()
         channel_key = "onchain" if self.discord_config.channel_ids.get("onchain") else "summary"
-        self.enqueue_discord_message(discord_onchain_embed_v2("🟠 稳定币流动性雷达", message, channel_key))
+        self.enqueue_discord_message(discord_onchain_embed_v2("🟠 稳定币流动性背景", message, channel_key))
         logging.info("Discord stablecoin liquidity radar enqueued: channel=%s hour_key=%s", channel_key, hour_key)
 
     def recent_coinglass_metric_values(self, symbol: str, since_seconds: int = 86400) -> dict[str, tuple[Any, float]]:
@@ -3751,9 +3762,7 @@ class DerivativesMonitor:
 
     def format_coinglass_panel(self, target: str | None = None) -> str:
         symbols = [normalize_usdt_symbol(target)] if target else ONCHAIN_SUMMARY_SYMBOLS
-        lines = [
-            "说明: CoinGlass 是外部聚合数据，不是钱包级链上流；仅用于外部资金确认。",
-        ]
+        lines = ["说明: CoinGlass 是外部聚合数据，不是钱包级链上流；仅用于外部资金确认。"]
         for symbol in symbols:
             if not is_valid_binance_usdt_symbol(symbol):
                 return "用法: !coinglass 或 !coinglass BTCUSDT"
@@ -3795,29 +3804,25 @@ class DerivativesMonitor:
         cached_line = f"缓存摘要: {compact_coinglass_market_context(cached_text)}" if cached_text and not metrics and not balances else ""
         updated = format_ts_short(parse_float(snapshot.get("updated_at")))
         if detail:
+            human_line = format_coinglass_human_summary_line(snapshot)
             lines = [
                 "",
+                human_line,
                 symbol,
-                balance_text,
+                balance_text.replace("n/a", "暂无数据"),
                 oi_text,
                 funding_text,
                 taker_text,
-                orderbook_text,
+                orderbook_text.replace("n/a", "暂无数据"),
                 f"数据更新时间: {updated}",
                 f"综合判断: {judgement}",
             ]
             if cached_line:
                 lines.insert(-1, cached_line)
             return lines
-        lines = [
-            "",
-            f"{symbol}: {balance_text}",
-            f"{oi_text} | {funding_text}",
-            f"{taker_text} | {orderbook_text}",
-            f"更新时间 {updated} | 判断: {judgement}",
-        ]
+        lines = [format_coinglass_human_summary_line(snapshot)]
         if cached_line:
-            lines.insert(-1, cached_line)
+            lines.append(cached_line)
         return lines
 
     def send_coinglass_summary_if_due(self) -> None:
@@ -3831,21 +3836,26 @@ class DerivativesMonitor:
         self.last_coinglass_summary_hour_key = hour_key
         self.save_state()
         channel_key = "onchain" if self.discord_config.channel_ids.get("onchain") else "summary"
-        self.enqueue_discord_message(discord_onchain_embed_v2("🔷 CoinGlass 聚合资金摘要", message, channel_key))
+        self.enqueue_discord_message(discord_onchain_embed_v2("🔷 CoinGlass主流资金", message, channel_key))
         logging.info("Discord CoinGlass summary enqueued: channel=%s hour_key=%s", channel_key, hour_key)
 
     def stablecoin_overview_lines_and_bias(self) -> tuple[list[str], str]:
         rows_by_asset = self.latest_stablecoin_supply_rows(("USDT", "USDC"))
-        lines = ["数据源: DefiLlama 稳定币供应聚合；不代表交易所买盘。"]
         conclusions: list[str] = []
+        snapshots = []
         for asset in ("USDT", "USDC"):
             snapshot = self.stablecoin_snapshot_from_rows(asset, rows_by_asset.get(asset, []))
+            snapshots.append(snapshot)
             changes = snapshot.get("changes") if isinstance(snapshot.get("changes"), dict) else {}
             conclusion = str(snapshot.get("conclusion") or "")
             conclusions.append(conclusion)
+        lines = [f"稳定币整体：{stablecoin_overall_label(conclusions)}"]
+        for snapshot in snapshots:
+            changes = snapshot.get("changes") if isinstance(snapshot.get("changes"), dict) else {}
+            conclusion = str(snapshot.get("conclusion") or "")
             lines.append(
-                f"{asset}: {format_usd_plain(parse_float(snapshot.get('supply')))} | "
-                f"24h {format_percent_optional(changes.get('24h'))} / 7d {format_percent_optional(changes.get('7d'))} | "
+                f"{snapshot.get('asset')}: {format_usd_plain(parse_float(snapshot.get('supply')))}，"
+                f"24h {format_percent_optional(changes.get('24h'))}，7d {format_percent_optional(changes.get('7d'))}，"
                 f"{stablecoin_conclusion_short(conclusion)}"
             )
         if any("扩张" in item for item in conclusions):
@@ -3859,22 +3869,12 @@ class DerivativesMonitor:
         return lines, bias
 
     def coinglass_overview_lines_and_bias(self) -> tuple[list[str], str]:
-        lines = ["CoinGlass 是外部聚合数据，不是钱包级链上流。"]
+        lines = []
         support = risk = conflict = insufficient = 0
         for symbol in ONCHAIN_SUMMARY_SYMBOLS:
             snapshot = self.coinglass_panel_snapshot(symbol)
             metrics = snapshot.get("metrics") if isinstance(snapshot.get("metrics"), dict) else {}
             balances = snapshot.get("balances") if isinstance(snapshot.get("balances"), dict) else {}
-            balance_text = (
-                f"1d {format_coinglass_balance_snapshot(balances.get('24h'))} / "
-                f"7d {format_coinglass_balance_snapshot(balances.get('7d'))} / "
-                f"30d {format_coinglass_balance_snapshot(balances.get('30d'))}"
-            )
-            taker_text = (
-                f"买{format_ratio_percent(metric_value(metrics, 'taker_flow_buy_ratio'))}/"
-                f"卖{format_ratio_percent(metric_value(metrics, 'taker_flow_sell_ratio'))}"
-            )
-            orderbook_bias = coinglass_orderbook_judgement(metric_value(metrics, "orderbook_bid_ask_ratio"))
             judgement = coinglass_panel_judgement(metrics, balances)
             short_bias = coinglass_judgement_short(judgement)
             if short_bias == "支撑":
@@ -3885,9 +3885,7 @@ class DerivativesMonitor:
                 conflict += 1
             else:
                 insufficient += 1
-            lines.append(
-                f"{symbol}: 余额 {balance_text} | 主动{taker_text} | 订单簿 {orderbook_bias} | {short_bias}"
-            )
+            lines.append(format_coinglass_human_summary_line(snapshot))
         if support and not risk:
             bias = "support"
         elif risk and not support:
@@ -3954,13 +3952,11 @@ class DerivativesMonitor:
         stable_lines, stable_bias = self.stablecoin_overview_lines_and_bias()
         coinglass_lines, coinglass_bias = self.coinglass_overview_lines_and_bias()
         onchain_lines, onchain_bias = self.onchain_event_overview_lines_and_bias()
-        health_lines = self.external_source_health_overview_lines()
         conclusion = self.external_funds_overview_conclusion(stable_bias, coinglass_bias, onchain_bias)
         fields = [
-            ("稳定币流动性", discord_field_value("\n".join(stable_lines)), False),
-            ("CoinGlass 主流聚合", discord_field_value("\n".join(coinglass_lines)), False),
-            ("链上事件状态", discord_field_value("\n".join(onchain_lines)), False),
-            ("数据源健康", discord_field_value("\n".join(health_lines)), False),
+            ("稳定币背景", discord_field_value("\n".join(stable_lines)), False),
+            ("主流币外部资金", discord_field_value("\n".join(coinglass_lines)), False),
+            ("链上事件", discord_field_value("\n".join(onchain_lines[:3])), False),
             ("总结论", discord_field_value(conclusion), False),
         ]
         return DiscordOutboundMessage(
@@ -5741,10 +5737,14 @@ class DerivativesMonitor:
                 {"route": final_decision.route, "evidence_summary": humanize_route_reason(final_decision, signal)},
             )
             return
+        if self.discord_visible_signal_is_duplicate(signal, final_decision, quality_score, now):
+            return
         side = discord_side_for_signal(signal, final_decision)
         previous = self.discord_symbol_conflict_previous(signal, side, now)
         if previous is not None:
             conflict_decision = discord_conflict_route_decision(max(final_decision.score, previous.route_decision.score))
+            if self.discord_visible_signal_is_duplicate(signal, conflict_decision, quality_score, now):
+                return
             channel = discord_channel_for_route(conflict_decision, signal, self.discord_config.channel_ids)
             self.remove_queued_discord_symbol_messages(signal.symbol)
             self.enqueue_discord_message(
@@ -5776,6 +5776,7 @@ class DerivativesMonitor:
                 side,
                 channel,
             )
+            self.record_discord_visible_signal(signal, conflict_decision, quality_score, now)
             return
         channel = discord_channel_for_route(final_decision, signal, self.discord_config.channel_ids)
         self.enqueue_discord_signal(
@@ -5788,6 +5789,123 @@ class DerivativesMonitor:
         )
         self.discord_signal_cooldowns[key] = (now, final_decision.route)
         self.remember_discord_symbol_signal(signal, side, now, priority, quality_score, quality_reason, final_decision, channel)
+        self.record_discord_visible_signal(signal, final_decision, quality_score, now)
+
+    def discord_visible_signal_record(self, signal: Signal, route_decision: RouteDecision, quality_score: int, now: float) -> dict[str, Any]:
+        snapshot = signal.snapshot
+        conviction = 0
+        risk_score = 0
+        if snapshot is not None:
+            try:
+                conviction, _conv_label, _conv_reason = conviction_score(snapshot, signal)
+            except Exception:
+                conviction = 0
+            try:
+                risk_score, _risk_label, _risk_reason = trap_risk_score(snapshot, signal)
+            except Exception:
+                risk_score = 0
+        return {
+            "timestamp": now,
+            "symbol": str(signal.symbol or "").strip().upper(),
+            "route": route_decision.route,
+            "route_group": discord_visible_route_group(route_decision.route),
+            "direction_group": discord_visible_direction_group(signal, route_decision),
+            "kind_family": discord_visible_kind_family(signal.kind, route_decision),
+            "kind": signal.kind,
+            "quality": int(quality_score or 0),
+            "conviction": int(conviction or 0),
+            "risk_score": int(risk_score or 0),
+            "price_change": snapshot.price_change_percent if snapshot else None,
+            "oi_change": snapshot.oi_change_percent if snapshot else None,
+        }
+
+    def discord_visible_signal_is_duplicate(
+        self,
+        signal: Signal,
+        route_decision: RouteDecision,
+        quality_score: int,
+        now: float | None = None,
+    ) -> bool:
+        if route_decision.route in {DISCORD_ROUTE_SUPPRESS, DISCORD_ROUTE_DIGEST}:
+            return False
+        current_time = now or time.time()
+        current = self.discord_visible_signal_record(signal, route_decision, quality_score, current_time)
+        recent = getattr(self, "discord_visible_signal_recent", None)
+        if recent is None:
+            self.discord_visible_signal_recent = deque(maxlen=500)
+            self.discord_visible_signal_lock = threading.Lock()
+            recent = self.discord_visible_signal_recent
+        lock = getattr(self, "discord_visible_signal_lock", None)
+        if lock is None:
+            self.discord_visible_signal_lock = threading.Lock()
+            lock = self.discord_visible_signal_lock
+        with lock:
+            previous_items = list(recent)
+        for previous in previous_items:
+            if current_time - float(previous.get("timestamp") or 0) > DISCORD_VISIBLE_DEDUPE_SECONDS:
+                continue
+            if previous.get("symbol") != current["symbol"]:
+                continue
+            if previous.get("route_group") != current["route_group"]:
+                continue
+            if previous.get("direction_group") != current["direction_group"]:
+                continue
+            if previous.get("kind_family") != current["kind_family"]:
+                continue
+            price_delta = abs(float(current.get("price_change") or 0) - float(previous.get("price_change") or 0))
+            oi_delta = abs(float(current.get("oi_change") or 0) - float(previous.get("oi_change") or 0))
+            if price_delta >= 2 or oi_delta >= 3:
+                continue
+            if discord_visible_route_level(current["route"]) > discord_visible_route_level(str(previous.get("route") or "")):
+                continue
+            if int(current.get("risk_score") or 0) - int(previous.get("risk_score") or 0) >= 3:
+                continue
+            if int(current.get("conviction") or 0) - int(previous.get("conviction") or 0) >= 15:
+                continue
+            if previous.get("route") != DISCORD_ROUTE_RISK_REALTIME and current.get("route") == DISCORD_ROUTE_RISK_REALTIME:
+                continue
+            age = int(current_time - float(previous.get("timestamp") or current_time))
+            logging.info(
+                "Discord duplicate visible signal suppressed: symbol=%s family=%s previous_age=%s quality_old=%s quality_new=%s",
+                current["symbol"],
+                current["kind_family"],
+                age,
+                previous.get("quality", "-"),
+                current.get("quality", "-"),
+            )
+            self.record_discord_route_audit(
+                DiscordOutboundMessage(
+                    channel_key="dedupe_suppress",
+                    title=f"duplicate visible suppressed {current['symbol']}",
+                    symbol=current["symbol"],
+                    kind=current["kind_family"],
+                    final_route=current["route"],
+                    channel_corrected=True,
+                )
+            )
+            return True
+        return False
+
+    def record_discord_visible_signal(
+        self,
+        signal: Signal,
+        route_decision: RouteDecision,
+        quality_score: int,
+        now: float | None = None,
+    ) -> None:
+        current_time = now or time.time()
+        recent = getattr(self, "discord_visible_signal_recent", None)
+        if recent is None:
+            self.discord_visible_signal_recent = deque(maxlen=500)
+            self.discord_visible_signal_lock = threading.Lock()
+            recent = self.discord_visible_signal_recent
+        lock = getattr(self, "discord_visible_signal_lock", None)
+        if lock is None:
+            self.discord_visible_signal_lock = threading.Lock()
+            lock = self.discord_visible_signal_lock
+        record = self.discord_visible_signal_record(signal, route_decision, quality_score, current_time)
+        with lock:
+            recent.appendleft(record)
 
     def update_signal_quality_stats(self, signal: Signal, priority: str, suppressed: bool) -> None:
         with self.signal_quality_stats_lock:
@@ -6660,7 +6778,7 @@ class DerivativesMonitor:
         self.last_onchain_summary_hour_key = hour_key
         self.save_state()
         self.enqueue_discord_message(
-            discord_onchain_embed_v2("外部资金确认摘要", message, "onchain")
+            discord_onchain_embed_v2("🧭 主流外部资金观察", message, "onchain")
         )
 
     def format_onchain_summary_from_cache(self) -> str:
@@ -6676,7 +6794,7 @@ class DerivativesMonitor:
                 lines.append(line)
         if not lines:
             return "数据不足，等待外部资金缓存"
-        return "外部资金确认摘要\n" + "\n".join(lines)
+        return "\n".join(lines)
 
     def refresh_market_summary_cache_from_latest(self, source: str = "scan") -> str:
         if not self.latest_snapshots:
@@ -6883,6 +7001,69 @@ class DerivativesMonitor:
             return False
         if not self.discord_config.bot_token:
             return False
+        initial_channel = item.channel_key
+        selected_channel = discord_channel_for_payload(
+            item.kind,
+            route_decision=RouteDecision(
+                item.final_route,
+                discord_route_level(item.final_route),
+                "",
+                0,
+                item.final_route not in {DISCORD_ROUTE_REALTIME, DISCORD_ROUTE_RISK_REALTIME},
+                item.route_tags or [],
+            ) if item.final_route else None,
+            signal=None,
+            title=item.title,
+            tags=item.route_tags,
+            channel_ids=self.discord_config.channel_ids,
+            symbol=item.symbol,
+            kind=item.kind,
+        )
+        if selected_channel not in {"suppress", "command"}:
+            if selected_channel != item.channel_key:
+                if selected_channel in {"main_asset", "alerts"} and discord_is_main_asset_signal(
+                    item.symbol,
+                    item.kind,
+                    item.title,
+                    item.final_route,
+                ):
+                    logging.warning(
+                        "Discord main asset channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+                        item.symbol or "-",
+                        item.kind or "-",
+                        item.final_route or "-",
+                        item.channel_key,
+                        selected_channel,
+                        item.title or "-",
+                    )
+                elif selected_channel == "onchain":
+                    logging.warning(
+                        "Discord onchain channel mismatch corrected: title=%s from=%s to=%s",
+                        item.title or "-",
+                        item.channel_key,
+                        selected_channel,
+                    )
+                elif "多空分歧观察" in str(item.title or ""):
+                    logging.warning(
+                        "Discord conflict channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+                        item.symbol or "-",
+                        item.kind or "-",
+                        item.final_route or DISCORD_ROUTE_CONFLICT_OBSERVE,
+                        item.channel_key,
+                        selected_channel,
+                        item.title or "-",
+                    )
+                else:
+                    logging.warning(
+                        "Discord route/channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+                        item.symbol or "-",
+                        item.kind or "-",
+                        item.final_route or "-",
+                        item.channel_key,
+                        selected_channel,
+                        item.title or "-",
+                    )
+            item = replace(item, channel_key=selected_channel)
         corrected_channel = discord_correct_route_channel_mismatch(
             item.final_route,
             item.channel_key,
@@ -6891,15 +7072,20 @@ class DerivativesMonitor:
             kind=item.kind,
             title=item.title,
         )
+        corrected = corrected_channel != initial_channel or item.channel_key != initial_channel
         if corrected_channel != item.channel_key:
-            item = replace(item, channel_key=corrected_channel)
+            item = replace(item, channel_key=corrected_channel, channel_corrected=True)
+        elif corrected:
+            item = replace(item, channel_corrected=True)
         if item.channel_key == "suppress":
             return False
         try:
             self.discord_outbound_queue.put_nowait(item)
             channel_suffix = discord_channel_id_suffix(self.discord_config.channel_ids, item.channel_key)
+            self.record_discord_route_audit(item)
             logging.info(
-                "Discord enqueue: symbol=%s kind=%s final_route=%s channel_key=%s channel_id=%s title=%s",
+                "Discord enqueue: payload_type=%s symbol=%s kind=%s final_route=%s channel_key=%s channel_id=%s title=%s",
+                item.kind or "-",
                 item.symbol or "-",
                 item.kind or "-",
                 item.final_route or "-",
@@ -6911,6 +7097,27 @@ class DerivativesMonitor:
         except queue.Full:
             logging.warning("Discord outbound queue is full; dropping message for channel=%s", item.channel_key)
             return False
+
+    def record_discord_route_audit(self, item: DiscordOutboundMessage) -> None:
+        audit = getattr(self, "discord_route_audit", None)
+        if audit is None:
+            self.discord_route_audit = deque(maxlen=DISCORD_ROUTE_AUDIT_LIMIT)
+            self.discord_route_audit_lock = threading.Lock()
+            audit = self.discord_route_audit
+        lock = getattr(self, "discord_route_audit_lock", None)
+        if lock is None:
+            self.discord_route_audit_lock = threading.Lock()
+            lock = self.discord_route_audit_lock
+        with lock:
+            audit.appendleft(
+                {
+                    "time": time.time(),
+                    "title": item.title or item.kind or item.symbol or "-",
+                    "final_route": item.final_route or "-",
+                    "channel_key": item.channel_key,
+                    "corrected": bool(item.channel_corrected),
+                }
+            )
 
     def enqueue_discord_signal(
         self,
@@ -6939,13 +7146,17 @@ class DerivativesMonitor:
 
     def enqueue_discord_status(self, title: str, message: str) -> None:
         channel_key = "summary" if "摘要" in title or "简报" in title else "debug"
-        self.enqueue_discord_message(discord_summary_embed_v2(title, message, channel_key))
+        self.enqueue_discord_message(replace(discord_summary_embed_v2(title, message, channel_key), kind="status"))
 
     def discord_command_response(self, text: str) -> str | DiscordOutboundMessage:
         parts = text.split()
         command = parts[0].lower()
         if command == "!帮助":
             return discord_help_text()
+        if command == "!频道":
+            return self.format_discord_channel_config_response()
+        if command == "!频道审计":
+            return self.format_discord_channel_audit_response()
         if command == "!摘要":
             cached_text, cached_at, _cache_source = self.cached_market_summary()
             if cached_text:
@@ -6992,17 +7203,17 @@ class DerivativesMonitor:
             target = parts[1] if len(parts) >= 2 else None
             if target and str(target).strip().upper() not in {"USDT", "USDC"}:
                 return discord_onchain_embed_v2("稳定币流动性雷达", "用法: !稳定币 或 !稳定币 USDT / !稳定币 USDC", "onchain")
-            title = f"🟠 稳定币流动性雷达 {str(target).upper()}" if target else "🟠 稳定币流动性雷达"
+            title = f"🟠 稳定币流动性背景 {str(target).upper()}" if target else "🟠 稳定币流动性背景"
             return discord_onchain_embed_v2(title, self.format_stablecoin_liquidity_radar(target), "onchain")
         if command == "!coinglass":
             target = parts[1] if len(parts) >= 2 else None
-            title = f"🔷 CoinGlass 聚合资金 {normalize_usdt_symbol(target)}" if target else "🔷 CoinGlass 聚合资金摘要"
+            title = f"🔷 CoinGlass主流资金 {normalize_usdt_symbol(target)}" if target else "🔷 CoinGlass主流资金"
             return discord_onchain_embed_v2(title, self.format_coinglass_panel(target), "onchain")
         if command in ("!链上摘要", "!外部资金摘要"):
-            return discord_onchain_embed_v2("外部资金确认摘要", self.format_onchain_summary_from_cache(), "onchain")
+            return discord_onchain_embed_v2("🧭 主流外部资金观察", self.format_onchain_summary_from_cache(), "onchain")
         if command in ("!链上", "!链上资金", "!外部资金"):
             if len(parts) < 2:
-                return discord_onchain_embed_v2("外部资金确认摘要", self.format_onchain_summary_from_cache(), "onchain")
+                return discord_onchain_embed_v2("🧭 主流外部资金观察", self.format_onchain_summary_from_cache(), "onchain")
             return self.discord_external_funds_command_response(parts[1])
         if command == "!质量":
             return discord_summary_embed_v2("信号质量统计", self.format_signal_quality_stats(), "debug")
@@ -7029,6 +7240,48 @@ class DerivativesMonitor:
             response_parts.append(format_symbol_diagnosis(snapshot, signals, liquidation_text, coinglass_text))
             return discord_diagnosis_embed_v2(symbol, snapshot, signals, liquidation_text, coinglass_text, response_parts)
         return ""
+
+    def format_discord_channel_config_response(self) -> str:
+        channel_ids = self.discord_config.channel_ids
+        lines = ["Discord 频道治理矩阵"]
+        for key in ("main", "main_asset", "alerts", "observe", "risk", "alt_watch", "digest", "summary", "onchain", "stock_token"):
+            lines.append(f"- {key} id configured? {'yes' if channel_ids.get(key) else 'no'}")
+        lines.extend(
+            [
+                "",
+                "main: 只接收 route=realtime 的 🟢 高把握信号 / 🟢 实时重点。",
+                "main_asset: 主流雷达，接收主流币趋势/风险/分歧观察；未配置时 fallback alerts，不 fallback main。",
+                "alerts/observe: priority_observe、多空分歧观察、非高风险爆发观察、高位观察、普通重点观察；observe 未配置时 fallback alerts。",
+                "risk: 只接收 final_route=risk_realtime 的 top_risk/top_exhaustion/distribution/main_risk_watch。",
+                "alt_watch: 山寨观察摘要、普通观察、route=observe 的非主流非风险实时；futures-only DEX watch 走 onchain。",
+                "digest: suppressed_digest、静默信号摘要、route=digest。",
+                "summary: 每小时市场简报、市场温度摘要；不放单币信号。",
+                "onchain: 外部资金确认摘要、稳定币、CoinGlass、DEX流动性、链上事件、数据源/采集统计自动摘要。",
+                "stock_token: 美股代币观察摘要、美股代币风险、美股代币来源；未配置时 fallback summary。",
+                "command: Discord 命令回复只回当前命令频道，不参与自动推送频道治理。",
+            ]
+        )
+        return "\n".join(lines)
+
+    def format_discord_channel_audit_response(self) -> str:
+        audit = getattr(self, "discord_route_audit", None)
+        if not audit:
+            return "最近暂无 Discord enqueue 审计记录。"
+        lock = getattr(self, "discord_route_audit_lock", None)
+        if lock is None:
+            rows = list(audit)
+        else:
+            with lock:
+                rows = list(audit)
+        lines = ["最近 Discord enqueue 路由审计"]
+        for row in rows[:DISCORD_ROUTE_AUDIT_LIMIT]:
+            ts = format_ts_short(row.get("time"))
+            title = truncate_text(str(row.get("title") or "-"), 60)
+            lines.append(
+                f"{ts} | {title} | final_route={row.get('final_route') or '-'} | "
+                f"channel_key={row.get('channel_key') or '-'} | corrected={'yes' if row.get('corrected') else 'no'}"
+            )
+        return "\n".join(lines)
 
     def start_telegram_command_worker(self) -> None:
         if self.telegram_command_thread_started:
@@ -8035,7 +8288,7 @@ class DerivativesMonitor:
 
         sections = [
             ("🟢 实时重点", {DISCORD_ROUTE_REALTIME}),
-            ("🟡 重点观察", {DISCORD_ROUTE_PRIORITY_OBSERVE}),
+            ("🟡 重点观察", {DISCORD_ROUTE_PRIORITY_OBSERVE, DISCORD_ROUTE_CONFLICT_OBSERVE}),
             ("🔴 风险观察", {DISCORD_ROUTE_RISK_REALTIME}),
             ("🧾 静默潜力", {DISCORD_ROUTE_DIGEST}),
             ("👀 普通观察", {DISCORD_ROUTE_OBSERVE}),
@@ -9151,9 +9404,9 @@ def discord_env_diagnostics() -> str:
 
 def discord_channel_for_signal(signal: Signal, priority: str) -> str:
     normalized_kind = str(signal.kind or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if normalized_kind in {"main_momentum_watch", "main_trend_watch"}:
-        return "main"
-    if normalized_kind in {"main_risk_watch", "top_risk", "top_exhaustion", "distribution"}:
+    if signal.symbol in MAINSTREAM_WATCH_SYMBOLS or normalized_kind in {"main_momentum_watch", "main_trend_watch", "main_risk_watch"}:
+        return "main_asset"
+    if normalized_kind in {"top_risk", "top_exhaustion", "distribution"}:
         return "risk"
     if str(priority or "").strip().upper() in {"S", "A", "B"}:
         return "alerts"
@@ -9165,17 +9418,139 @@ def discord_channel_for_route(
     signal: Signal | None = None,
     channel_ids: dict[str, str] | None = None,
 ) -> str:
-    route = route_decision.route if route_decision else DISCORD_ROUTE_OBSERVE
+    return discord_channel_for_payload("signal", route_decision=route_decision, signal=signal, channel_ids=channel_ids)
+
+
+def discord_observe_channel_key(channel_ids: dict[str, str] | None = None) -> str:
     channel_ids = channel_ids or {}
-    normalized_kind = topq_kind_normalized(signal.kind if signal else "")
+    if channel_ids.get("observe"):
+        return "observe"
+    return "alerts"
+
+
+def discord_stock_token_channel_key(channel_ids: dict[str, str] | None = None) -> str:
+    channel_ids = channel_ids or {}
+    return "stock_token" if channel_ids.get("stock_token") else "summary"
+
+
+def discord_main_asset_channel_key(channel_ids: dict[str, str] | None = None) -> str:
+    channel_ids = channel_ids or {}
+    return "main_asset" if channel_ids.get("main_asset") else "alerts"
+
+
+def discord_is_main_asset_signal(
+    symbol: str | None = None,
+    kind: str | None = None,
+    title: str | None = None,
+    route: str | None = None,
+) -> bool:
+    if route in {DISCORD_ROUTE_DIGEST, DISCORD_ROUTE_SUPPRESS}:
+        return False
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_kind = topq_kind_normalized(kind)
+    return (
+        normalized_symbol in MAINSTREAM_WATCH_SYMBOLS
+        or normalized_kind in {"main_momentum_watch", "main_trend_watch", "main_risk_watch"}
+        or text_has_any(str(title or ""), ("主流", "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "DOGE/USDT", "XRP/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "TON/USDT"))
+    )
+
+
+def discord_visible_route_group(route: str | None) -> str:
+    value = str(route or "")
+    if value == DISCORD_ROUTE_RISK_REALTIME:
+        return "risk_realtime"
+    if value == DISCORD_ROUTE_REALTIME:
+        return "realtime"
+    if value == DISCORD_ROUTE_PRIORITY_OBSERVE:
+        return "priority_observe"
+    if value in {DISCORD_ROUTE_OBSERVE, DISCORD_ROUTE_CONFLICT_OBSERVE}:
+        return "observe"
+    if value == DISCORD_ROUTE_DIGEST:
+        return "digest"
+    return value or "unknown"
+
+
+def discord_visible_route_level(route: str | None) -> int:
+    group = discord_visible_route_group(route)
+    return {
+        "digest": 0,
+        "observe": 1,
+        "priority_observe": 2,
+        "realtime": 3,
+        "risk_realtime": 4,
+    }.get(group, 0)
+
+
+def discord_visible_kind_family(kind: str | None, route_decision: RouteDecision | None = None) -> str:
+    normalized = topq_kind_normalized(kind)
+    route = route_decision.route if route_decision else ""
+    if normalized in DISCORD_RISK_KINDS:
+        return "risk_family"
+    if normalized in {"bottom_reversal", "discovery", "hot_breakout", "main_momentum_watch", "main_trend_watch"}:
+        return "long_family"
+    if normalized == "conflict_observe" or route == DISCORD_ROUTE_CONFLICT_OBSERVE or discord_is_conflict_observe(route_decision):
+        return "conflict_family"
+    if route == DISCORD_ROUTE_DIGEST:
+        return "digest_family"
+    return f"{normalized or 'unknown'}_family"
+
+
+def discord_visible_direction_group(signal: Signal, route_decision: RouteDecision | None = None) -> str:
     if discord_is_conflict_observe(route_decision):
-        if channel_ids.get("observe"):
-            return "observe"
-        return "alerts"
+        return "conflict"
+    side = discord_side_for_signal(signal, route_decision)
+    return side or signal_direction_label(signal.kind) or "unknown"
+
+
+def discord_channel_for_payload(
+    payload_type: str | None,
+    route_decision: RouteDecision | None = None,
+    signal: Signal | None = None,
+    title: str | None = None,
+    tags: list[str] | None = None,
+    channel_ids: dict[str, str] | None = None,
+    symbol: str | None = None,
+    kind: str | None = None,
+) -> str:
+    channel_ids = channel_ids or {}
+    payload = str(payload_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+    route = route_decision.route if route_decision else DISCORD_ROUTE_OBSERVE
+    normalized_kind = topq_kind_normalized(signal.kind if signal else kind or payload)
+    tag_set = set(tags or (route_decision.route_tags if route_decision else []) or [])
+    title_text = str(title or "")
+    text = " ".join([payload, normalized_kind, route, title_text, " ".join(tag_set)])
+    payload_symbol = signal.symbol if signal else symbol
+
+    if payload in {"command", "diagnosis"}:
+        return "debug" if payload == "diagnosis" else "command"
+    if payload in {"stock_token", "stock_token_risk", "stock_token_source"} or "美股代币" in title_text:
+        return discord_stock_token_channel_key(channel_ids)
+    if payload in {"onchain", "external_funds_overview", "futures_only_liquidity"} or text_has_any(
+        title_text,
+        DISCORD_SUMMARY_ONCHAIN_TITLE_KEYWORDS,
+    ):
+        return "onchain"
+    if payload in {"suppressed_digest", "quiet_digest"} or route == DISCORD_ROUTE_DIGEST or "静默" in title_text:
+        return "digest"
+    if payload == "status":
+        if "摘要" in title_text or "简报" in title_text:
+            return "summary"
+        return "debug"
+    if payload == "summary":
+        if text_has_any(title_text, DISCORD_SUMMARY_ONCHAIN_TITLE_KEYWORDS):
+            return "onchain"
+        if "美股代币" in title_text:
+            return discord_stock_token_channel_key(channel_ids)
+        return "summary"
+    if payload in {"alt_watch", "topq"}:
+        return "alt_watch" if payload == "alt_watch" else "digest"
+
+    if discord_is_main_asset_signal(payload_symbol, normalized_kind, title_text, route):
+        return discord_main_asset_channel_key(channel_ids)
+    if discord_is_conflict_observe(route_decision):
+        return discord_observe_channel_key(channel_ids)
     if route == DISCORD_ROUTE_CONFLICT_OBSERVE:
-        if channel_ids.get("observe"):
-            return "observe"
-        return "alerts"
+        return discord_observe_channel_key(channel_ids)
     if route == DISCORD_ROUTE_REALTIME:
         if normalized_kind in {"main_momentum_watch", "main_trend_watch"}:
             return "main"
@@ -9183,17 +9558,13 @@ def discord_channel_for_route(
     if route == DISCORD_ROUTE_RISK_REALTIME:
         return "risk"
     if route == DISCORD_ROUTE_PRIORITY_OBSERVE:
-        if channel_ids.get("observe"):
-            return "observe"
-        if channel_ids.get("alerts"):
-            return "alerts"
-        if channel_ids.get("alt_watch"):
-            return "alt_watch"
-        return "alerts"
+        return discord_observe_channel_key(channel_ids)
     if route == DISCORD_ROUTE_OBSERVE:
+        if normalized_kind in DISCORD_RISK_KINDS or "risk" in tag_set:
+            return "alt_watch" if channel_ids.get("alt_watch") else "alerts"
+        if signal and signal.symbol in MAINSTREAM_WATCH_SYMBOLS:
+            return discord_observe_channel_key(channel_ids)
         return "alt_watch" if channel_ids.get("alt_watch") else "alerts"
-    if route == DISCORD_ROUTE_DIGEST:
-        return "digest" if channel_ids.get("digest") else "alerts"
     return "suppress"
 
 
@@ -9213,24 +9584,74 @@ def discord_correct_route_channel_mismatch(
 ) -> str:
     route = str(route or "")
     channel_ids = channel_ids or {}
-    if "多空分歧观察" in str(title or "") and channel_key in {"main", "high-confidence", "high_confidence", "risk", "digest", "alt_watch"}:
-        corrected = "observe" if channel_ids.get("observe") else "alerts"
+    title_text = str(title or "")
+    resolved_symbol = symbol or (signal.symbol if signal else None)
+    resolved_kind = kind or (signal.kind if signal else None)
+    if text_has_any(title_text, DISCORD_SUMMARY_ONCHAIN_TITLE_KEYWORDS) and channel_key != "onchain":
+        logging.warning(
+            "Discord onchain channel mismatch corrected: title=%s from=%s to=onchain",
+            title or "-",
+            channel_key,
+        )
+        return "onchain"
+    if discord_is_main_asset_signal(resolved_symbol, resolved_kind, title_text, route) and channel_key not in {"main_asset", "alerts"}:
+        corrected = discord_main_asset_channel_key(channel_ids)
+        logging.warning(
+            "Discord main asset channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+            resolved_symbol or "-",
+            resolved_kind or "-",
+            route or "-",
+            channel_key,
+            corrected,
+            title or "-",
+        )
+        return corrected
+    if channel_key == "summary" and "美股代币" in title_text:
+        corrected = discord_stock_token_channel_key(channel_ids)
+        logging.warning(
+            "Discord summary channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+            resolved_symbol or "-",
+            resolved_kind or "-",
+            route or "-",
+            channel_key,
+            corrected,
+            title or "-",
+        )
+        return corrected
+    if "多空分歧观察" in title_text and channel_key in {"main", "high-confidence", "high_confidence", "risk", "digest", "alt_watch"}:
+        corrected = discord_observe_channel_key(channel_ids)
         logging.warning(
             "Discord conflict channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
-            symbol or (signal.symbol if signal else "-"),
-            kind or (signal.kind if signal else "-"),
+            resolved_symbol or "-",
+            resolved_kind or "-",
             route or DISCORD_ROUTE_CONFLICT_OBSERVE,
             channel_key,
             corrected,
             title or "-",
         )
         return corrected
+    if channel_key == "main" and (
+        text_has_any(title_text, DISCORD_MAIN_FORBIDDEN_TITLE_KEYWORDS)
+        or (title_text and not title_text.startswith(DISCORD_MAIN_ALLOWED_TITLES))
+        or route != DISCORD_ROUTE_REALTIME
+    ):
+        corrected = discord_observe_channel_key(channel_ids)
+        logging.warning(
+            "Discord main channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+            resolved_symbol or "-",
+            resolved_kind or "-",
+            route or "-",
+            channel_key,
+            corrected,
+            title or "-",
+        )
+        return corrected
     if route == DISCORD_ROUTE_PRIORITY_OBSERVE and channel_key in {"main", "high-confidence", "high_confidence"}:
-        corrected = "observe" if channel_ids.get("observe") else ("alerts" if channel_ids.get("alerts") else "alt_watch")
+        corrected = discord_observe_channel_key(channel_ids)
         logging.warning(
             "Discord route/channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
-            symbol or (signal.symbol if signal else "-"),
-            kind or (signal.kind if signal else "-"),
+            resolved_symbol or "-",
+            resolved_kind or "-",
             route,
             channel_key,
             corrected,
@@ -9245,7 +9666,7 @@ def discord_channel_for_pending_signal(pending: PendingTelegramSignalMerge) -> s
     best_priority = best_priority_label(priorities)
     for signal in pending.signals:
         channel = discord_channel_for_signal(signal, best_priority)
-        if channel in {"main", "risk"}:
+        if channel in {"main_asset", "main", "risk"}:
             return channel
     if any(priority in {"S", "A", "B"} for priority in priorities):
         return "alerts"
@@ -10643,6 +11064,16 @@ def stablecoin_conclusion_short(conclusion: str) -> str:
     return "中性"
 
 
+def stablecoin_overall_label(conclusions: list[str]) -> str:
+    if any("扩张" in item for item in conclusions):
+        return "扩张"
+    if any("收缩" in item for item in conclusions):
+        return "收缩"
+    if conclusions and all("数据不足" in item for item in conclusions):
+        return "数据不足"
+    return "中性"
+
+
 def discord_summary_embed_v2(title: str, message: str, channel_key: str = "summary") -> DiscordOutboundMessage:
     text = discord_clean_summary_text(message, title=title, remove_title=True)
     fields = discord_chunk_fields(text, "摘要")
@@ -11885,6 +12316,8 @@ def discord_help_text() -> str:
         "!链上 BTCUSDT - 旧别名，当前不代表真实钱包流\n"
         "!链上摘要 - 旧别名，当前不代表真实钱包流\n"
         "!诊断 BTCUSDT - 单币诊断简版\n"
+        "!频道 - 查看 Discord 频道配置和路由矩阵\n"
+        "!频道审计 - 查看最近20条 Discord enqueue 路由\n"
         "!质量 - 信号质量统计\n"
         "!静默 - 等同 /quiet status\n"
         "!静默发送 - 立即发送 Discord 静默摘要队列\n"
@@ -12394,6 +12827,60 @@ def format_coinglass_balance_snapshot(row: Any) -> str:
     return " ".join(parts) if parts else "n/a"
 
 
+def format_coinglass_balance_human(balances: dict[str, Any]) -> str:
+    parts = []
+    for period, label in (("24h", "1d"), ("7d", "7d"), ("30d", "30d")):
+        value = format_coinglass_balance_snapshot(balances.get(period))
+        if value != "n/a":
+            parts.append(f"{label} {value}")
+    return "，".join(parts) if parts else "暂无数据"
+
+
+def coinglass_orderbook_human_from_metrics(metrics: dict[str, Any]) -> str:
+    judgement = coinglass_orderbook_judgement(metric_value(metrics, "orderbook_bid_ask_ratio"))
+    return "暂无数据" if judgement == "n/a" else judgement
+
+
+def coinglass_human_judgement(metrics: dict[str, Any], balances: dict[str, Any]) -> str:
+    judgement = coinglass_panel_judgement(metrics, balances)
+    orderbook = coinglass_orderbook_human_from_metrics(metrics)
+    if "余额回流" in judgement and "卖压" in orderbook:
+        return "抛压观察"
+    if "支撑" in judgement and "承接" in orderbook:
+        return "偏支撑"
+    if "数据不足" in judgement:
+        if "卖压" in orderbook:
+            return "数据不完整，偏谨慎"
+        return "数据不完整，暂不提供方向"
+    if "卖压" in orderbook:
+        return "分歧偏谨慎"
+    if "均衡" in orderbook:
+        return "中性/分歧"
+    return coinglass_judgement_short(judgement)
+
+
+def format_coinglass_human_summary_line(snapshot: dict[str, Any]) -> str:
+    symbol = str(snapshot.get("symbol") or "-")
+    metrics = snapshot.get("metrics") if isinstance(snapshot.get("metrics"), dict) else {}
+    balances = snapshot.get("balances") if isinstance(snapshot.get("balances"), dict) else {}
+    balance_text = format_coinglass_balance_human(balances)
+    orderbook = coinglass_orderbook_human_from_metrics(metrics)
+    judgement = coinglass_human_judgement(metrics, balances)
+    if balance_text == "暂无数据":
+        return f"{symbol}: 余额缺失，订单簿{orderbook} -> {judgement}"
+    balance_bias = "交易所余额短期流出" if any(
+        parse_float((balances.get(period) or {}).get("change")) is not None
+        and parse_float((balances.get(period) or {}).get("change")) < 0
+        for period in ("24h", "7d")
+    ) else "交易所余额回流" if any(
+        parse_float((balances.get(period) or {}).get("change")) is not None
+        and parse_float((balances.get(period) or {}).get("change")) > 0
+        for period in ("24h", "7d")
+    ) else f"交易所余额 {balance_text}"
+    joiner = " + " if "回流" in balance_bias and "卖压" in orderbook else "，"
+    return f"{symbol}: {balance_bias}{joiner}订单簿{orderbook} -> {judgement}"
+
+
 def coinglass_panel_judgement(metrics: dict[str, Any], balances: dict[str, Any]) -> str:
     balance_1d = parse_float((balances.get("24h") or {}).get("change"))
     balance_7d = parse_float((balances.get("7d") or {}).get("change"))
@@ -12591,6 +13078,63 @@ def extract_labeled_segment(text: str | None, start: str, end: str) -> str | Non
     return segment.strip()
 
 
+def coinglass_balance_text_from_context(coinglass_text: str | None) -> str:
+    text = str(coinglass_text or "")
+    balance_text = extract_labeled_segment(text, "交易所余额", "；") or ""
+    if not balance_text or "n/a / 7d n/a" in balance_text or balance_text.endswith("n/a"):
+        return "暂无数据"
+    if balance_text.startswith("交易所余额"):
+        balance_text = balance_text.replace("交易所余额", "", 1).strip(":： ")
+    return balance_text or "暂无数据"
+
+
+def coinglass_orderbook_text_from_context(coinglass_text: str | None) -> str:
+    orderbook_text = extract_labeled_segment(str(coinglass_text or ""), "CoinGlass订单簿: ", "\n") or ""
+    if "上方卖压偏强" in orderbook_text:
+        return "上方卖压偏强"
+    if "下方承接偏强" in orderbook_text:
+        return "下方承接偏强"
+    if "买卖盘相对均衡" in orderbook_text:
+        return "买卖盘均衡"
+    return "暂无数据"
+
+
+def external_funds_human_bias(coinglass_text: str | None, spot_score: int) -> str:
+    balance_1d = extract_coinglass_balance_change(coinglass_text, "1d")
+    balance_7d = extract_coinglass_balance_change(coinglass_text, "7d")
+    buy_ratio, sell_ratio = extract_coinglass_taker_ratios(coinglass_text)
+    orderbook = coinglass_orderbook_text_from_context(coinglass_text)
+    balance_up = any(value is not None and value > 0 for value in (balance_1d, balance_7d))
+    balance_down = any(value is not None and value < 0 for value in (balance_1d, balance_7d))
+    sell_pressure = (sell_ratio is not None and sell_ratio > 52) or "卖压" in orderbook
+    buy_support = (buy_ratio is not None and buy_ratio > 52) or "承接" in orderbook
+    if balance_up and sell_pressure:
+        return "外部资金偏风险"
+    if balance_down and buy_support:
+        return "外部资金偏支撑"
+    if orderbook == "上方卖压偏强":
+        return "外部资金偏谨慎"
+    if orderbook == "买卖盘均衡":
+        return "外部资金中性/分歧"
+    if coinglass_balance_text_from_context(coinglass_text) == "暂无数据" and spot_score == 5:
+        return "外部数据不足"
+    return "外部资金中性/分歧"
+
+
+def external_funds_human_conclusion(coinglass_text: str | None, spot_score: int) -> str:
+    bias = external_funds_human_bias(coinglass_text, spot_score)
+    orderbook = coinglass_orderbook_text_from_context(coinglass_text)
+    if bias == "外部资金偏风险":
+        return "抛压仍在，追多需等卖压减弱"
+    if bias == "外部资金偏支撑":
+        return "外部资金有支撑，但仍需等盘面确认"
+    if bias == "外部数据不足":
+        return "外部数据不足，暂不提供方向"
+    if orderbook == "上方卖压偏强":
+        return "上方卖压仍在，追多需谨慎"
+    return "买卖盘分歧，等待更明确确认"
+
+
 def format_onchain_brief(
     snapshot: MarketSnapshot,
     coinglass_text: str | None = None,
@@ -12603,32 +13147,35 @@ def format_onchain_brief(
     spot_score, spot_label, spot_reason = spot_onchain_score_from_text(snapshot, None, resolved_spot_text)
     div_label, div_score, div_reason = contract_spot_divergence_from_text(snapshot, None, resolved_spot_text)
     cg_text = str(coinglass_text or "")
-    balance_text = extract_labeled_segment(cg_text, "交易所余额", "；") or "CoinGlass交易所余额: 1d n/a / 7d n/a / 30d n/a"
-    if balance_text.startswith("交易所余额"):
-        balance_text = f"CoinGlass{balance_text}"
+    balance_text = coinglass_balance_text_from_context(cg_text)
     taker_24h = extract_labeled_segment(cg_text, "主动买卖 24h", "；")
     taker_7d = extract_labeled_segment(cg_text, "CoinGlass主动买卖 7d", "；")
-    orderbook_text = extract_labeled_segment(cg_text, "CoinGlass订单簿: ", "\n")
+    orderbook_text = coinglass_orderbook_text_from_context(cg_text)
     conclusion = onchain_conclusion(snapshot, spot_score, div_score, cg_text)
+    human_bias = external_funds_human_bias(cg_text, spot_score)
+    human_conclusion = external_funds_human_conclusion(cg_text, spot_score)
     source_text = external_confirmation_source_text(resolved_spot_text, cg_text)
 
     if compact:
-        coinglass_parts = "；".join(part for part in (balance_text, taker_24h, taker_7d, orderbook_text) if part)
         return discord_external_data_text(
-            f"{snapshot.symbol}: {balance_text} | 现货/DEX确认{spot_score}/10 {spot_label} | "
-            f"{div_label} | {coinglass_parts or 'CoinGlass: n/a'} | 结论: {conclusion}"
+            f"{snapshot.symbol.replace('USDT', '')}：{human_bias}\n"
+            f"- 交易所余额：{balance_text}\n"
+            f"- 订单簿：{orderbook_text}\n"
+            f"- 结论：{human_conclusion}"
         )
 
+    taker_text = " / ".join(part for part in (taker_24h, taker_7d) if part) or "暂无数据"
     lines = [
+        f"结论: {human_bias} - {human_conclusion}",
         f"币种: {snapshot.symbol}",
         "当前无钱包级净流数据，以下为 CoinGlass聚合/现货DEX确认",
-        f"{balance_text}",
+        f"交易所余额: {balance_text}",
         f"现货/DEX确认: {spot_score}/10 {spot_label} - {spot_reason}",
         f"合约现货背离: {div_label} {div_score}/10 - {div_reason}",
-        f"CoinGlass主动买卖: {' / '.join(part for part in (taker_24h, taker_7d) if part) or 'n/a'}",
-        f"CoinGlass订单簿: {orderbook_text or 'n/a'}",
+        f"CoinGlass主动买卖: {taker_text}",
+        f"CoinGlass订单簿: {orderbook_text}",
         source_text,
-        f"结论: {conclusion}",
+        f"原始综合判断: {conclusion.replace('数据不足', '数据不足：CoinGlass/现货DEX/订单簿有效项不足')}",
     ]
     return discord_external_data_text("\n".join(lines))
 
@@ -15830,6 +16377,12 @@ def discord_route_decision(
         reasons.append("追涨回撤风险")
         tags.append("chase_pullback_risk")
 
+    if single_signal_direction_conflict(data):
+        route = DISCORD_ROUTE_CONFLICT_OBSERVE
+        reasons.append("single signal internal direction conflict")
+        tags.append(DISCORD_CONFLICT_OBSERVE_TAG)
+        tags.append("single_signal_direction_conflict")
+
     final_action = ""
     final_conclusion = evidence_summary
     if isinstance(signal, Signal) and snapshot is not None:
@@ -16010,8 +16563,107 @@ def topq_is_risk_candidate(kind: str | None) -> bool:
     return normalized in TOPQ_RISK_KINDS or is_risk_structure_kind(normalized)
 
 
+def single_signal_direction_conflict(data: dict[str, Any]) -> bool:
+    kind = topq_kind_normalized(data.get("kind"))
+    if kind not in DISCORD_RISK_KINDS and not topq_is_risk_candidate(kind):
+        return False
+    evidence_direction = str(data.get("evidence_direction") or "").strip().lower()
+    evidence = int(parse_float(data.get("evidence")) or 0)
+    leading = int(parse_float(data.get("leading")) or 0)
+    leading_direction = str(data.get("leading_direction") or "").strip().lower()
+    leading_label = str(data.get("leading_label") or "")
+    flow_label = str(data.get("flow_label") or "")
+    evidence_summary = str(data.get("evidence_summary") or "")
+    external_text = str(data.get("external_confirmation_text") or "")
+    spot_label = str(data.get("spot_onchain_label") or "")
+    spot_absorption = str(data.get("spot_absorption_label") or "")
+    price_action = data.get("price_action")
+    kline_score = max(
+        int(parse_float(data.get("kline_short_score")) or 0),
+        int(parse_float(data.get("kline_mid_score")) or 0),
+        int(parse_float(data.get("kline_long_score")) or 0),
+        int(parse_float(data.get("kline_score")) or 0),
+        int(getattr(price_action, "score", 0) or 0) if price_action is not None else 0,
+    )
+    kline_text = " ".join(
+        str(part or "")
+        for part in (
+            data.get("kline_label"),
+            data.get("kline_text"),
+            getattr(price_action, "label", "") if price_action is not None else "",
+            getattr(price_action, "recommendation", "") if price_action is not None else "",
+            " ".join(getattr(price_action, "items", []) or []) if price_action is not None else "",
+            " ".join(getattr(price_action, "patterns", []) or []) if price_action is not None else "",
+        )
+    )
+    bullish_text = " ".join([evidence_summary, external_text, spot_label, spot_absorption, kline_text, leading_label])
+    bullish_evidence_count = sum(
+        1
+        for keyword in (
+            "OI增仓推涨",
+            "主力建仓",
+            "中线主力流入",
+            "长线主力流入",
+            "短线资金回流",
+            "现货确认",
+            "外部确认",
+            "现货承接",
+            "现货/DEX/外部确认",
+            "多周期共振流入",
+            "突破",
+            "放量阳线",
+        )
+        if keyword in bullish_text
+    )
+    evidence_bullish = evidence_direction in {"看多", "long", "bull", "bullish"} and evidence >= 6
+    leading_bullish = leading >= 5 and (
+        leading_direction in {"long", "bull", "bullish", "看多", "neutral", "中性", ""}
+        or text_has_any(leading_label, ("偏多", "看多", "中性", "分歧"))
+    )
+    kline_bullish = kline_score >= 7 and text_has_any(
+        kline_text,
+        ("15m", "1h", "转强", "突破", "放量阳线", "突破近20根高点", "短线强"),
+    )
+    flow_conflict = flow_label in {"短强中弱", "资金分歧"} and bullish_evidence_count >= 3
+    external_bullish = text_has_any(bullish_text, ("现货/DEX/外部确认", "现货确认", "外部确认")) and text_has_any(
+        bullish_text,
+        ("现货承接", "承接"),
+    )
+    return bool(
+        (evidence_bullish and leading_bullish)
+        or leading_bullish
+        or kline_bullish
+        or flow_conflict
+        or external_bullish
+    )
+
+
+def single_signal_direction_conflict_for_display(
+    signal: Signal | dict[str, Any] | None,
+    price_action: MultiTimeframePriceAction | None = None,
+) -> bool:
+    if isinstance(signal, Signal) and signal.snapshot is not None:
+        data = discord_route_metrics(signal, signal.snapshot, price_action)
+    elif isinstance(signal, dict):
+        data = discord_route_metrics(signal, None, price_action)
+    else:
+        return False
+    return single_signal_direction_conflict(data)
+
+
 DISCORD_CONFLICT_OBSERVE_TAG = "conflict_observe"
-DISCORD_CONFLICT_LONG_FORBIDDEN_KEYWORDS = ("高位拥挤", "派发", "主动卖盘强", "出货")
+DISCORD_CONFLICT_LONG_FORBIDDEN_KEYWORDS = (
+    "高位拥挤",
+    "派发",
+    "主动卖盘强",
+    "主动卖盘转强",
+    "出货",
+    "压力位",
+    "接近压力区",
+    "中线资金不支持",
+    "长线资金不支持",
+    "下跌趋势反弹",
+)
 
 
 def discord_side_for_signal(
@@ -16118,7 +16770,9 @@ def discord_conflict_evidence_lists(
         if snapshot.oi_change_percent > 0 and snapshot.price_change_percent > 0:
             long_items.append("OI增仓推涨")
         if snapshot.taker_buy_sell_ratio is not None and snapshot.taker_buy_sell_ratio < 1:
-            risk_items.append("主动卖盘转强")
+            risk_items.append("主动卖盘强")
+            if snapshot.oi_change_percent > 0:
+                risk_items.append("OI扩张但主动买卖比<1")
         if (
             (snapshot.global_long_short_ratio is not None and snapshot.global_long_short_ratio >= 1.8)
             or (snapshot.top_account_ratio is not None and snapshot.top_account_ratio >= 1.8)
@@ -16131,6 +16785,49 @@ def discord_conflict_evidence_lists(
         elif isinstance(item, dict):
             text_parts.extend(str(item.get(key) or "") for key in ("evidence_summary", "message", "discord_route_reason", "external_confirmation_text"))
     combined = " ".join(str(part or "") for part in text_parts)
+    if isinstance(signal, Signal) and signal.snapshot is not None:
+        try:
+            _ev_score, _ev_direction, ev_summary, ev_items = evidence_score(signal.snapshot, signal)
+            combined = f"{combined} {ev_summary} " + " ".join(item.label for item in ev_items)
+        except Exception:
+            pass
+        try:
+            _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(signal.snapshot)
+            combined = f"{combined} {flow_label}"
+            if flow_label == "短强中弱":
+                long_items.append("短线资金回流")
+                risk_items.append("短强中弱，谨慎追")
+                risk_items.append("中线资金不支持")
+            elif flow_label == "资金分歧":
+                risk_items.append("资金分歧，谨慎追")
+        except Exception:
+            pass
+    elif isinstance(signal, dict):
+        combined = f"{combined} {signal.get('flow_trend_label') or ''} {signal.get('kline_text') or ''}"
+        if str(signal.get("flow_trend_label") or "") == "短强中弱":
+            long_items.append("短线资金回流")
+            risk_items.append("短强中弱，谨慎追")
+            risk_items.append("中线资金不支持")
+    if text_has_any(combined, ("主力建仓", "中线主力流入", "长线主力流入")):
+        if "主力建仓" in combined:
+            long_items.append("主力建仓")
+        if text_has_any(combined, ("中线主力流入", "中线资金流入")):
+            long_items.append("中线主力流入")
+        if text_has_any(combined, ("长线主力流入", "长线资金流入")):
+            long_items.append("长线主力流入")
+    if text_has_any(combined, ("15m", "1h", "转强", "突破近20根高点", "放量阳线")) and text_has_any(combined, ("转强", "突破", "放量阳线")):
+        long_items.append("15m/1h K线转强")
+    if text_has_any(combined, ("现货承接", "现货/DEX/外部确认", "现货确认", "外部确认")):
+        if "现货承接" in combined:
+            long_items.append("现货承接")
+        else:
+            long_items.append("现货/外部确认")
+    if text_has_any(combined, ("中线资金不支持", "中线不支持")):
+        risk_items.append("中线资金不支持")
+    if text_has_any(combined, ("长线资金不支持", "长线不支持", "中长线资金不支持")):
+        risk_items.append("长线资金不支持")
+    if text_has_any(combined, ("压力位", "接近压力区", "追高风险")):
+        risk_items.append("接近压力区，追高风险")
     if text_has_any(combined, ("现货确认", "外部确认", "现货/DEX/外部确认")) and not text_has_any(combined, DISCORD_WEAK_EXTERNAL_CONFIRMATION_KEYWORDS):
         long_items.append("现货/外部确认")
     if text_has_any(combined, ("现货/外部确认不足", "外部确认不足", "现货确认偏弱", "外部确认偏弱", "现货未跟", "无标准现货", "偏弱")):
@@ -16139,6 +16836,7 @@ def discord_conflict_evidence_lists(
         pa_text = " ".join([price_action.label, price_action.recommendation, *price_action.items, *price_action.risk_items, *price_action.patterns])
         if price_action.long_score <= 3 or text_has_any(pa_text, ("大周期下跌", "大周期未确认")):
             risk_items.append("大周期下跌趋势反弹")
+            risk_items.append("长线资金不支持")
         if text_has_any(pa_text, ("4h箱体未突破", "箱体未突破")):
             risk_items.append("4h箱体未突破")
     long_items = discord_conflict_filter_long_evidence(long_items)
@@ -16156,11 +16854,34 @@ def discord_conflict_observe_fields(
 ) -> list[tuple[str, str, bool]]:
     price_action = safe_multi_timeframe_price_action(signal.symbol, log_result=True) if signal.snapshot else None
     long_items, risk_items = discord_conflict_evidence_lists(signal, previous, price_action)
+    single_conflict = bool(route_decision and "single_signal_direction_conflict" in (route_decision.route_tags or []))
+    if single_conflict:
+        try:
+            _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(signal.snapshot) if signal.snapshot else (0, 0, 0, "", "")
+        except Exception:
+            flow_label = ""
+        kline_text = ""
+        if price_action is not None:
+            kline_text = " ".join([price_action.label, price_action.recommendation, *price_action.items, *price_action.risk_items, *price_action.patterns])
+        sui_style = flow_label == "短强中弱" or text_has_any(kline_text, ("15m", "1h", "转强", "突破", "放量阳线"))
+        conclusion = (
+            "短线结构转强，但中长线资金和大周期仍不支持，暂不站队。"
+            if sui_style
+            else "看多资金证据仍在，但短线卖压/压力位出现风险，暂不站队。"
+        )
+        action = (
+            "不追多，也不急着追空。等待 15m/1h 方向和中线资金重新一致。"
+            if sui_style
+            else "不追多，也不急着追空。等待 15m/1h 方向重新一致。"
+        )
+    else:
+        conclusion = "短线资金和结构出现反复，多空证据冲突，等待方向确认。"
+        action = "暂不追多，也不追空。等待 15m/1h 方向重新一致。"
     return [
         ("币种/方向", discord_field_value(f"{signal.symbol} / 观察 / 暂不站队"), True),
         ("Discord路由", discord_field_value("观察\n原因：多空证据冲突，等待方向确认"), False),
-        ("结论", discord_field_value("短线资金和结构出现反复，多空证据冲突，等待方向确认。"), False),
-        ("操作建议", discord_field_value("暂不追多，也不追空。等待 15m/1h 方向重新一致。"), False),
+        ("结论", discord_field_value(conclusion), False),
+        ("操作建议", discord_field_value(action), False),
         ("看多证据", discord_field_value("\n".join(f"- {item}" for item in long_items)), False),
         ("风险证据", discord_field_value("\n".join(f"- {item}" for item in risk_items)), False),
     ][:12]

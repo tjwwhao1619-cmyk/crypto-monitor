@@ -239,12 +239,116 @@ def test_conflict_observe_channel_is_not_main_or_risk():
 
 def test_conflict_observe_channel_prefers_observe_when_configured():
     decision = m.discord_conflict_route_decision(80)
-    sig = m.Signal("ADAUSDT", "top_risk", 1, "risk", "", "k", snapshot("ADAUSDT"))
+    sig = m.Signal("TSTUSDT", "top_risk", 1, "risk", "", "k", snapshot("TSTUSDT"))
 
     channel = m.discord_channel_for_route(decision, sig, {"main": "1", "risk": "2", "alerts": "3", "observe": "4"})
 
     assert channel == "observe"
     assert channel != "main"
+
+
+def test_main_momentum_watch_btc_routes_to_main_asset():
+    decision = m.RouteDecision(m.DISCORD_ROUTE_REALTIME, "实时", "main", 90, False, [])
+    sig = m.Signal("BTCUSDT", "main_momentum_watch", 1, "main", "", "k", snapshot("BTCUSDT"))
+
+    channel = m.discord_channel_for_route(decision, sig, {"main_asset": "1500895602542903336", "alerts": "2"})
+
+    assert channel == "main_asset"
+
+
+def test_mainstream_observe_routes_to_main_asset():
+    sig = m.Signal("ADAUSDT", "bottom_reversal", 1, "observe", "", "k", snapshot("ADAUSDT"))
+
+    channel = m.discord_channel_for_route(observe_decision(), sig, {"main_asset": "1500895602542903336", "alerts": "2", "observe": "3"})
+
+    assert channel == "main_asset"
+
+
+def test_main_asset_missing_fallback_alerts_not_main():
+    sig = m.Signal("BTCUSDT", "main_trend_watch", 1, "main", "", "k", snapshot("BTCUSDT"))
+    decision = m.RouteDecision(m.DISCORD_ROUTE_REALTIME, "实时", "main", 90, False, [])
+
+    channel = m.discord_channel_for_route(decision, sig, {"main": "1", "alerts": "2"})
+
+    assert channel == "alerts"
+    assert channel != "main"
+
+
+def test_suppressed_digest_channel_only_digest():
+    decision = m.RouteDecision(m.DISCORD_ROUTE_DIGEST, "静默", "quiet", 10, True, [])
+    sig = m.Signal("ADAUSDT", "bottom_reversal", 1, "risk", "", "k", snapshot("ADAUSDT"))
+
+    channel = m.discord_channel_for_payload(
+        "suppressed_digest",
+        route_decision=decision,
+        signal=sig,
+        title="🧾 静默信号摘要",
+        channel_ids={"main": "1", "alerts": "2", "digest": "3"},
+    )
+
+    assert channel == "digest"
+
+
+def test_market_summary_channel_only_summary():
+    channel = m.discord_channel_for_payload(
+        "summary",
+        title="📊 每小时市场简报",
+        channel_ids={"summary": "1", "onchain": "2", "digest": "3"},
+    )
+
+    assert channel == "summary"
+
+
+def test_onchain_payload_channel_only_onchain():
+    channel = m.discord_channel_for_payload(
+        "onchain",
+        title="🔷 CoinGlass 聚合资金摘要",
+        channel_ids={"summary": "1", "onchain": "2"},
+    )
+
+    assert channel == "onchain"
+
+
+def test_stock_token_payload_channel_only_stock_token():
+    channel = m.discord_channel_for_payload(
+        "stock_token",
+        title="美股代币观察摘要",
+        channel_ids={"summary": "1", "stock_token": "2"},
+    )
+
+    assert channel == "stock_token"
+
+
+def test_main_title_priority_observe_corrected_to_alerts():
+    corrected = m.discord_correct_route_channel_mismatch(
+        m.DISCORD_ROUTE_REALTIME,
+        "main",
+        {"main": "1", "alerts": "3"},
+        symbol="ADAUSDT",
+        kind="bottom_reversal",
+        title="🟡 重点观察 ADA/USDT",
+    )
+
+    assert corrected == "alerts"
+
+
+def test_discord_channel_command_outputs_matrix_keywords():
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    monitor.discord_config = m.DiscordConfig(
+        True,
+        "token",
+        {"main": "1", "main_asset": "6", "alerts": "2", "summary": "3", "onchain": "4", "stock_token": "5"},
+    )
+
+    text = monitor.discord_command_response("!频道")
+
+    assert "Discord 频道治理矩阵" in text
+    assert "main id configured?" in text
+    assert "main_asset id configured?" in text
+    assert "主流雷达" in text
+    assert "priority_observe" in text
+    assert "suppressed_digest" in text
+    assert "美股代币" in text
 
 
 def test_conflict_title_channel_fallback_alerts_without_observe():
@@ -280,6 +384,95 @@ def test_conflict_title_channel_defense_corrects_main_to_alerts(caplog):
     assert "Discord conflict channel mismatch corrected: symbol=TSTUSDT" in caplog.text
 
 
+def init_discord_monitor_for_routing(channel_ids=None):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    monitor.discord_config = m.DiscordConfig(True, "token", channel_ids or {"alerts": "2222222222226118"})
+    monitor.discord_outbound_queue = queue.Queue()
+    monitor.discord_signal_cooldowns = {}
+    monitor.discord_symbol_signal_memory = {}
+    monitor.discord_symbol_signal_memory_lock = threading.Lock()
+    monitor.discord_visible_signal_recent = m.deque(maxlen=500)
+    monitor.discord_visible_signal_lock = threading.Lock()
+    monitor.discord_route_audit = m.deque(maxlen=m.DISCORD_ROUTE_AUDIT_LIMIT)
+    monitor.discord_route_audit_lock = threading.Lock()
+    return monitor
+
+
+def test_duplicate_visible_risk_observe_suppresses_second(monkeypatch):
+    monitor = init_discord_monitor_for_routing()
+    decision = m.RouteDecision(m.DISCORD_ROUTE_OBSERVE, "观察", "risk observe", 70, True, ["risk"])
+    monkeypatch.setattr(m, "discord_route_decision", lambda *args, **kwargs: decision)
+    monkeypatch.setattr(m, "conviction_score", lambda *args, **kwargs: (50, "中", "smoke"))
+    monkeypatch.setattr(m, "trap_risk_score", lambda *args, **kwargs: (4, "中", "smoke"))
+    sig1 = m.Signal("UBUSDT", "top_risk", 1, "risk", "风险", "k1", snapshot("UBUSDT", price_change=1, oi_change=2))
+    sig2 = m.Signal("UBUSDT", "top_risk", 1, "risk", "风险", "k2", snapshot("UBUSDT", price_change=1.5, oi_change=3))
+
+    monitor.route_discord_signal(sig1, "B", 24, "old")
+    monitor.route_discord_signal(sig2, "B", 32, "new")
+
+    assert monitor.discord_outbound_queue.qsize() == 1
+    audit_text = monitor.format_discord_channel_audit_response()
+    assert "dedupe_suppress" in audit_text
+
+
+def test_duplicate_visible_allows_route_upgrade(monkeypatch):
+    monitor = init_discord_monitor_for_routing()
+    decisions = [
+        m.RouteDecision(m.DISCORD_ROUTE_OBSERVE, "观察", "observe", 40, True, []),
+        m.RouteDecision(m.DISCORD_ROUTE_PRIORITY_OBSERVE, "重点观察", "upgrade", 80, True, []),
+    ]
+    monkeypatch.setattr(m, "discord_route_decision", lambda *args, **kwargs: decisions.pop(0))
+    monkeypatch.setattr(m, "conviction_score", lambda *args, **kwargs: (50, "中", "smoke"))
+    monkeypatch.setattr(m, "trap_risk_score", lambda *args, **kwargs: (2, "低", "smoke"))
+    sig1 = m.Signal("UBUSDT", "bottom_reversal", 1, "long", "direction long 看多", "k1", snapshot("UBUSDT"))
+    sig2 = m.Signal("UBUSDT", "bottom_reversal", 1, "long", "direction long 看多", "k2", snapshot("UBUSDT"))
+
+    monitor.route_discord_signal(sig1, "C", 30, "old")
+    monitor.route_discord_signal(sig2, "A", 60, "new")
+
+    assert monitor.discord_outbound_queue.qsize() == 2
+
+
+def test_onchain_balance_na_humanized_and_not_repeated():
+    text = m.format_onchain_brief(
+        snapshot("BTCUSDT"),
+        "CoinGlass聚合: n/a\nCoinGlass订单簿: n/a",
+        "暂无明显现货/DEX/外部确认",
+        compact=True,
+    )
+
+    assert "交易所余额：暂无数据" in text
+    assert "n/a / 7d n/a / 30d n/a" not in text
+    assert text.count("CoinGlass交易所余额") <= 1
+
+
+def test_stablecoin_summary_mentions_not_exchange_buying(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    monkeypatch.setattr(monitor, "latest_stablecoin_supply_rows", lambda assets: {asset: [] for asset in assets})
+
+    text = monitor.format_stablecoin_liquidity_radar()
+
+    assert "不等于交易所买盘" in text
+
+
+def test_onchain_title_corrected_from_summary_or_main():
+    corrected_summary = m.discord_correct_route_channel_mismatch(
+        None,
+        "summary",
+        {"onchain": "9", "summary": "1"},
+        title="🔷 CoinGlass主流资金",
+    )
+    corrected_main = m.discord_correct_route_channel_mismatch(
+        None,
+        "main",
+        {"onchain": "9", "main": "1"},
+        title="🟠 稳定币流动性背景",
+    )
+
+    assert corrected_summary == "onchain"
+    assert corrected_main == "onchain"
+
+
 def test_conflict_observe_copy_and_long_evidence_sanitized(monkeypatch):
     monkeypatch.setattr(m, "safe_multi_timeframe_price_action", lambda *args, **kwargs: price_action("4h箱体未突破", long_score=2))
     decision = m.discord_conflict_route_decision(80)
@@ -294,6 +487,95 @@ def test_conflict_observe_copy_and_long_evidence_sanitized(monkeypatch):
     assert "暂不站队" in text
     for forbidden in ("高位拥挤", "派发", "主动卖盘强"):
         assert forbidden not in long_value
+
+
+def test_single_signal_internal_conflict_risk_with_bullish_kline_display(monkeypatch):
+    pa = m.MultiTimeframePriceAction(
+        score=8,
+        label="15m/1h K线转强",
+        direction="long",
+        short_score=8,
+        mid_score=8,
+        long_score=3,
+        short_label="15m 突破近20根高点",
+        mid_label="1h转强",
+        long_label="大周期下跌趋势反弹",
+        items=["15m/1h K线转强", "15m 突破近20根高点", "放量阳线"],
+        risk_items=["大周期下跌趋势反弹", "中线资金不支持", "长线资金不支持"],
+        patterns=[],
+        recommendation="短线强，中线不支持",
+    )
+    monkeypatch.setattr(m, "safe_multi_timeframe_price_action", lambda *args, **kwargs: pa)
+    monkeypatch.setattr(m, "conviction_score", lambda *args, **kwargs: (55, "中", "smoke"))
+    monkeypatch.setattr(
+        m,
+        "leading_signal_score",
+        lambda *args, **kwargs: m.LeadingSignalScore(6, "neutral", "偏多 6/10", ["偏多"], 6, 2),
+    )
+    monkeypatch.setattr(
+        m,
+        "evidence_score",
+        lambda *args, **kwargs: (
+            3,
+            "观察",
+            "现货/DEX/外部确认，现货承接，OI增仓推涨",
+            [
+                m.EvidenceItem("OI增仓推涨", 2, "positive", "short", "OI"),
+                m.EvidenceItem("现货承接", 2, "positive", "spot", "SPOT"),
+                m.EvidenceItem("主动卖盘强", 2, "risk", "short", "TAKER"),
+            ],
+        ),
+    )
+    monkeypatch.setattr(m, "flow_horizon_scores", lambda *args, **kwargs: (7, 3, 2, "短强中弱", "short strong"))
+    sig = m.Signal("SUIUSDT", "top_exhaustion", 1, "风险", "短线强，中线不支持，现货承接", "k", snapshot("SUIUSDT"))
+
+    decision = m.discord_route_decision(sig, sig.snapshot)
+    title = m.discord_signal_title_for_route(sig, "B", decision)
+    fields = m.discord_signal_fields(sig, "B", 60, "smoke", decision)
+    channel = m.discord_channel_for_route(decision, sig, {"main": "1", "risk": "2", "alerts": "3", "observe": "4"})
+    direction_value = next(value for name, value, _inline in fields if name == "币种/方向")
+    long_value = next(value for name, value, _inline in fields if name == "看多证据")
+    text = "\n".join(value for _name, value, _inline in fields)
+
+    assert decision.route == m.DISCORD_ROUTE_CONFLICT_OBSERVE
+    assert "多空分歧观察" in title
+    assert "观察 / 暂不站队" in direction_value
+    assert channel == "observe"
+    assert channel not in {"risk", "main"}
+    assert "短线结构转强，但中长线资金和大周期仍不支持，暂不站队" in text
+    assert "等待 15m/1h 方向和中线资金重新一致" in text
+    for forbidden in ("主动卖盘强", "中线资金不支持", "长线资金不支持", "下跌趋势反弹", "压力位"):
+        assert forbidden not in long_value
+
+
+def test_discord_candidates_single_internal_conflict_not_risk(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    rows = [
+        {
+            "symbol": "SUIUSDT",
+            "kind": "top_risk",
+            "conviction_score": "55",
+            "evidence_score": "2",
+            "evidence_direction": "观察",
+            "evidence_summary": "现货/DEX/外部确认 现货承接 OI增仓推涨",
+            "leading_score": "6",
+            "leading_direction": "neutral",
+            "leading_label": "偏多 6/10",
+            "signal_quality_score": "60",
+            "flow_trend_label": "短强中弱",
+            "kline_score": "8",
+            "kline_short_score": "8",
+            "kline_mid_score": "8",
+            "kline_text": "15m/1h K线转强 15m 突破近20根高点",
+        },
+    ]
+    monkeypatch.setattr(monitor, "load_recent_signal_rows", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(m, "light_multi_timeframe_price_action", lambda *_args, **_kwargs: None)
+
+    text = monitor.format_discord_route_candidates_response()
+
+    assert "🟡 多空分歧观察 SUI/USDT" in text
+    assert "🔴 风险观察\n暂无" in text
 
 
 def test_discord_candidates_show_single_conflict_for_same_symbol(monkeypatch):
