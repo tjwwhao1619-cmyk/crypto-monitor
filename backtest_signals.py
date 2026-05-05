@@ -1131,6 +1131,48 @@ def route_detail_line(x, decision, score):
     )
 
 
+def print_breakout_entry_confirmation_report(routed):
+    rows_by_state = {}
+    for x, decision, _base_decision in routed:
+        if "breakout_watch" not in decision.route_tags and "breakout_watch_fallback" not in decision.route_tags:
+            continue
+        entry = live_routes.breakout_entry_confirmation(x, None, x, decision)
+        rows_by_state.setdefault(entry.state, []).append(x)
+
+    print("[BREAKOUT ENTRY CONFIRMATION]")
+    state_order = (
+        "waiting_pullback",
+        "waiting_pullback_high_risk",
+        "waiting_pullback_track",
+        "pullback_holding",
+        "volume_continuation",
+        "breakout_confirmed",
+        "failed_invalidated",
+        "unknown",
+    )
+    labels = getattr(live_routes, "BREAKOUT_ENTRY_STATE_LABELS", {})
+    for state in state_order:
+        rows = rows_by_state.get(state, [])
+        adverse_values = [route_bad_score(row) for row in rows]
+        adverse_values = [value for value in adverse_values if value is not None]
+        adverse_avg = statistics.mean(adverse_values) if adverse_values else None
+        stat_1h = stats_for_values(horizon_values(rows, "1h"))
+        stat_4h = stats_for_values(horizon_values(rows, "4h"))
+        if stat_1h["n"]:
+            one_hour = f"{stat_1h['wins']}/{stat_1h['n']} {stat_1h['win_rate']:.1f}% avg={fmt_stat_value(stat_1h['avg'])}"
+        else:
+            one_hour = "样本=0"
+        if stat_4h["n"]:
+            four_hour = f"{stat_4h['wins']}/{stat_4h['n']} {stat_4h['win_rate']:.1f}% avg={fmt_stat_value(stat_4h['avg'])}"
+        else:
+            four_hour = "样本=0"
+        print(
+            f"{state} {labels.get(state, state)}: count={len(rows)} "
+            f"1h={one_hour} 4h={four_hour} adverse_avg={fmt_stat_value(adverse_avg)}"
+        )
+    print("")
+
+
 def print_route_simulation_report(results):
     routed = [(x, route_simulation_decision(x), route_simulation_decision(x, disable_breakout_watch=True)) for x in results]
     print("[ROUTE SIMULATION] Discord 路由模拟")
@@ -1158,6 +1200,18 @@ def print_route_simulation_report(results):
     for horizon in ("1h", "4h"):
         print_horizon_stat_line("  ", fallback_rows, horizon, include_worst=True)
     print(f"breakout_watch_fallback 从 digest/observe 迁移: 样本={len(fallback_migrated)}")
+    breakout_high_risk_demoted_count = 0
+    breakout_track_count = 0
+    for x, decision, _base_decision in routed:
+        if "breakout_watch" not in decision.route_tags and "breakout_watch_fallback" not in decision.route_tags:
+            continue
+        entry = live_routes.breakout_entry_confirmation(x, None, x, decision)
+        if entry.state == "waiting_pullback_high_risk":
+            breakout_high_risk_demoted_count += 1
+        elif entry.state == "waiting_pullback_track":
+            breakout_track_count += 1
+    print(f"breakout_high_risk_demoted_count={breakout_high_risk_demoted_count}")
+    print(f"breakout_track_count={breakout_track_count}")
     realtime_priority_rows = [
         x for x, decision, _base_decision in routed if decision.route in {"realtime", "risk_realtime", "priority_observe"}
     ]
@@ -1165,6 +1219,7 @@ def print_route_simulation_report(results):
     for horizon in ("1h", "4h"):
         print_horizon_stat_line("  ", realtime_priority_rows, horizon, include_worst=True)
     print("")
+    print_breakout_entry_confirmation_report(routed)
 
     realtime_routes = {"realtime", "risk_realtime"}
     visible_routes = {"realtime", "risk_realtime", "priority_observe"}
@@ -1174,6 +1229,9 @@ def print_route_simulation_report(results):
     bad_priority = []
     bad_breakout = []
     bad_breakout_fallback = []
+    conflict_downgraded_realtime_count = 0
+    leading_risk_downgrade_count = 0
+    weak_external_confirmation_downgrade_count = 0
     focus_symbols = {"LABUSDT", "TAGUSDT", "TSTUSDT", "BSBUSDT"}
     focus_after = Counter()
     focus_before = Counter()
@@ -1196,6 +1254,12 @@ def print_route_simulation_report(results):
             bad_breakout.append((worst, x, decision))
         if "breakout_watch_fallback" in decision.route_tags and worst is not None and worst <= -3:
             bad_breakout_fallback.append((worst, x, decision))
+        if "conflict_downgrade" in decision.route_tags:
+            conflict_downgraded_realtime_count += 1
+        if "leading_risk_downgrade" in decision.route_tags:
+            leading_risk_downgrade_count += 1
+        if "weak_external_confirmation_downgrade" in decision.route_tags:
+            weak_external_confirmation_downgrade_count += 1
     missed.sort(key=lambda item: item[0], reverse=True)
     missed_before.sort(key=lambda item: item[0], reverse=True)
     bad_realtime.sort(key=lambda item: item[0])
@@ -1218,6 +1282,9 @@ def print_route_simulation_report(results):
     print("")
 
     print("[BAD REALTIME] Discord 实时噪声 TOP30")
+    print(f"conflict_downgraded_realtime_count={conflict_downgraded_realtime_count}")
+    print(f"leading_risk_downgrade_count={leading_risk_downgrade_count}")
+    print(f"weak_external_confirmation_downgrade_count={weak_external_confirmation_downgrade_count}")
     for index, (score, x, decision) in enumerate(bad_realtime[:30], start=1):
         print(f"{index:02d}. {route_detail_line(x, decision, score)}")
     print("")

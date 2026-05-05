@@ -184,6 +184,16 @@ class MultiTimeframePriceAction:
 
 
 @dataclass(frozen=True)
+class BreakoutEntryConfirmation:
+    state: str
+    score: int
+    summary: str
+    conditions: list[str]
+    invalidation_price: float | None = None
+    trigger_price: float | None = None
+
+
+@dataclass(frozen=True)
 class TelegramSignalDigestItem:
     created_at: float
     symbol: str
@@ -5608,7 +5618,7 @@ class DerivativesMonitor:
             lines.append(
                 (
                     f"{item.symbol} {signal_kind_label(item.kind)} | 路由={discord_route_human_label(item.route)} | 把握{item.conviction_score} 质量{item.quality_score} | "
-                    f"领先{item.leading_score} 证据{item.evidence_score} 风险{item.trap_score}"
+                    f"领先{item.leading_score} 证据{discord_compact_score_10_text(item.evidence_score)} 风险{item.trap_score}"
                 )
             )
             lines.append(
@@ -5728,7 +5738,7 @@ class DerivativesMonitor:
             self.discord_suppressed_digest_queue = []
         if not items:
             self.last_discord_suppressed_digest_flush_status = "empty"
-            logging.info("Discord suppressed digest flush skipped: empty")
+            logging.debug("Discord suppressed digest flush skipped: empty")
             return False, "静默摘要队列为空", 0
         channel_key = "digest" if self.discord_config.channel_ids.get("digest") else "main"
         try:
@@ -7207,11 +7217,11 @@ class DerivativesMonitor:
             return "读取信号记录失败，请查看服务日志。"
 
         sections = [
-            ("实时候选", {DISCORD_ROUTE_REALTIME}),
-            ("重点观察", {DISCORD_ROUTE_PRIORITY_OBSERVE}),
-            ("风险候选", {DISCORD_ROUTE_RISK_REALTIME}),
-            ("静默潜力", {DISCORD_ROUTE_DIGEST}),
-            ("普通观察", {DISCORD_ROUTE_OBSERVE}),
+            ("🟢 实时重点", {DISCORD_ROUTE_REALTIME}),
+            ("🟡 重点观察", {DISCORD_ROUTE_PRIORITY_OBSERVE}),
+            ("🔴 风险观察", {DISCORD_ROUTE_RISK_REALTIME}),
+            ("🧾 静默潜力", {DISCORD_ROUTE_DIGEST}),
+            ("👀 普通观察", {DISCORD_ROUTE_OBSERVE}),
         ]
         grouped: dict[str, list[tuple[tuple[float, ...], dict[str, str], RouteDecision, MultiTimeframePriceAction | None]]] = {title: [] for title, _routes in sections}
         best_seen: set[tuple[str, str, str]] = set()
@@ -7228,6 +7238,8 @@ class DerivativesMonitor:
             decision = discord_route_decision(row, context={"load_price_action": False, "price_action": price_action})
             if decision.route == DISCORD_ROUTE_SUPPRESS:
                 continue
+            entry_state = breakout_entry_state_for_display(row, price_action, row, decision)
+            display_route = DISCORD_ROUTE_OBSERVE if entry_state == "waiting_pullback_high_risk" else decision.route
             key = (symbol, topq_kind_normalized(row.get("kind")), decision.route)
             if key in best_seen:
                 continue
@@ -7237,7 +7249,7 @@ class DerivativesMonitor:
             leading = parse_float(row.get("leading_score")) or 0
             kind_rank = topq_kind_tiebreak_rank(row.get("kind"), signal_direction_label(row.get("kind")))
             score_key = (
-                DISCORD_ROUTE_ORDER.get(decision.route, 0),
+                DISCORD_ROUTE_ORDER.get(display_route, 0),
                 conviction,
                 evidence,
                 leading,
@@ -7246,48 +7258,20 @@ class DerivativesMonitor:
                 -recent_index,
             )
             for title, routes in sections:
-                if decision.route in routes:
+                if display_route in routes:
                     grouped[title].append((score_key, row, decision, price_action))
                     break
 
-        lines = ["Discord路由候选"]
+        lines = ["Discord 候选"]
         for title, _routes in sections:
-            limit = 4 if title == "普通观察" else 8
+            limit = 4 if title == "👀 普通观察" else 8
             items = sorted(grouped[title], key=lambda item: item[0], reverse=True)[:limit]
-            lines.append(f"[{title}]")
+            lines.append(title)
             if not items:
                 lines.append("暂无")
                 continue
             for index, (_score_key, row, decision, price_action) in enumerate(items, start=1):
-                symbol = display_usdt_symbol(row.get("symbol"))
-                kind = row.get("kind") or "-"
-                conviction = format_csv_compact_number(row.get("conviction_score"), signed=False)
-                quality = format_csv_compact_number(row.get("signal_quality_score"), signed=False)
-                priority = str(row.get("signal_priority") or "-").upper()
-                leading = format_csv_compact_number(row.get("leading_score"), signed=False)
-                evidence = format_csv_compact_number(row.get("evidence_score"), signed=False)
-                short_flow = format_csv_compact_number(row.get("short_flow_score"), signed=False)
-                mid_flow = format_csv_compact_number(row.get("mid_flow_score"), signed=False)
-                long_flow = format_csv_compact_number(row.get("long_flow_score"), signed=False)
-                flow_label = row.get("flow_trend_label") or "-"
-                kline = (
-                    humanize_kline_summary(price_action).replace("\n", " | ")
-                    if price_action
-                    else "暂无多周期K线确认，仅资金/OI观察"
-                )
-                route_label = discord_route_display_label(decision)
-                human_reason = humanize_route_reason(decision, row, {"price_action": price_action})
-                tag_text = " | 标签: 爆发观察" if (
-                    "breakout_watch" in decision.route_tags
-                    or "breakout_watch_fallback" in decision.route_tags
-                ) else ""
-                lines.append(
-                    f"{index}. 路由: {route_label}{tag_text} | {symbol} {signal_kind_label(kind)} | 原因: {human_reason}"
-                )
-                lines.append(
-                    f"   conv={conviction} q={priority}/{quality} lead={leading} ev={evidence} | "
-                    f"短{short_flow}/中{mid_flow}/长{long_flow} | {kline} | {humanize_flow_label(flow_label)}"
-                )
+                lines.extend(discord_candidate_brief_lines(row, decision, price_action))
         return "\n".join(lines)
 
     def format_topq_response(self, discord_view: bool = False) -> str:
@@ -8379,6 +8363,9 @@ def discord_signal_title(signal: Signal, priority: str) -> str:
 def discord_signal_title_for_route(signal: Signal, priority: str, route_decision: RouteDecision | None = None) -> str:
     if route_decision:
         pair = discord_symbol_pair(signal.symbol)
+        price_action = safe_multi_timeframe_price_action(signal.symbol, log_result=False) if signal.snapshot else None
+        if breakout_entry_is_high_risk_display(signal.snapshot, price_action, signal, route_decision):
+            return f"👀 高位观察 {pair}"
         if route_decision.route == DISCORD_ROUTE_PRIORITY_OBSERVE:
             if "breakout_watch" in route_decision.route_tags or "breakout_watch_fallback" in route_decision.route_tags:
                 return f"🟡 爆发观察 {pair}"
@@ -8501,6 +8488,34 @@ def discord_field_value(text: str) -> str:
     return truncate_text(str(text or ""), 900)
 
 
+def discord_clamp_score_10(value: Any) -> tuple[int | None, float | None]:
+    raw = parse_float(value)
+    if raw is None:
+        return None, None
+    capped = int(max(0, min(10, round(raw))))
+    return capped, raw
+
+
+def discord_score_10_text(value: Any) -> str:
+    capped, raw = discord_clamp_score_10(value)
+    if capped is None or raw is None:
+        return "-/10"
+    if int(round(raw)) != capped:
+        raw_text = format_csv_compact_number(raw, signed=False)
+        return f"{capped}/10（原始{raw_text}分）"
+    return f"{capped}/10"
+
+
+def discord_compact_score_10_text(value: Any) -> str:
+    capped, raw = discord_clamp_score_10(value)
+    if capped is None or raw is None:
+        return "-"
+    if int(round(raw)) != capped:
+        raw_text = format_csv_compact_number(raw, signed=False)
+        return f"{capped}(原{raw_text})"
+    return str(capped)
+
+
 def discord_price_oi_field_value(snapshot: MarketSnapshot) -> str:
     confirm_parts = []
     if snapshot.confirm_price_change_percent is not None:
@@ -8546,7 +8561,7 @@ def discord_evidence_field_value(snapshot: MarketSnapshot, signal: Signal | None
         if item.polarity == "positive" and item.source in {"OI", "FLOW", "FUNDING", "BASIS", "LSR", "WHALE", "SPOT", "ONCHAIN", "LIQ"}
     ][:6]
     prefix = "资金证据" if signal and topq_kind_normalized(signal.kind) in DISCORD_RISK_KINDS else "证据"
-    lines = [f"{ev_score}/10 | {ev_direction} | {prefix}: {ev_summary or '暂无明确证据'}"]
+    lines = [f"{discord_score_10_text(ev_score)} | {ev_direction} | {prefix}: {ev_summary or '暂无明确证据'}"]
     lines.extend(f"- {item.label} +{item.points}" for item in positive_items)
     return discord_field_value("\n".join(lines))
 
@@ -8681,6 +8696,339 @@ def discord_price_action_field_value(price_action: MultiTimeframePriceAction | N
     return truncate_text("\n".join(lines), 900)
 
 
+BREAKOUT_ENTRY_STATE_LABELS = {
+    "waiting_pullback": "等待回踩",
+    "waiting_pullback_high_risk": "等待回踩，高位风险",
+    "waiting_pullback_track": "等待回踩，可跟踪",
+    "pullback_holding": "回踩不破",
+    "volume_continuation": "放量延续",
+    "breakout_confirmed": "突破确认",
+    "failed_invalidated": "失败失效",
+    "unknown": "数据不足",
+}
+
+
+BREAKOUT_ENTRY_STATE_ACTIONS = {
+    "waiting_pullback": "等回踩不破再考虑",
+    "waiting_pullback_high_risk": "只观察，等深回踩或风险释放，不追",
+    "waiting_pullback_track": "等回踩不破再考虑，不追高",
+    "pullback_holding": "等放量延续确认，不追高",
+    "volume_continuation": "等回踩不破或放量延续确认，不追高",
+    "breakout_confirmed": "突破确认，等回踩确认风险",
+    "failed_invalidated": "移出观察，等重新转强",
+    "unknown": "确认不足，先观察",
+}
+
+
+def breakout_entry_source_value(source: MarketSnapshot | dict[str, Any] | None, key: str, default: Any = None) -> Any:
+    if source is None:
+        return default
+    if isinstance(source, MarketSnapshot):
+        return getattr(source, key, default)
+    if key == "close_price" and "price" in source:
+        return source.get("price", default)
+    return source.get(key, default)
+
+
+def breakout_entry_source_float(source: MarketSnapshot | dict[str, Any] | None, key: str, default: float = 0.0) -> float:
+    value = parse_float(breakout_entry_source_value(source, key))
+    return default if value is None else value
+
+
+def breakout_entry_flow_value(source: MarketSnapshot | dict[str, Any] | None, period: str) -> float:
+    if isinstance(source, MarketSnapshot):
+        return summary_flow_value(source, period)
+    if isinstance(source, dict):
+        return parse_float(source.get(f"net_flow_{period}_usd")) or 0.0
+    return 0.0
+
+
+def breakout_entry_price_action_text(price_action: MultiTimeframePriceAction | None) -> str:
+    if price_action is None:
+        return ""
+    return " ".join([price_action.label, price_action.recommendation, *price_action.items, *price_action.risk_items, *price_action.patterns])
+
+
+def breakout_entry_kline_text(source: MarketSnapshot | dict[str, Any] | None, price_action: MultiTimeframePriceAction | None) -> str:
+    text = breakout_entry_price_action_text(price_action)
+    if text:
+        return text
+    if isinstance(source, dict):
+        return str(source.get("kline_text") or source.get("kline_label") or "")
+    return ""
+
+
+def breakout_entry_confirmation_enabled(route_decision: RouteDecision | None) -> bool:
+    return bool(route_decision and {"breakout_watch", "breakout_watch_fallback"} & set(route_decision.route_tags))
+
+
+def breakout_entry_signal_text(signal: Signal | dict[str, Any] | None) -> str:
+    if isinstance(signal, Signal):
+        return " ".join(str(part or "") for part in (signal.title, signal.message))
+    if isinstance(signal, dict):
+        return " ".join(
+            str(signal.get(key) or "")
+            for key in (
+                "leading_label",
+                "evidence_summary",
+                "conclusion",
+                "action",
+                "action_label",
+                "external_confirmation_text",
+                "spot_onchain_label",
+                "spot_onchain_reason",
+                "contract_spot_divergence_label",
+                "contract_spot_divergence_reason",
+                "spot_absorption_label",
+                "spot_absorption_reason",
+            )
+        )
+    return ""
+
+
+def breakout_entry_leading_risk(snapshot: MarketSnapshot | dict[str, Any] | None, signal: Signal | dict[str, Any] | None) -> bool:
+    source = signal if isinstance(signal, dict) else snapshot
+    direction = str(breakout_entry_source_value(source, "leading_direction") or "").strip().lower()
+    label = str(breakout_entry_source_value(source, "leading_label") or "")
+    return (
+        direction in {"bear", "bearish", "risk", "short", "看空", "看空/风险"}
+        or text_has_any(label, ("偏风险", "出货", "派发", "资金分歧", "风险"))
+    )
+
+
+def breakout_entry_external_weak(snapshot: MarketSnapshot | dict[str, Any] | None, signal: Signal | dict[str, Any] | None) -> bool:
+    text = breakout_entry_signal_text(signal)
+    if isinstance(snapshot, dict):
+        text = " ".join(
+            [
+                text,
+                str(snapshot.get("external_confirmation_text") or ""),
+                str(snapshot.get("spot_onchain_label") or ""),
+                str(snapshot.get("spot_onchain_reason") or ""),
+                str(snapshot.get("contract_spot_divergence_label") or ""),
+                str(snapshot.get("contract_spot_divergence_reason") or ""),
+                str(snapshot.get("spot_absorption_label") or ""),
+                str(snapshot.get("spot_absorption_reason") or ""),
+            ]
+        )
+    return text_has_any(text, DISCORD_WEAK_EXTERNAL_CONFIRMATION_KEYWORDS)
+
+
+def breakout_entry_confirmation(
+    snapshot: MarketSnapshot | dict[str, Any] | None,
+    kline_structure: MultiTimeframePriceAction | None,
+    signal: Signal | dict[str, Any] | None,
+    route_decision: RouteDecision | None,
+) -> BreakoutEntryConfirmation:
+    if not breakout_entry_confirmation_enabled(route_decision):
+        return BreakoutEntryConfirmation("unknown", 0, "非爆发观察信号，不启用入场确认。", [])
+
+    if snapshot is None:
+        return BreakoutEntryConfirmation("unknown", 0, "数据不足，暂时只能观察。", ["缺少快照数据"])
+
+    price = breakout_entry_source_float(snapshot, "close_price", 0.0)
+    high = breakout_entry_source_float(snapshot, "high_24h", 0.0)
+    low = breakout_entry_source_float(snapshot, "low_24h", 0.0)
+    price_position = parse_float(breakout_entry_source_value(snapshot, "price_position_24h"))
+    price_change = breakout_entry_source_float(snapshot, "price_change_percent", 0.0)
+    oi_change = breakout_entry_source_float(snapshot, "oi_change_percent", 0.0)
+    confirm_price = breakout_entry_source_float(snapshot, "confirm_price_change_percent", 0.0)
+    confirm_oi = breakout_entry_source_float(snapshot, "confirm_oi_change_percent", 0.0)
+    funding = parse_float(breakout_entry_source_value(snapshot, "funding_rate_percent"))
+    basis_pct = parse_float(breakout_entry_source_value(snapshot, "basis_pct"))
+    basis_label = str(breakout_entry_source_value(snapshot, "basis_state") or "")
+    if not basis_label and isinstance(snapshot, MarketSnapshot):
+        basis_pct, basis_label, _basis_reason = basis_state(snapshot)
+    taker_ratio_raw = parse_float(breakout_entry_source_value(snapshot, "taker_buy_sell_ratio"))
+    taker_ratio = taker_ratio_raw or 0.0
+    flow_15m = breakout_entry_flow_value(snapshot, "15m")
+    flow_1h = breakout_entry_flow_value(snapshot, "1h")
+    risk_score = int(breakout_entry_source_float(snapshot, "trap_risk_score", 0.0))
+    if risk_score <= 0 and isinstance(signal, Signal) and signal.snapshot is not None:
+        risk_score, _risk_label, _risk_reason = trap_risk_score(signal.snapshot, signal)
+
+    pa = kline_structure
+    pa_text = breakout_entry_kline_text(snapshot, pa)
+    pa_score = pa.score if pa is not None else int(max(
+        breakout_entry_source_float(snapshot, "kline_score", 0.0),
+        breakout_entry_source_float(snapshot, "kline_short_score", 0.0),
+        breakout_entry_source_float(snapshot, "kline_mid_score", 0.0),
+    ))
+    short_score = pa.short_score if pa is not None else int(breakout_entry_source_float(snapshot, "kline_short_score", 0.0))
+    mid_score = pa.mid_score if pa is not None else int(breakout_entry_source_float(snapshot, "kline_mid_score", 0.0))
+
+    conditions: list[str] = []
+    if short_score >= 7:
+        conditions.append("短线K线转强")
+    if mid_score >= 6:
+        conditions.append("中线结构配合")
+    if flow_15m > 0:
+        conditions.append("15m资金仍为正")
+    if flow_1h > 0:
+        conditions.append("1h资金仍为正")
+    if taker_ratio > 1.05:
+        conditions.append("主动买盘占优")
+    if oi_change > 0 or confirm_oi > 0:
+        conditions.append("OI仍在增加")
+    if confirm_price > 0:
+        conditions.append("确认价继续抬高")
+
+    near_pressure = (
+        (price_position is not None and price_position >= 80)
+        or (high > 0 and price > 0 and price >= high * 0.985)
+        or text_has_any(pa_text, ("压力", "临近压力位", "追高风险", "长上影", "4h箱体未突破", "1d压力"))
+    )
+    surged = price_change >= 5 or (price_position is not None and price_position >= 88)
+    confirm_surge = confirm_price >= 2
+    funds_or_oi_not_sync = (flow_15m <= 0 and flow_1h <= 0) or (oi_change <= 0 and confirm_oi <= 0)
+    funding_hot = funding is not None and funding >= 0.08
+    basis_premium = (basis_pct is not None and basis_pct >= 0.15) or basis_label in PREMIUM_BASIS_STATES
+    leading_risk = breakout_entry_leading_risk(snapshot, signal)
+    external_weak = breakout_entry_external_weak(snapshot, signal)
+    high_risk_reasons: list[str] = []
+    if near_pressure:
+        high_risk_reasons.append("临近压力/长上影风险")
+    if (surged or confirm_surge) and funds_or_oi_not_sync:
+        high_risk_reasons.append("短线已拉升但资金/OI未同步")
+    if funding_hot:
+        high_risk_reasons.append("Funding偏热")
+    if basis_premium:
+        high_risk_reasons.append("基差明显溢价")
+    if risk_score >= 5:
+        high_risk_reasons.append("风险分偏高")
+    if leading_risk:
+        high_risk_reasons.append("领先信号偏风险")
+    if external_weak:
+        high_risk_reasons.append("外部/现货确认偏弱")
+    high_risk = bool(high_risk_reasons)
+    track_waiting = short_score >= 7 and flow_15m > 0 and risk_score <= 4 and not high_risk
+    pullback = confirm_price < 0 or (price_position is not None and 45 <= price_position <= 78 and price_change > 0)
+    oi_not_collapsed = oi_change > -8 and confirm_oi > -5
+    flow_or_buying_ok = flow_15m > 0 or (taker_ratio_raw is not None and taker_ratio > 1.05)
+    continuation = confirm_price > 0 and confirm_oi > 0 and (taker_ratio_raw is None or taker_ratio > 1.1) and (flow_15m > 0 or flow_1h > 0)
+    recent_high_break = high > 0 and price > 0 and price >= high * 0.995
+    breakout_confirmed = recent_high_break and (oi_change > 0 or confirm_oi > 0) and pa_score >= 7 and risk_score <= 4
+    invalidated = (
+        (low > 0 and price > 0 and price <= low * 1.01)
+        or (oi_change <= -8 and flow_15m < 0 and flow_1h < 0)
+        or (taker_ratio_raw is not None and taker_ratio < 0.9)
+        or text_has_any(pa_text, ("顶部", "长上影", "放量滞涨", "跌破结构", "跌破近20根低点"))
+    )
+
+    invalidation_price = None
+    trigger_price = None
+    if price > 0:
+        invalidation_price = low if low > 0 else price * 0.97
+        trigger_price = high if high > 0 else price * 1.02
+
+    if invalidated:
+        return BreakoutEntryConfirmation(
+            "failed_invalidated",
+            2,
+            "爆发观察失效，资金或K线转弱，先移出观察。",
+            list(dict.fromkeys(conditions + ["资金/K线转弱"])),
+            invalidation_price,
+            trigger_price,
+        )
+    if breakout_confirmed:
+        return BreakoutEntryConfirmation(
+            "breakout_confirmed",
+            9,
+            "价格接近或突破近期高点，OI和K线同步确认，但仍不追高。",
+            list(dict.fromkeys(conditions + ["突破近期高点", "风险分数可控"])),
+            invalidation_price,
+            trigger_price,
+        )
+    if continuation:
+        return BreakoutEntryConfirmation(
+            "volume_continuation",
+            8,
+            "价格和OI继续抬高，主动买盘增强，接近确认。",
+            list(dict.fromkeys(conditions + ["放量延续"])),
+            invalidation_price,
+            trigger_price,
+        )
+    if pullback and oi_not_collapsed and flow_or_buying_ok:
+        return BreakoutEntryConfirmation(
+            "pullback_holding",
+            7,
+            "回踩后资金和OI未明显坍塌，继续观察是否放量延续。",
+            list(dict.fromkeys(conditions + ["回踩未破关键承接"])),
+            invalidation_price,
+            trigger_price,
+        )
+    if high_risk:
+        return BreakoutEntryConfirmation(
+            "waiting_pullback_high_risk",
+            5,
+            "短线有爆发苗头，但高位/外部/衍生品风险未释放，只观察等待深回踩。",
+            list(dict.fromkeys(conditions + high_risk_reasons)),
+            invalidation_price,
+            trigger_price,
+        )
+    if track_waiting or conditions:
+        return BreakoutEntryConfirmation(
+            "waiting_pullback_track",
+            4,
+            "短线K线和资金有转强迹象，风险暂可控，等回踩不破再考虑。",
+            list(dict.fromkeys(conditions + (["可继续跟踪"] if track_waiting else []))),
+            invalidation_price,
+            trigger_price,
+        )
+    return BreakoutEntryConfirmation("unknown", 0, "数据不足，暂时只能观察。", ["确认条件不足"], invalidation_price, trigger_price)
+
+
+def breakout_entry_confirmation_field(entry: BreakoutEntryConfirmation) -> tuple[str, str, bool]:
+    label = BREAKOUT_ENTRY_STATE_LABELS.get(entry.state, "数据不足")
+    lines = [
+        f"状态：{label}",
+        f"评分：{entry.score}/10",
+        f"说明：{entry.summary}",
+        f"操作：{BREAKOUT_ENTRY_STATE_ACTIONS.get(entry.state, '确认不足，先观察')}",
+    ]
+    if entry.trigger_price:
+        lines.append(f"触发价：{entry.trigger_price:.8g}")
+    if entry.invalidation_price:
+        lines.append(f"失效价：{entry.invalidation_price:.8g}")
+    if entry.conditions:
+        lines.append("条件：" + "；".join(entry.conditions[:4]))
+    return "入场确认", discord_field_value("\n".join(lines)), False
+
+
+def breakout_entry_confirmation_short(entry: BreakoutEntryConfirmation) -> str:
+    mapping = {
+        "waiting_pullback": "等回踩",
+        "waiting_pullback_high_risk": "高位风险，等深回踩",
+        "waiting_pullback_track": "等回踩，可跟踪",
+        "pullback_holding": "回踩不破，继续观察",
+        "volume_continuation": "放量延续，接近确认",
+        "breakout_confirmed": "突破确认，等回踩确认风险",
+        "failed_invalidated": "失败失效，移出观察",
+        "unknown": "确认不足",
+    }
+    return mapping.get(entry.state, "确认不足")
+
+
+def breakout_entry_state_for_display(
+    snapshot: MarketSnapshot | dict[str, Any] | None,
+    price_action: MultiTimeframePriceAction | None,
+    signal: Signal | dict[str, Any] | None,
+    route_decision: RouteDecision | None,
+) -> str:
+    if not breakout_entry_confirmation_enabled(route_decision):
+        return ""
+    return breakout_entry_confirmation(snapshot, price_action, signal, route_decision).state
+
+
+def breakout_entry_is_high_risk_display(
+    snapshot: MarketSnapshot | dict[str, Any] | None,
+    price_action: MultiTimeframePriceAction | None,
+    signal: Signal | dict[str, Any] | None,
+    route_decision: RouteDecision | None,
+) -> bool:
+    return breakout_entry_state_for_display(snapshot, price_action, signal, route_decision) == "waiting_pullback_high_risk"
+
+
 def discord_full_price_action_fields(price_action: MultiTimeframePriceAction | None) -> list[tuple[str, str, bool]]:
     if price_action is None:
         price_action = MultiTimeframePriceAction(
@@ -8758,7 +9106,17 @@ def discord_signal_fields(
         action = conflict_summary if conflict_summary else "风险观察，不追多"
         action_reason = "Discord风险口径"
     if route_decision and route_decision.route == DISCORD_ROUTE_PRIORITY_OBSERVE:
-        if "chase_pullback_risk" in route_decision.route_tags:
+        entry_state = breakout_entry_state_for_display(snapshot, price_action, signal, route_decision)
+        if entry_state == "waiting_pullback_high_risk":
+            action = BREAKOUT_ENTRY_STATE_ACTIONS["waiting_pullback_high_risk"]
+            action_reason = "爆发观察高位风险降级展示"
+        elif entry_state == "waiting_pullback_track":
+            action = BREAKOUT_ENTRY_STATE_ACTIONS["waiting_pullback_track"]
+            action_reason = "爆发观察可跟踪等待回踩"
+        elif "conflict_downgrade" in route_decision.route_tags or "conflict_observe" in route_decision.route_tags:
+            action = DISCORD_REALTIME_CONFLICT_ACTION
+            action_reason = DISCORD_REALTIME_CONFLICT_REASON
+        elif "chase_pullback_risk" in route_decision.route_tags:
             action = "重点观察，等回踩确认，不追高"
             action_reason = "追涨回撤风险"
         else:
@@ -8766,6 +9124,13 @@ def discord_signal_fields(
             action_reason = "观察层高分组合"
     human_route_reason = humanize_route_reason(route_decision, signal, {"price_action": price_action})
     human_action = humanize_action(route_decision, signal, price_action, action, action_reason)
+    observe_conflict_explanation = discord_priority_observe_conflict_explanation(route_decision, snapshot, signal, price_action)
+    display_route_label = discord_route_display_label(route_decision)
+    if breakout_entry_is_high_risk_display(snapshot, price_action, signal, route_decision):
+        display_route_label = "观察 / 高位观察"
+    route_text = f"{display_route_label}\n原因：{human_route_reason}"
+    if observe_conflict_explanation:
+        route_text = f"{route_text}\n说明：{observe_conflict_explanation}"
     level_text = f"{priority} / 质量 {quality_score} / 把握 {conviction} {conviction_label}"
     if display_downgraded:
         level_text = f"{level_text}\n资金/结构未共振，观察为主"
@@ -8774,10 +9139,7 @@ def discord_signal_fields(
         ("等级/把握", discord_field_value(level_text), True),
         (
             "Discord路由",
-            discord_field_value(
-                f"{discord_route_display_label(route_decision)}"
-                f"\n原因：{human_route_reason}"
-            ),
+            discord_field_value(route_text),
             False,
         ),
         ("价格/OI", discord_price_oi_field_value(snapshot), False),
@@ -8790,6 +9152,9 @@ def discord_signal_fields(
         ("结论", discord_field_value(clean_discord_reason(conflict_summary)), False),
         ("操作建议", discord_field_value(human_action), False),
     ]
+    if breakout_entry_confirmation_enabled(route_decision):
+        entry = breakout_entry_confirmation(snapshot, price_action, signal, route_decision)
+        fields.insert(10, breakout_entry_confirmation_field(entry))
     return fields[:12]
 
 
@@ -8944,16 +9309,25 @@ def discord_alt_watch_embed_v2(
             if not discord_summary_is_conflict_override(conflict_summary, item.reason):
                 conclusion = "等回踩，观察"
         kline_line = alt_watch_price_action_line(price_action)
+        observe_explanation = (
+            f"\n说明：{DISCORD_PRIORITY_OBSERVE_CONFLICT_EXPLANATION}"
+            if item.route == DISCORD_ROUTE_PRIORITY_OBSERVE and text_has_any(
+                f"{item.reason} {conclusion} {flow_label} {kline_line}",
+                ("偏风险", "出货", "派发", "资金分歧", "外部确认偏弱", "现货/DEX/外部确认偏弱", "1w K线数据不足"),
+            )
+            else ""
+        )
         fields.append(
             (
                 f"🟡 山寨观察 {discord_symbol_pair(item.symbol)}",
                 discord_field_value(
                     f"{item.symbol} {signal_kind_label(item.kind)} | 把握{item.conviction_score} 质量{item.quality_score} | "
-                    f"领先{item.leading_score} 证据{item.evidence_score} 风险{item.trap_score} | 路由={discord_route_human_label(item.route)}\n"
+                    f"领先{item.leading_score} 证据{discord_compact_score_10_text(item.evidence_score)} 风险{item.trap_score} | 路由={discord_route_human_label(item.route)}\n"
                     f"价格 {format_percent_optional(item.price_change_percent)} | OI {format_percent_optional(item.oi_change_percent)} | 费率 {funding_text} | 基差 {basis_text}\n"
                     f"资金 15m {flow_15m} / 1h {flow_1h} / 4h {flow_4h} | 短{short_flow}/中{mid_flow}/长{long_flow} | {humanize_flow_label(flow_label)}\n"
                     f"{kline_line}\n"
                     f"结论：{clean_discord_reason(conclusion)}"
+                    f"{observe_explanation}"
                 ),
                 False,
             )
@@ -9220,11 +9594,217 @@ def discord_summary_embed_v2(title: str, message: str, channel_key: str = "summa
     )
 
 
+def discord_candidate_kind_text(kind: str | None, route: str) -> str:
+    normalized = topq_kind_normalized(kind)
+    if normalized == "discovery":
+        return "启动观察" if route == DISCORD_ROUTE_PRIORITY_OBSERVE else "启动发现"
+    if normalized == "hot_breakout":
+        return "突破观察" if route != DISCORD_ROUTE_REALTIME else "突破信号"
+    if normalized == "bottom_reversal":
+        return "底部反转观察" if route == DISCORD_ROUTE_PRIORITY_OBSERVE else "底部反转"
+    if normalized == "main_momentum_watch":
+        return "主流异动观察"
+    if normalized == "main_trend_watch":
+        return "主流趋势观察"
+    if normalized in DISCORD_RISK_KINDS or topq_is_risk_candidate(normalized):
+        return signal_kind_label(normalized).replace("雷达", "观察")
+    return signal_kind_label(normalized)
+
+
+def discord_candidate_is_risk_kind(kind: str | None) -> bool:
+    normalized = topq_kind_normalized(kind)
+    return normalized in DISCORD_RISK_KINDS or topq_is_risk_candidate(normalized)
+
+
+def discord_candidate_leading_text(row: dict[str, str]) -> str:
+    score = parse_float(row.get("leading_score")) or 0
+    direction = str(row.get("leading_direction") or "").strip().lower()
+    label = str(row.get("leading_label") or "")
+    if direction in {"long", "bullish", "看多"} and score >= 6:
+        return "领先信号偏多"
+    if direction in {"bear", "bearish", "risk", "short", "看空", "看空/风险"} or text_has_any(label, ("偏风险", "出货", "派发")):
+        return "领先信号偏风险"
+    return "领先信号分歧"
+
+
+def discord_candidate_flow_text(flow_label: str | None) -> str:
+    mapping = {
+        "多周期共振流入": "多周期资金回流",
+        "短强中弱": "短线强，中线没跟上",
+        "资金分歧": "资金方向分歧",
+        "中长线派发": "中长线资金流出",
+        "中长线吸筹": "中长线有吸筹",
+        "短弱中强": "短线弱，中线仍有支撑",
+    }
+    return mapping.get(str(flow_label or "").strip(), humanize_flow_label(flow_label))
+
+
+def discord_candidate_kline_text(price_action: MultiTimeframePriceAction | None) -> str:
+    if price_action is None or price_action.label == "K线数据不足":
+        return "K线确认不足"
+    text = " ".join([price_action.label, price_action.recommendation, *price_action.items, *price_action.risk_items, *price_action.patterns])
+    if text_has_any(text, ("接近压力区", "压力位附近", "追高风险", "日线压力", "周线压力")):
+        return "临近压力位"
+    if text_has_any(text, ("4h箱体未突破", "4h 箱体未突破")):
+        return "4h箱体未突破"
+    if text_has_any(text, ("大周期未确认", "中长周期未确认")):
+        return "大周期未确认"
+    if price_action.score >= 7 or (price_action.short_score >= 7 and price_action.mid_score >= 6):
+        return "K线短中线转强"
+    if price_action.short_score >= 6:
+        return "短线转强"
+    return "K线确认不足"
+
+
+def discord_candidate_risk_text(row: dict[str, str], decision: RouteDecision, price_action: MultiTimeframePriceAction | None) -> str:
+    leading_text = discord_candidate_leading_text(row)
+    if leading_text == "领先信号偏风险":
+        return "领先信号偏风险"
+    external_text = " ".join(
+        str(row.get(key) or "")
+        for key in (
+            "spot_onchain_label",
+            "spot_onchain_reason",
+            "contract_spot_divergence_label",
+            "contract_spot_divergence_reason",
+            "spot_absorption_label",
+            "spot_absorption_reason",
+        )
+    )
+    if text_has_any(external_text, DISCORD_WEAK_EXTERNAL_CONFIRMATION_KEYWORDS):
+        return "现货/外部确认偏弱"
+    kline_text = discord_candidate_kline_text(price_action)
+    if kline_text in {"临近压力位", "4h箱体未突破", "大周期未确认", "K线确认不足"}:
+        return kline_text
+    flow_text = discord_candidate_flow_text(row.get("flow_trend_label"))
+    if flow_text in {"资金方向分歧", "短线强，中线没跟上", "中长线资金流出"}:
+        return flow_text
+    if decision.route == DISCORD_ROUTE_DIGEST:
+        return "确认不足"
+    return "等待确认"
+
+
+def discord_candidate_action_text(decision: RouteDecision, risk_text: str, kline_text: str) -> str:
+    if decision.route == DISCORD_ROUTE_PRIORITY_OBSERVE:
+        if risk_text == "现货/外部确认偏弱":
+            return "等现货/外部确认，不追高"
+        if kline_text in {"4h箱体未突破", "大周期未确认", "K线确认不足"}:
+            return "等放量延续，不追高"
+        return "等回踩不破，不追高"
+    if decision.route == DISCORD_ROUTE_REALTIME:
+        return "按计划跟踪，回踩不破再加确认"
+    if decision.route == DISCORD_ROUTE_RISK_REALTIME:
+        return "风险观察，等跌破确认"
+    if decision.route == DISCORD_ROUTE_DIGEST:
+        return "静默观察，不追高"
+    if kline_text in {"4h箱体未突破", "大周期未确认", "K线确认不足"}:
+        return "等放量延续，不追高"
+    return "等回踩不破，不追高"
+
+
+def discord_candidate_watch_reason(row: dict[str, str], decision: RouteDecision, price_action: MultiTimeframePriceAction | None) -> str:
+    risk_kind = discord_candidate_is_risk_kind(row.get("kind"))
+    high_score_unfocused = (
+        (parse_float(row.get("conviction_score")) or 0) >= 90
+        and decision.route in {DISCORD_ROUTE_OBSERVE, DISCORD_ROUTE_DIGEST}
+    )
+    high_score_note = " 分数高，但确认不足，未进重点。" if high_score_unfocused else ""
+    if risk_kind and decision.route == DISCORD_ROUTE_DIGEST:
+        return ("风险苗头出现，但确认不足，先放入静默观察。" + high_score_note).strip()
+    if risk_kind and decision.route == DISCORD_ROUTE_OBSERVE:
+        return ("风险信号出现，但资金/现货仍有支撑，等待跌破确认。" + high_score_note).strip()
+    if risk_kind:
+        return "风险信号出现，等待跌破确认。"
+    if decision.route == DISCORD_ROUTE_DIGEST:
+        return ("有异动苗头，但确认不足，先放入静默观察。" + high_score_note).strip()
+    flow_text = discord_candidate_flow_text(row.get("flow_trend_label"))
+    leading_text = discord_candidate_leading_text(row)
+    kline_text = discord_candidate_kline_text(price_action)
+    kind = topq_kind_normalized(row.get("kind"))
+    if kind == "bottom_reversal":
+        base = "下跌后有短线承接"
+    elif kind in {"main_momentum_watch", "main_trend_watch"}:
+        base = "主流资产有异动"
+    elif kline_text in {"K线短中线转强", "短线转强"}:
+        base = "短线放量转强"
+    else:
+        base = "短线有异动苗头"
+    if decision.route == DISCORD_ROUTE_PRIORITY_OBSERVE:
+        return f"{base}，{flow_text}，但{leading_text.replace('领先信号', '领先信号仍')}。"
+    if decision.route == DISCORD_ROUTE_RISK_REALTIME:
+        return f"{base}，但风险线索升高，需要先看确认。"
+    return (f"{base}，{flow_text}。" + high_score_note).strip()
+
+
+def discord_candidate_brief_lines(
+    row: dict[str, str],
+    decision: RouteDecision,
+    price_action: MultiTimeframePriceAction | None,
+) -> list[str]:
+    symbol = display_usdt_symbol(row.get("symbol"))
+    kind_text = discord_candidate_kind_text(row.get("kind"), decision.route)
+    conviction = format_csv_compact_number(row.get("conviction_score"), signed=False)
+    quality = format_csv_compact_number(row.get("signal_quality_score"), signed=False)
+    entry = breakout_entry_confirmation(row, price_action, row, decision) if breakout_entry_confirmation_enabled(decision) else None
+    if entry and entry.state == "waiting_pullback_high_risk":
+        icon = "👀"
+    else:
+        icon = "🔴" if decision.route == DISCORD_ROUTE_RISK_REALTIME else "🟢" if decision.route == DISCORD_ROUTE_REALTIME else "🟡"
+    why = discord_candidate_watch_reason(row, decision, price_action)
+    risk = discord_candidate_risk_text(row, decision, price_action)
+    kline = discord_candidate_kline_text(price_action)
+    flow = discord_candidate_flow_text(row.get("flow_trend_label"))
+    entry_text = ""
+    if entry is not None:
+        entry_text = f"｜入场: {breakout_entry_confirmation_short(entry)}"
+    if entry is not None:
+        action = BREAKOUT_ENTRY_STATE_ACTIONS.get(entry.state, "等回踩不破或放量延续确认，不追高")
+    else:
+        action = "等跌破确认，不追空" if discord_candidate_is_risk_kind(row.get("kind")) else discord_candidate_action_text(decision, risk, kline)
+    return [
+        f"{icon} {symbol} {kind_text}｜把握{conviction}｜质量{quality}",
+        f"{why} 主要风险：{risk}。",
+        f"K线: {kline}｜资金: {flow}{entry_text}｜操作: {action}",
+    ]
+
+
+def discord_topq_candidate_fields(message: str, chunk_size: int = 950) -> list[tuple[str, str, bool]]:
+    lines = [line.strip() for line in str(message or "").splitlines() if line.strip()]
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith(("🟢 ", "🟡 ", "🔴 ")) and "｜把握" in line:
+            block_lines = [line]
+            if index + 1 < len(lines):
+                block_lines.append(lines[index + 1])
+            if index + 2 < len(lines):
+                block_lines.append(lines[index + 2])
+            blocks.append("\n".join(block_lines))
+            index += 3
+            continue
+        blocks.append(line)
+        index += 1
+
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        candidate = f"{current}\n{block}".strip() if current else block
+        if len(candidate) > chunk_size and current:
+            chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return [
+        ("候选列表" if index == 1 else f"第{index}页", chunk, False)
+        for index, chunk in enumerate(chunks[:6], start=1)
+    ]
+
+
 def discord_topq_embed_v2(message: str, channel_key: str = "digest") -> DiscordOutboundMessage:
-    fields = discord_chunk_fields(message, "候选")
-    kline_lines = [line for line in str(message or "").splitlines() if "K线" in line][:6]
-    kline_text = "\n".join(kline_lines) if kline_lines else "候选已接入多周期K线结构确认；K线弱或大周期未确认时只显示观察。"
-    fields.append(("K线结构", truncate_text(kline_text, 900), False))
+    fields = discord_topq_candidate_fields(message)
     return DiscordOutboundMessage(
         channel_key=channel_key,
         title="把握候选TOP10",
@@ -12222,6 +12802,45 @@ MAIN_MOMENTUM_DOWNGRADE_FLOW_KEYWORDS = ("资金分歧", "短强中弱", "短弱
 DISCORD_BULLISH_DOWNGRADE_TEXT = "短线信号较强，但中长周期未确认，等待回踩/放量确认，不追高"
 DISCORD_BULLISH_DOWNGRADE_NOTE = "展示降级：资金分歧，观察为主"
 DISCORD_BULLISH_DOWNGRADE_EVIDENCE_KEYWORDS = ("高位拥挤", "注意出货", "不宜追", "谨慎追")
+DISCORD_REALTIME_CONFLICT_REASON = "资金和短线承接有迹象，但领先/外部/K线确认冲突，先观察"
+DISCORD_REALTIME_CONFLICT_ACTION = "重点观察，等回踩不破或现货确认，不追高"
+DISCORD_PRIORITY_OBSERVE_CONFLICT_EXPLANATION = "短线承接有迹象，但领先/外部确认仍有分歧，先观察，不追高。"
+DISCORD_REALTIME_CONFLICT_KEYWORDS = (
+    "建议观察",
+    "等确认",
+    "等待确认",
+    "观望",
+    "不急追",
+    "不急追单",
+    "不追高",
+    "等回踩",
+    "资金分歧",
+    "风险释放",
+    "领先信号偏风险",
+    "高位出货",
+    "现货/DEX/外部确认偏弱",
+)
+DISCORD_KLINE_CONFIRMATION_CONFLICT_KEYWORDS = (
+    "4h结构还没确认",
+    "4h箱体未突破",
+    "4h 尚未有效确认",
+    "4h 尚未确认",
+    "箱体未突破",
+    "大周期未确认",
+)
+DISCORD_WEAK_EXTERNAL_CONFIRMATION_KEYWORDS = (
+    "现货/DEX/外部确认偏弱",
+    "外部确认偏弱",
+    "现货/链上确认偏弱",
+    "现货确认偏弱",
+    "现货未跟",
+    "现货出货",
+    "链上出货",
+    "高位现货未确认",
+    "无标准现货",
+    "无方向",
+    "偏弱",
+)
 DISCORD_RISK_KINDS = {"top_exhaustion", "top_risk", "distribution", "main_risk_watch"}
 DISCORD_BULLISH_KINDS = {"discovery", "hot_breakout", "bottom_reversal", "main_momentum_watch", "main_trend_watch"}
 DISCORD_BEARISH_PRICE_ACTION_PATTERNS = ("长上影", "阴包阳", "放量滞涨", "日线压力", "周线压力", "跌破结构", "跌破近20根低点")
@@ -12280,6 +12899,8 @@ def discord_route_metrics(
                 "priority": "-",
                 "quality": 0,
                 "leading": 0,
+                "leading_direction": "",
+                "leading_label": "",
                 "evidence": 0,
                 "evidence_direction": "",
                 "evidence_summary": signal.message,
@@ -12294,6 +12915,10 @@ def discord_route_metrics(
                 "confirm_price_change_percent": 0,
                 "confirm_oi_change_percent": 0,
                 "flow_label": "",
+                "spot_onchain_label": "",
+                "contract_spot_divergence_label": "",
+                "spot_absorption_label": "",
+                "external_confirmation_text": "",
                 "price_action": price_action,
                 "kline_label": "",
                 "kline_text": "",
@@ -12308,10 +12933,28 @@ def discord_route_metrics(
         entry_score, entry_label, _entry_reason = entry_timing_score(snapshot, signal)
         trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
         _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+        spot_score, spot_label, spot_reason = spot_onchain_score(snapshot, signal)
+        div_label, div_score, div_reason = contract_spot_divergence(snapshot, signal)
+        absorption_label, absorption_score, absorption_reason = spot_absorption_state(snapshot, signal)
         kline_label = price_action.label if price_action else ""
         kline_text = ""
         if price_action:
             kline_text = " ".join([price_action.label, price_action.recommendation, *price_action.items, *price_action.risk_items, *price_action.patterns])
+        external_confirmation_text = " ".join(
+            str(part or "")
+            for part in (
+                spot_label,
+                spot_score,
+                spot_reason,
+                div_label,
+                div_score,
+                div_reason,
+                absorption_label,
+                absorption_score,
+                absorption_reason,
+                cached_spot_alpha_confirmation(snapshot.symbol),
+            )
+        )
         return {
             "symbol": signal.symbol,
             "kind": topq_kind_normalized(signal.kind),
@@ -12320,6 +12963,7 @@ def discord_route_metrics(
             "quality": int(quality or 0),
             "leading": int(leading.leading_score or 0),
             "leading_direction": leading.leading_direction,
+            "leading_label": leading.leading_label,
             "evidence": int(ev_score or 0),
             "evidence_direction": str(ev_direction or ""),
             "evidence_summary": str(ev_summary or ""),
@@ -12334,6 +12978,10 @@ def discord_route_metrics(
             "confirm_price_change_percent": float(snapshot.confirm_price_change_percent or 0),
             "confirm_oi_change_percent": float(snapshot.confirm_oi_change_percent or 0),
             "flow_label": str(flow_label or ""),
+            "spot_onchain_label": str(spot_label or ""),
+            "contract_spot_divergence_label": str(div_label or ""),
+            "spot_absorption_label": str(absorption_label or ""),
+            "external_confirmation_text": external_confirmation_text,
             "price_action": price_action,
             "kline_label": kline_label,
             "kline_text": kline_text,
@@ -12357,6 +13005,7 @@ def discord_route_metrics(
         "quality": int(discord_route_float(signal, "signal_quality_score", 0)),
         "leading": int(discord_route_float(signal, "leading_score", 0)),
         "leading_direction": str(signal.get("leading_direction") or ""),
+        "leading_label": str(signal.get("leading_label") or ""),
         "evidence": int(discord_route_float(signal, "evidence_score", 0)),
         "evidence_direction": str(signal.get("evidence_direction") or ""),
         "evidence_summary": str(signal.get("evidence_summary") or ""),
@@ -12371,6 +13020,20 @@ def discord_route_metrics(
         "confirm_price_change_percent": discord_route_float(signal, "confirm_price_change_percent", 0),
         "confirm_oi_change_percent": discord_route_float(signal, "confirm_oi_change_percent", 0),
         "flow_label": str(signal.get("flow_trend_label") or ""),
+        "spot_onchain_label": str(signal.get("spot_onchain_label") or ""),
+        "contract_spot_divergence_label": str(signal.get("contract_spot_divergence_label") or ""),
+        "spot_absorption_label": str(signal.get("spot_absorption_label") or ""),
+        "external_confirmation_text": " ".join(
+            str(signal.get(key) or "")
+            for key in (
+                "spot_onchain_label",
+                "spot_onchain_reason",
+                "contract_spot_divergence_label",
+                "contract_spot_divergence_reason",
+                "spot_absorption_label",
+                "spot_absorption_reason",
+            )
+        ),
         "price_action": pa,
         "kline_label": kline_label or (pa.label if pa is not None else ""),
         "kline_text": kline_text,
@@ -12449,6 +13112,188 @@ def discord_priority_observe_chase_risk(data: dict[str, Any]) -> bool:
         or text_has_any(price_action_text, ("追高风险", "箱体未突破", "大周期未确认"))
         or (price_change >= 5 and not text_has_any(price_action_text, ("回踩", "承接", "长下影", "支撑")))
     )
+
+
+def discord_weak_external_confirmation(data: dict[str, Any]) -> bool:
+    external_text = " ".join(
+        str(data.get(key) or "")
+        for key in (
+            "spot_onchain_label",
+            "contract_spot_divergence_label",
+            "spot_absorption_label",
+            "external_confirmation_text",
+        )
+    )
+    return text_has_any(external_text, DISCORD_WEAK_EXTERNAL_CONFIRMATION_KEYWORDS)
+
+
+def discord_leading_is_risk(data: dict[str, Any]) -> bool:
+    direction = str(data.get("leading_direction") or "").strip().lower()
+    label = str(data.get("leading_label") or "")
+    return (
+        direction in {"bear", "bearish", "risk", "short", "看空", "看空/风险"}
+        or text_has_any(label, ("偏风险", "高位出货", "出货", "派发", "资金分歧", "风险"))
+    )
+
+
+def discord_realtime_conflict_flags(
+    data: dict[str, Any],
+    route: str,
+    action: str | None = None,
+    conclusion: str | None = None,
+) -> set[str]:
+    if route == DISCORD_ROUTE_RISK_REALTIME:
+        return set()
+    flags: set[str] = set()
+    evidence_summary = str(data.get("evidence_summary") or "")
+    leading_label = str(data.get("leading_label") or "")
+    combined = " ".join(
+        str(part or "")
+        for part in (
+            action,
+            conclusion,
+            evidence_summary,
+            leading_label,
+            data.get("external_confirmation_text"),
+            data.get("kline_text"),
+            data.get("kline_label"),
+        )
+    )
+    if text_has_any(combined, DISCORD_REALTIME_CONFLICT_KEYWORDS):
+        flags.add("conflict")
+    if text_has_any(combined, DISCORD_KLINE_CONFIRMATION_CONFLICT_KEYWORDS):
+        flags.add("kline_conflict")
+    if discord_leading_is_risk(data):
+        flags.add("leading_risk")
+    if discord_weak_external_confirmation(data):
+        flags.add("weak_external")
+    return flags
+
+
+def discord_bullish_realtime_hard_blocked(data: dict[str, Any], action: str | None = None) -> set[str]:
+    flags: set[str] = set()
+    leading = int(data.get("leading") or 0)
+    evidence_summary = str(data.get("evidence_summary") or "")
+    action_text = str(action or "")
+    if discord_leading_is_risk(data):
+        flags.add("leading_risk")
+    kline_text = f"{data.get('kline_text') or ''} {data.get('kline_label') or ''}"
+    strong_confirmed_breakout = (
+        leading < 4
+        and int(data.get("evidence") or 0) >= 8
+        and text_has_any(kline_text, ("强确认突破", "放量突破", "短中线突破延续"))
+        and not text_has_any(kline_text, DISCORD_KLINE_CONFIRMATION_CONFLICT_KEYWORDS)
+        and not discord_weak_external_confirmation(data)
+    )
+    if leading < 4 and not strong_confirmed_breakout:
+        flags.add("leading_low")
+    if text_has_any(evidence_summary, ("资金分歧", "观望", "观察", "等确认", "不急追单", "不追高", "等回踩", "风险释放")):
+        flags.add("conflict")
+    if text_has_any(action_text, ("观察", "等确认", "等待确认", "观望", "不急追单", "不追高", "等回踩", "风险释放")):
+        flags.add("conflict")
+    if text_has_any(kline_text, DISCORD_KLINE_CONFIRMATION_CONFLICT_KEYWORDS):
+        flags.add("kline_conflict")
+    if discord_weak_external_confirmation(data):
+        flags.add("weak_external")
+    return flags
+
+
+def discord_route_has_observe_conflict(route_decision: RouteDecision | None) -> bool:
+    if route_decision is None or route_decision.route != DISCORD_ROUTE_PRIORITY_OBSERVE:
+        return False
+    tags = set(route_decision.route_tags)
+    return bool(
+        tags
+        & {
+            "conflict_downgrade",
+            "conflict_observe",
+            "leading_risk_downgrade",
+            "weak_external_confirmation_downgrade",
+            "leading_low_downgrade",
+        }
+    )
+
+
+def discord_priority_observe_conflict_explanation(
+    route_decision: RouteDecision | None,
+    snapshot: MarketSnapshot | None = None,
+    signal: Signal | None = None,
+    price_action: MultiTimeframePriceAction | None = None,
+) -> str:
+    if route_decision is None or route_decision.route != DISCORD_ROUTE_PRIORITY_OBSERVE:
+        return ""
+    if discord_route_has_observe_conflict(route_decision):
+        return DISCORD_PRIORITY_OBSERVE_CONFLICT_EXPLANATION
+    if snapshot is None:
+        return ""
+    leading = leading_signal_score(snapshot, signal)
+    leading_conflict = (
+        leading.leading_direction not in {"long", "bullish", "看多"}
+        or text_has_any(leading.leading_label, ("偏风险", "出货", "派发", "资金分歧", "方向不明确"))
+    )
+    data = discord_route_metrics(signal, snapshot, price_action) if signal is not None else {}
+    external_conflict = discord_weak_external_confirmation(data) if data else False
+    text = ""
+    if price_action is not None:
+        text = " ".join([price_action.label, price_action.recommendation, *price_action.items, *price_action.risk_items, *price_action.patterns])
+    kline_conflict = price_action is not None and price_action.score >= 6 and text_has_any(text, ("1w K线数据不足", "1w 数据不足"))
+    waiting_squeeze = signal is not None and text_has_any(f"{signal.title} {signal.message}", ("等待逼空确认",))
+    if leading_conflict or external_conflict or kline_conflict or waiting_squeeze:
+        return DISCORD_PRIORITY_OBSERVE_CONFLICT_EXPLANATION
+    return ""
+
+
+def apply_discord_route_consistency_guard(
+    route: str,
+    data: dict[str, Any],
+    bullish_kind: bool,
+    risk_kind: bool,
+    reasons: list[str],
+    tags: list[str],
+    action: str | None = None,
+    conclusion: str | None = None,
+) -> str:
+    if route == DISCORD_ROUTE_RISK_REALTIME:
+        if risk_kind:
+            return route
+        route = DISCORD_ROUTE_PRIORITY_OBSERVE
+        reasons.append(DISCORD_REALTIME_CONFLICT_REASON)
+        tags.append("conflict_downgrade")
+        return route
+    if route == DISCORD_ROUTE_REALTIME:
+        conflict_flags = discord_realtime_conflict_flags(data, route, action, conclusion)
+        if bullish_kind:
+            conflict_flags.update(discord_bullish_realtime_hard_blocked(data, action))
+        if conflict_flags:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append(DISCORD_REALTIME_CONFLICT_REASON)
+            tags.append("conflict_downgrade")
+            if "leading_risk" in conflict_flags:
+                tags.append("leading_risk_downgrade")
+            if "weak_external" in conflict_flags:
+                tags.append("weak_external_confirmation_downgrade")
+            if "leading_low" in conflict_flags:
+                tags.append("leading_low_downgrade")
+            if "kline_conflict" in conflict_flags:
+                tags.append("kline_conflict_downgrade")
+    elif route == DISCORD_ROUTE_PRIORITY_OBSERVE and bullish_kind:
+        conflict_flags = discord_realtime_conflict_flags(data, route, action, conclusion)
+        conflict_flags.update(discord_bullish_realtime_hard_blocked(data, action))
+        strong_funds_or_kline = (
+            int(data.get("long_flow") or 0) >= 7
+            or discord_price_action_score_confirmed(data.get("price_action"))
+            or int(data.get("kline_mid_score") or 0) >= 6
+        )
+        if conflict_flags and strong_funds_or_kline and (int(data.get("conviction") or 0) >= 65 or int(data.get("evidence") or 0) >= 8):
+            reasons.append(DISCORD_REALTIME_CONFLICT_REASON)
+            tags.append("conflict_observe")
+            if "leading_risk" in conflict_flags:
+                tags.append("leading_risk_downgrade")
+            if "weak_external" in conflict_flags:
+                tags.append("weak_external_confirmation_downgrade")
+            if "kline_conflict" in conflict_flags:
+                tags.append("kline_conflict_downgrade")
+    return route
 
 
 def discord_breakout_watch_candidate(data: dict[str, Any]) -> bool:
@@ -12720,6 +13565,8 @@ def humanize_route_reason(
     if "duplicate" in tags:
         return "同类信号短时间重复，合并观察"
     if route == DISCORD_ROUTE_PRIORITY_OBSERVE:
+        if "conflict_downgrade" in tags or "conflict_observe" in tags:
+            return DISCORD_REALTIME_CONFLICT_REASON
         if "breakout_watch_fallback" in tags:
             return "历史字段不足，但K线和OI结构转强，观察爆发延续"
         if "breakout_watch" in tags:
@@ -12783,6 +13630,11 @@ def humanize_action(
     kind = topq_kind_normalized(signal.kind if signal else "")
     tags = set(route_decision.route_tags if route_decision else [])
     if route == DISCORD_ROUTE_PRIORITY_OBSERVE:
+        entry_state = breakout_entry_state_for_display(signal.snapshot if signal else None, price_action, signal, route_decision)
+        if entry_state in BREAKOUT_ENTRY_STATE_ACTIONS:
+            return BREAKOUT_ENTRY_STATE_ACTIONS[entry_state]
+        if "conflict_downgrade" in tags or "conflict_observe" in tags:
+            return DISCORD_REALTIME_CONFLICT_ACTION
         if "breakout_watch" in tags or "breakout_watch_fallback" in tags:
             return "爆发观察，等回踩不破或放量延续确认，不追高"
         if "chase_pullback_risk" in tags:
@@ -12996,6 +13848,38 @@ def discord_route_decision(
     if route == DISCORD_ROUTE_PRIORITY_OBSERVE and discord_priority_observe_chase_risk(data):
         reasons.append("追涨回撤风险")
         tags.append("chase_pullback_risk")
+
+    final_action = ""
+    final_conclusion = evidence_summary
+    if isinstance(signal, Signal) and snapshot is not None:
+        direction = "风险/减仓" if is_risk_structure_kind(signal.kind) else signal_direction_label(signal.kind)
+        final_conclusion = discord_conflict_aware_summary(
+            signal.kind,
+            direction,
+            evidence_direction,
+            evidence,
+            evidence_summary,
+            str(data.get("leading_direction") or ""),
+            flow_label,
+            trap,
+            price_action,
+        )
+        final_action, _action_reason, _display_downgraded = discord_signal_action(
+            snapshot,
+            signal,
+            evidence_summary,
+            price_action,
+        )
+    route = apply_discord_route_consistency_guard(
+        route,
+        data,
+        bullish_kind,
+        risk_kind,
+        reasons,
+        tags,
+        final_action,
+        final_conclusion,
+    )
 
     score = int(conviction + evidence * 3 + leading * 2 + max(0, quality) * 0.25)
     if route == DISCORD_ROUTE_RISK_REALTIME and trap <= 6:
