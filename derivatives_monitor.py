@@ -10556,10 +10556,12 @@ def discord_signal_fields(
         return discord_conflict_observe_fields(signal, route_decision=route_decision)
     if snapshot is None:
         evidence_name = "风险证据" if is_risk_structure_kind(signal.kind) else "证据"
+        verdict = build_signal_verdict(signal, route_decision=route_decision)
         return [
             ("币种", signal.symbol, True),
             ("方向", direction, True),
             ("等级/把握", f"{priority} / 质量 {quality_score} / 信号 {signal.score}", True),
+            signal_verdict_display_field(verdict),
             (evidence_name, truncate_text(quality_reason or signal.message, 1024), False),
         ]
 
@@ -10571,6 +10573,18 @@ def discord_signal_fields(
     leading = leading_signal_score(snapshot, signal)
     _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
     trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+    verdict = signal_verdict_for_discord_signal(
+        signal,
+        snapshot,
+        price_action,
+        route_decision,
+        ev_score,
+        ev_direction,
+        ev_summary,
+        leading,
+        flow_label,
+        trap_score,
+    )
     conflict_summary = discord_conflict_aware_summary(
         signal.kind,
         direction,
@@ -10626,6 +10640,12 @@ def discord_signal_fields(
     if conservative_observe:
         human_route_reason = discord_conservative_observe_sanitize(human_route_reason)
         human_action = "重点观察，等回踩确认，不追高"
+    if verdict.final_direction == "看多" and verdict.confidence == "中":
+        human_action = signal_verdict_display_action(verdict)
+    elif verdict.final_direction == "看空风险" and verdict.confidence == "中":
+        human_action = signal_verdict_display_action(verdict)
+    elif verdict.final_direction == "多空分歧":
+        human_action = signal_verdict_display_action(verdict)
     observe_conflict_explanation = discord_priority_observe_conflict_explanation(route_decision, snapshot, signal, price_action)
     display_route_label = discord_route_display_label(route_decision)
     if breakout_entry_is_high_risk_display(snapshot, price_action, signal, route_decision):
@@ -10652,6 +10672,7 @@ def discord_signal_fields(
         ("证据", discord_evidence_field_value(snapshot, signal), False),
         ("风险提示", discord_risk_field_value(snapshot, signal, price_action, conservative_observe), False),
         ("K线结构", discord_price_action_field_value(price_action, conservative_observe), False),
+        signal_verdict_display_field(verdict),
         ("结论", discord_field_value(conclusion_text), False),
         ("操作建议", discord_field_value(human_action), False),
     ]
@@ -10663,7 +10684,7 @@ def discord_signal_fields(
             (name, discord_field_value(discord_conservative_observe_sanitize(value)), inline)
             for name, value, inline in fields
         ]
-    return fields[:12]
+    return fields[:13]
 
 
 def discord_signal_embed_v2(
@@ -12183,10 +12204,12 @@ def discord_candidate_brief_lines(
 ) -> list[str]:
     if discord_is_conflict_observe(decision):
         symbol = discord_symbol_pair(row.get("symbol"))
+        verdict = signal_verdict_for_candidate_row(row, decision, price_action)
         return [
             f"🟡 多空分歧观察 {symbol}｜把握{format_csv_compact_number(row.get('conviction_score'), signed=False)}｜质量{format_csv_compact_number(row.get('signal_quality_score'), signed=False)}",
             "短线资金和结构出现反复，多空证据冲突，等待方向确认。",
-            "方向: 观察 / 暂不站队｜操作: 暂不追多，也不追空。等待 15m/1h 方向重新一致。",
+            f"方向: 观察 / 暂不站队｜操作: {signal_verdict_display_action(verdict)}。",
+            f"SignalVerdict｜{signal_verdict_display_value(verdict).replace(chr(10), '｜')}",
         ]
     symbol = display_usdt_symbol(row.get("symbol"))
     kind_text = discord_candidate_kind_text(row.get("kind"), decision.route)
@@ -12213,10 +12236,18 @@ def discord_candidate_brief_lines(
         action = BREAKOUT_ENTRY_STATE_ACTIONS.get(entry.state, "等回踩不破或放量延续确认，不追高")
     else:
         action = "等跌破确认，不追空" if discord_candidate_is_risk_kind(row.get("kind")) else discord_candidate_action_text(decision, risk, kline)
+    verdict = signal_verdict_for_candidate_row(row, decision, price_action)
+    if (
+        (verdict.final_direction == "看多" and verdict.confidence == "中")
+        or (verdict.final_direction == "看空风险" and verdict.confidence == "中")
+        or verdict.final_direction == "多空分歧"
+    ):
+        action = signal_verdict_display_action(verdict)
     return [
         f"{icon} {symbol} {kind_text}｜把握{conviction}｜质量{quality}",
         discord_conservative_observe_sanitize(f"{why} 主要风险：{risk}。"),
         discord_conservative_observe_sanitize(f"K线: {kline}｜资金: {flow}{entry_text}｜操作: {action}"),
+        f"SignalVerdict｜{signal_verdict_display_value(verdict).replace(chr(10), '｜')}",
     ]
 
 
@@ -12232,8 +12263,10 @@ def discord_topq_candidate_fields(message: str, chunk_size: int = 950) -> list[t
                 block_lines.append(lines[index + 1])
             if index + 2 < len(lines):
                 block_lines.append(lines[index + 2])
+            if index + 3 < len(lines) and lines[index + 3].startswith("SignalVerdict｜"):
+                block_lines.append(lines[index + 3])
             blocks.append("\n".join(block_lines))
-            index += 3
+            index += len(block_lines)
             continue
         blocks.append(line)
         index += 1
@@ -16327,6 +16360,10 @@ def _signal_verdict_data(signal, snapshot=None, kline_structure=None, route_deci
             "leading_direction", "leading_label", "signal_quality_score",
             "conviction_score", "action_label", "conclusion", "flow_label",
             "flow_trend_label", "risk_score", "risk_items", "evidence_items",
+            "entry_timing_score", "entry_score", "trap_risk_score",
+            "spot_onchain_score", "spot_onchain_label",
+            "contract_spot_divergence_score", "contract_spot_divergence_label",
+            "major_flow_score", "major_flow_label",
         ):
             if hasattr(signal, key):
                 data[key] = getattr(signal, key)
@@ -16395,8 +16432,10 @@ def build_signal_verdict(signal, snapshot=None, kline_structure=None, route_deci
     evidence_score = _signal_verdict_num(data, "evidence_score", "ev", "evidence")
     leading_score = _signal_verdict_num(data, "leading_score", "lead", "leading")
     kline_score = _signal_verdict_num(data, "kline_score", "price_action_score", "pa_score")
-    raw_risk_score = _signal_verdict_num(data, "risk_score", "structure_risk_score", "trap_score")
+    raw_risk_score = _signal_verdict_num(data, "risk_score", "structure_risk_score", "trap_score", "trap_risk_score")
+    raw_entry_score = _signal_verdict_num(data, "entry_score", "entry_timing_score")
     conviction_score = _signal_verdict_num(data, "conviction_score", "conviction")
+    spot_onchain_score = _signal_verdict_num(data, "spot_onchain_score", "spot_score")
 
     risk_kind = any(term in kind_lower for term in (
         "risk", "short", "top_risk", "top_exhaustion", "distribution", "main_risk_watch"
@@ -16425,15 +16464,42 @@ def build_signal_verdict(signal, snapshot=None, kline_structure=None, route_deci
         "4h/12h资金流不支持", "OI扩张>10%但主动买卖比<1",
         "费率偏热", "合约溢价", "高位增仓"
     )
+    bullish_high_block_terms = (
+        "压力位", "大周期压力", "长上影", "短强中弱", "资金分歧",
+        "中线资金不支持", "长线资金不支持", "中长线不支持", "4h/12h资金流不支持"
+    )
 
     bullish_count = sum(1 for term in bullish_terms if term in all_text)
     risk_count = sum(1 for term in risk_terms if term in all_text)
 
-    spot_confirmed = ("现货/DEX/外部确认" in all_text or "现货承接" in all_text)
+    spot_label_text = _signal_verdict_text(data, "spot_onchain_label", "contract_spot_divergence_label", "major_flow_label")
+    spot_confirmed = (
+        "现货/DEX/外部确认" in all_text
+        or "现货/外部确认" in all_text
+        or "外部确认" in all_text
+        or "现货确认" in all_text
+        or "现货承接" in all_text
+        or spot_onchain_score >= 70
+        or "现货/链上确认强" in spot_label_text
+        or "现货强" in spot_label_text
+        or "主力偏多" in spot_label_text
+    )
     kline_confirmed = kline_score >= 7 or any(term in kline_text for term in (
-        "15m/1h 转强", "15m/1h K线转强", "突破近20根高点", "放量阳线", "连续收盘抬高"
+        "15m/1h 转强", "15m/1h K线转强", "突破近20根高点", "放量阳线", "连续收盘抬高",
+        "短中线突破延续"
+    ))
+    if not kline_confirmed:
+        kline_short_score = _signal_verdict_num(data, "kline_short_score")
+        kline_mid_score = _signal_verdict_num(data, "kline_mid_score")
+        kline_confirmed = kline_short_score >= 8 and kline_mid_score >= 6
+    kline_medium_confirmed = any(term in kline_text for term in (
+        "4h延续强", "短中线突破延续", "15m/1h 转强", "15m/1h K线转强", "突破近20根高点"
     ))
     flow_support = any(term in flow_label for term in ("多周期共振流入", "中长线吸筹", "短强中弱", "资金分歧"))
+    bullish_high_blocked = any(term in all_text for term in bullish_high_block_terms)
+    bullish_medium_blocked = any(term in all_text for term in (
+        "短线承压", "长上影", "压力位", "大周期压力", "明显压力"
+    ))
 
     long_score = 0
     long_score += min(25, int(evidence_score * 2.5))
@@ -16471,6 +16537,9 @@ def build_signal_verdict(signal, snapshot=None, kline_structure=None, route_deci
         entry_score += 30
     if spot_confirmed:
         entry_score += 20
+    if raw_entry_score:
+        normalized_entry_score = raw_entry_score * 10 if raw_entry_score <= 10 else raw_entry_score
+        entry_score += min(20, int(normalized_entry_score * 0.2))
     if evidence_score >= 7:
         entry_score += 20
     if leading_score >= 6:
@@ -16479,19 +16548,51 @@ def build_signal_verdict(signal, snapshot=None, kline_structure=None, route_deci
     entry_score = max(0, min(100, entry_score))
 
     # Deterministic final judgement.
-    if conflict_score >= 55 and risk_score < 75:
+    high_confidence_long = (
+        long_score >= 85
+        and entry_score >= 70
+        and risk_score <= 25
+        and conflict_score <= 30
+        and kline_confirmed
+        and spot_confirmed
+        and not bullish_high_blocked
+    )
+    bullish_candidate = (
+        long_score >= 78
+        and risk_score <= 35
+        and entry_score >= 60
+        and conflict_score <= 45
+        and kline_confirmed
+        and spot_confirmed
+        and not bullish_high_blocked
+    )
+    bullish_medium_candidate = (
+        long_score >= 70
+        and (evidence_score >= 10 or leading_score >= 6)
+        and risk_score <= 45
+        and conflict_score <= 55
+        and spot_confirmed
+        and kline_medium_confirmed
+        and not bullish_medium_blocked
+    )
+
+    if conflict_score > 55 and risk_score < 75:
         final_direction = "多空分歧"
     elif risk_score >= 65 and long_score < 65:
         final_direction = "看空风险"
-    elif long_score >= 72 and risk_score <= 45 and entry_score >= 50:
+    elif bullish_candidate:
+        final_direction = "看多"
+    elif bullish_medium_candidate:
         final_direction = "看多"
     elif risk_kind and risk_score >= 45 and long_score < 70:
         final_direction = "看空风险"
+    elif long_score >= 70 and risk_score >= 35 and conflict_score >= 35:
+        final_direction = "多空分歧"
     else:
         final_direction = "仅观察"
 
     if final_direction == "看多":
-        if entry_score >= 65 and risk_score <= 35:
+        if high_confidence_long and entry_score >= 65 and risk_score <= 35:
             entry_state = "可跟踪"
         else:
             entry_state = "等回踩确认"
@@ -16518,6 +16619,10 @@ def build_signal_verdict(signal, snapshot=None, kline_structure=None, route_deci
         confidence = "中"
     else:
         confidence = "低"
+    if final_direction == "看多" and not high_confidence_long and confidence == "高":
+        confidence = "中"
+    if final_direction in {"看空风险", "多空分歧"} and confidence == "高":
+        confidence = "中"
 
     primary_reasons: list[str] = []
     risk_reasons: list[str] = []
@@ -16552,8 +16657,8 @@ def build_signal_verdict(signal, snapshot=None, kline_structure=None, route_deci
         display_title = "高确定性看多" if confidence == "高" else "看多观察"
         action_text = "等回踩不破或放量延续确认，不追高" if entry_state != "可跟踪" else "可跟踪，仍需按止损执行"
     elif final_direction == "看空风险":
-        display_title = "风险预警" if confidence == "高" else "风险观察"
-        action_text = "等跌破短线结构确认，不盲目追空"
+        display_title = "风险提醒候选"
+        action_text = "等跌破确认，不追空"
     elif final_direction == "多空分歧":
         display_title = "多空分歧观察"
         action_text = "暂不站队，等待15m/1h方向重新一致"
@@ -16576,6 +16681,102 @@ def build_signal_verdict(signal, snapshot=None, kline_structure=None, route_deci
         action_text=action_text,
     )
 # --- end SignalVerdict phase 1 ---
+
+
+def signal_verdict_display_action(verdict: SignalVerdict) -> str:
+    if verdict.final_direction == "看多" and verdict.confidence == "中":
+        return "看多重点观察，等回踩确认，不追高"
+    if verdict.final_direction == "看空风险" and verdict.confidence == "中":
+        return "风险提醒候选，等跌破确认，不追空"
+    if verdict.final_direction == "多空分歧":
+        return "暂不站队，等待15m/1h方向重新一致"
+    return verdict.action_text
+
+
+def signal_verdict_display_value(verdict: SignalVerdict) -> str:
+    lines = [
+        f"裁判方向：{verdict.final_direction}",
+        f"确定性：{verdict.confidence}",
+        f"入场状态：{verdict.entry_state}",
+        f"裁判建议：{signal_verdict_display_action(verdict)}",
+        (
+            "分数："
+            f"Long {verdict.long_score} / Risk {verdict.risk_score} / "
+            f"Conflict {verdict.conflict_score} / Entry {verdict.entry_score}"
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def signal_verdict_display_field(verdict: SignalVerdict) -> tuple[str, str, bool]:
+    return ("SignalVerdict", discord_field_value(signal_verdict_display_value(verdict)), False)
+
+
+def signal_verdict_for_discord_signal(
+    signal: Signal,
+    snapshot: MarketSnapshot | None,
+    price_action: MultiTimeframePriceAction | None,
+    route_decision: RouteDecision | None,
+    ev_score: float,
+    ev_direction: str,
+    ev_summary: str,
+    leading: LeadingSignalScore,
+    flow_label: str,
+    trap_score: float,
+) -> SignalVerdict:
+    data = {
+        "symbol": signal.symbol,
+        "kind": signal.kind,
+        "evidence_score": ev_score,
+        "evidence_direction": ev_direction,
+        "evidence_summary": ev_summary,
+        "leading_score": leading.leading_score,
+        "leading_direction": leading.leading_direction,
+        "leading_label": leading.leading_label,
+        "flow_trend_label": flow_label,
+        "risk_score": trap_score,
+        "risk_text": signal.message,
+        "evidence_items": " ".join(str(item) for item in getattr(leading, "leading_items", []) or []),
+    }
+    if price_action is not None:
+        data.update(
+            {
+                "kline_score": price_action.score,
+                "kline_short_score": price_action.short_score,
+                "kline_mid_score": price_action.mid_score,
+                "kline_long_score": price_action.long_score,
+                "kline_text": " ".join(
+                    [
+                        price_action.label,
+                        price_action.recommendation,
+                        price_action.short_label,
+                        price_action.mid_label,
+                        price_action.long_label,
+                        *price_action.items,
+                        *price_action.risk_items,
+                        *price_action.patterns,
+                    ]
+                ),
+            }
+        )
+    return build_signal_verdict(data, snapshot=snapshot, kline_structure=price_action, route_decision=route_decision)
+
+
+def signal_verdict_for_candidate_row(
+    row: dict[str, Any],
+    decision: RouteDecision | None,
+    price_action: MultiTimeframePriceAction | None = None,
+) -> SignalVerdict:
+    verdict = build_signal_verdict(row, kline_structure=price_action, route_decision=decision)
+    if discord_is_conflict_observe(decision):
+        return replace(
+            verdict,
+            final_direction="多空分歧",
+            confidence="中" if verdict.confidence == "高" else verdict.confidence,
+            entry_state="暂不站队",
+            action_text="暂不站队，等待15m/1h方向重新一致",
+        )
+    return verdict
 
 def discord_route_decision(
     signal: Signal | dict[str, Any],
@@ -17351,9 +17552,18 @@ def discord_conflict_observe_fields(
     else:
         conclusion = "短线资金和结构出现反复，多空证据冲突，等待方向确认。"
         action = "暂不追多，也不追空。等待 15m/1h 方向重新一致。"
+    verdict = build_signal_verdict(signal, kline_structure=price_action, route_decision=route_decision)
+    verdict = replace(
+        verdict,
+        final_direction="多空分歧",
+        confidence="中" if verdict.confidence == "高" else verdict.confidence,
+        entry_state="暂不站队",
+        action_text="暂不站队，等待15m/1h方向重新一致",
+    )
     return [
         ("币种/方向", discord_field_value(f"{signal.symbol} / 观察 / 暂不站队"), True),
         ("Discord路由", discord_field_value("观察\n原因：多空证据冲突，等待方向确认"), False),
+        signal_verdict_display_field(verdict),
         ("结论", discord_field_value(conclusion), False),
         ("操作建议", discord_field_value(action), False),
         ("看多证据", discord_field_value("\n".join(f"- {item}" for item in long_items)), False),
