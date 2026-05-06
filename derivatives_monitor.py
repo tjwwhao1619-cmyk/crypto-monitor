@@ -8310,13 +8310,13 @@ class DerivativesMonitor:
             return "读取信号记录失败，请查看服务日志。"
 
         sections = [
-            ("🟢 实时重点", {DISCORD_ROUTE_REALTIME}),
-            ("🟡 重点观察", {DISCORD_ROUTE_PRIORITY_OBSERVE, DISCORD_ROUTE_CONFLICT_OBSERVE}),
-            ("🔴 风险观察", {DISCORD_ROUTE_RISK_REALTIME}),
-            ("🧾 静默潜力", {DISCORD_ROUTE_DIGEST}),
-            ("👀 普通观察", {DISCORD_ROUTE_OBSERVE}),
+            "🟢 高确定性",
+            "🟡 看多重点观察",
+            "🟠 风险候选",
+            "🟡 多空分歧",
+            "👀 普通观察/静默",
         ]
-        grouped: dict[str, list[tuple[tuple[float, ...], dict[str, str], RouteDecision, MultiTimeframePriceAction | None]]] = {title: [] for title, _routes in sections}
+        grouped: dict[str, list[tuple[tuple[float, ...], dict[str, str], RouteDecision, MultiTimeframePriceAction | None, SignalVerdict]]] = {title: [] for title in sections}
         raw_entries: list[tuple[str, str, str, tuple[float, ...], dict[str, str], RouteDecision, MultiTimeframePriceAction | None]] = []
         best_seen: set[tuple[str, str, str]] = set()
         for recent_index, row in enumerate(rows):
@@ -8366,12 +8366,11 @@ class DerivativesMonitor:
                     continue
                 conflict_added.add(symbol)
                 conflict_decision = discord_conflict_route_decision(decision.score)
-                grouped["🟡 重点观察"].append((score_key, row, conflict_decision, price_action))
+                verdict = signal_verdict_for_candidate_row(row, conflict_decision, price_action)
+                grouped[discord_candidate_verdict_section(verdict)].append((score_key, row, conflict_decision, price_action, verdict))
                 continue
-            for title, routes in sections:
-                if display_route in routes:
-                    grouped[title].append((score_key, row, decision, price_action))
-                    break
+            verdict = signal_verdict_for_candidate_row(row, decision, price_action)
+            grouped[discord_candidate_verdict_section(verdict)].append((score_key, row, decision, price_action, verdict))
 
         max_total = 10_000 if include_all else 3500
         total_limit = 10_000 if include_all else max(1, min(15, int(limit or 8)))
@@ -8379,21 +8378,21 @@ class DerivativesMonitor:
         shown_total = 0
         truncated = False
         lines = ["Discord 候选"]
-        for section_index, (title, _routes) in enumerate(sections):
+        for section_index, title in enumerate(sections):
             items = sorted(grouped[title], key=lambda item: item[0], reverse=True)
             lines.append(title)
             if not items:
                 lines.append("暂无")
                 continue
             section_count = 0
-            for _index, (_score_key, row, decision, price_action) in enumerate(items, start=1):
+            for _index, (_score_key, row, decision, price_action, verdict) in enumerate(items, start=1):
                 if not include_all and shown_total >= total_limit:
                     truncated = True
                     break
                 if section_count >= per_section_limit:
                     truncated = True
                     break
-                block = discord_candidate_compact_block(row, decision, price_action)
+                block = discord_candidate_compact_block(row, decision, price_action, verdict)
                 candidate_lines = block.splitlines()
                 prospective = "\n".join([*lines, *candidate_lines])
                 if not include_all and len(prospective) > max_total:
@@ -8405,7 +8404,7 @@ class DerivativesMonitor:
             if not include_all and shown_total >= total_limit:
                 truncated = truncated or any(
                     sorted(grouped[other_title], key=lambda item: item[0], reverse=True)
-                    for other_title, _other_routes in sections[section_index + 1 :]
+                    for other_title in sections[section_index + 1 :]
                 )
                 break
         if truncated and not include_all:
@@ -12304,11 +12303,13 @@ def discord_candidate_compact_block(
     row: dict[str, str],
     decision: RouteDecision,
     price_action: MultiTimeframePriceAction | None,
+    verdict: Any = None,
     limit: int = 280,
 ) -> str:
+    verdict = verdict or signal_verdict_for_candidate_row(row, decision, price_action)
+    old_route = decision.route if decision else "-"
     if discord_is_conflict_observe(decision):
         symbol = discord_symbol_pair(row.get("symbol"))
-        verdict = signal_verdict_for_candidate_row(row, decision, price_action)
         header = (
             f"🟡 多空分歧观察 {symbol}｜"
             f"把握{format_csv_compact_number(row.get('conviction_score'), signed=False)}｜"
@@ -12316,7 +12317,7 @@ def discord_candidate_compact_block(
         )
         action = signal_verdict_display_action(verdict)
         return truncate_text_by_lines(
-            f"{header}\n方向: 观察/暂不站队｜操作: {action}\n{signal_verdict_compact_line(verdict)}",
+            f"{header}\n方向: 观察/暂不站队｜操作: {action}\n旧路由: {old_route}\n{signal_verdict_compact_line(verdict)}",
             limit,
             suffix="...已截断",
         )
@@ -12326,7 +12327,6 @@ def discord_candidate_compact_block(
     conviction = format_csv_compact_number(row.get("conviction_score"), signed=False)
     quality = format_csv_compact_number(row.get("signal_quality_score"), signed=False)
     icon = "🔴" if decision.route == DISCORD_ROUTE_RISK_REALTIME else "🟢" if decision.route == DISCORD_ROUTE_REALTIME else "🟡"
-    verdict = signal_verdict_for_candidate_row(row, decision, price_action)
     risk = discord_candidate_risk_text(row, decision, price_action)
     kline = discord_candidate_kline_text(price_action)
     flow = discord_candidate_flow_text(row.get("flow_trend_label"))
@@ -12340,7 +12340,7 @@ def discord_candidate_compact_block(
     header = f"{icon} {symbol} {kind_text}｜把握{conviction}｜质量{quality}"
     summary = f"K线:{kline}｜资金:{flow}｜风险:{risk}｜操作:{action}"
     return truncate_text_by_lines(
-        f"{header}\n{summary}\n{signal_verdict_compact_line(verdict)}",
+        f"{header}\n{summary}\n旧路由: {old_route}\n{signal_verdict_compact_line(verdict)}",
         limit,
         suffix="...已截断",
     )
@@ -12358,8 +12358,10 @@ def discord_topq_candidate_fields(message: str, chunk_size: int = 950) -> list[t
                 block_lines.append(lines[index + 1])
             if index + 2 < len(lines):
                 block_lines.append(lines[index + 2])
-            if index + 3 < len(lines) and lines[index + 3].startswith("SignalVerdict｜"):
+            if index + 3 < len(lines):
                 block_lines.append(lines[index + 3])
+            if index + 4 < len(lines) and lines[index + 4].startswith(("SignalVerdict｜", "Verdict:")):
+                block_lines.append(lines[index + 4])
             blocks.append("\n".join(block_lines))
             index += len(block_lines)
             continue
@@ -16904,6 +16906,18 @@ def signal_verdict_compact_line(verdict: SignalVerdict) -> str:
         f"Verdict: {verdict.final_direction}/{verdict.confidence}｜{verdict.entry_state}｜"
         f"L{verdict.long_score} R{verdict.risk_score} C{verdict.conflict_score} E{verdict.entry_score}"
     )
+
+
+def discord_candidate_verdict_section(verdict: SignalVerdict) -> str:
+    if verdict.final_direction == "看多" and verdict.confidence == "高" and verdict.entry_state == "可跟踪":
+        return "🟢 高确定性"
+    if verdict.final_direction == "看多" and verdict.confidence == "中":
+        return "🟡 看多重点观察"
+    if verdict.final_direction == "看空风险" and verdict.confidence == "中":
+        return "🟠 风险候选"
+    if verdict.final_direction == "多空分歧" and verdict.conflict_score >= 55:
+        return "🟡 多空分歧"
+    return "👀 普通观察/静默"
 
 def discord_route_decision(
     signal: Signal | dict[str, Any],

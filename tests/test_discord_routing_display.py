@@ -81,6 +81,35 @@ def observe_decision():
     )
 
 
+def realtime_decision():
+    return m.RouteDecision(
+        m.DISCORD_ROUTE_REALTIME,
+        "实时",
+        "legacy realtime",
+        100,
+        False,
+        ["realtime"],
+    )
+
+
+def section_text(text, title):
+    lines = text.splitlines()
+    start = lines.index(title)
+    end = len(lines)
+    section_titles = {
+        "🟢 高确定性",
+        "🟡 看多重点观察",
+        "🟠 风险候选",
+        "🟡 多空分歧",
+        "👀 普通观察/静默",
+    }
+    for index in range(start + 1, len(lines)):
+        if lines[index] in section_titles:
+            end = index
+            break
+    return "\n".join(lines[start:end])
+
+
 def patch_conservative_inputs(monkeypatch, pa):
     monkeypatch.setattr(m, "safe_multi_timeframe_price_action", lambda *args, **kwargs: pa)
     monkeypatch.setattr(m, "conviction_score", lambda *args, **kwargs: (88, "高", "smoke"))
@@ -575,7 +604,7 @@ def test_discord_candidates_single_internal_conflict_not_risk(monkeypatch):
     text = monitor.format_discord_route_candidates_response()
 
     assert "🟡 多空分歧观察 SUI/USDT" in text
-    assert "🔴 风险观察\n暂无" in text
+    assert "🟠 风险候选\n暂无" in text
 
 
 def test_discord_candidates_show_single_conflict_for_same_symbol(monkeypatch):
@@ -649,6 +678,7 @@ def test_discord_candidates_default_is_capped_and_keeps_verdict(monkeypatch):
     assert candidate_count <= 8
     assert candidate_count == 4
     assert "Verdict: 看多/中｜等回踩确认｜L" in text
+    assert "旧路由: priority_observe" in text
     assert "已截断，使用 !候选 全部 查看更多。" in text
 
 
@@ -719,3 +749,88 @@ def test_discord_candidates_all_splits_safe_embeds(monkeypatch):
         text = "\n".join(value for _name, value, _inline in embed.fields)
         assert len(text) <= 3500
     assert any("Verdict:" in value for embed in response for _name, value, _inline in embed.fields)
+
+
+def test_discord_candidates_realtime_but_low_verdict_goes_to_observe(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    rows = [
+        {
+            "symbol": "MUSDT",
+            "kind": "discovery",
+            "conviction_score": "100",
+            "signal_quality_score": "74",
+            "evidence_score": "2",
+            "evidence_direction": "观察",
+            "leading_score": "0",
+            "flow_trend_label": "多周期共振流入",
+        }
+    ]
+    monkeypatch.setattr(monitor, "load_recent_signal_rows", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(m, "light_multi_timeframe_price_action", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(m, "discord_route_decision", lambda *_args, **_kwargs: realtime_decision())
+
+    text = monitor.format_discord_route_candidates_response()
+
+    assert "M 启动发现" not in section_text(text, "🟢 高确定性")
+    assert "M 启动发现" in section_text(text, "👀 普通观察/静默")
+    assert "Verdict: 仅观察/低" in text
+    assert "旧路由: realtime" in text
+
+
+def test_discord_candidates_conflict_route_with_low_conflict_not_conflict_section(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    rows = [
+        {
+            "symbol": "CFXUSDT",
+            "kind": "discovery",
+            "conviction_score": "100",
+            "signal_quality_score": "100",
+            "evidence_score": "2",
+            "evidence_direction": "观察",
+            "leading_score": "0",
+            "flow_trend_label": "多周期共振流入",
+        }
+    ]
+    monkeypatch.setattr(monitor, "load_recent_signal_rows", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(m, "light_multi_timeframe_price_action", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(m, "discord_route_decision", lambda *_args, **_kwargs: m.discord_conflict_route_decision(90))
+
+    text = monitor.format_discord_route_candidates_response()
+
+    assert "CFX/USDT" not in section_text(text, "🟡 多空分歧")
+    assert "CFX/USDT" in section_text(text, "👀 普通观察/静默")
+    assert "Verdict: 多空分歧/低｜暂不站队｜L" in text
+    assert "C0" in text
+    assert "旧路由: conflict_observe" in text
+
+
+def test_discord_candidates_high_verdict_goes_to_high_confidence(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    rows = [
+        {
+            "symbol": "ZECUSDT",
+            "kind": "discovery",
+            "conviction_score": "100",
+            "signal_quality_score": "100",
+            "evidence_score": "9",
+            "evidence_direction": "看多",
+            "evidence_summary": "主动买盘强 短线主力流入 中线主力流入 现货承接 OI增仓推涨",
+            "leading_score": "7",
+            "leading_direction": "long",
+            "spot_onchain_label": "强",
+            "spot_onchain_score": "10",
+            "flow_trend_label": "多周期共振流入",
+            "kline_score": "8",
+            "kline_text": "15m/1h K线转强 15m 突破近20根高点",
+            "risk_score": "2",
+        }
+    ]
+    monkeypatch.setattr(monitor, "load_recent_signal_rows", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(m, "light_multi_timeframe_price_action", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(m, "discord_route_decision", lambda *_args, **_kwargs: realtime_decision())
+
+    text = monitor.format_discord_route_candidates_response()
+
+    assert "ZEC 启动发现" in section_text(text, "🟢 高确定性")
+    assert "Verdict: 看多/高｜可跟踪" in text
+    assert "旧路由: realtime" in text
