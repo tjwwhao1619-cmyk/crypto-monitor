@@ -706,6 +706,8 @@ class DerivativesMonitor:
         self.discord_route_audit_lock = threading.Lock()
         self.discord_visible_signal_recent: deque[dict[str, Any]] = deque(maxlen=500)
         self.discord_visible_signal_lock = threading.Lock()
+        self.discord_verdict_shadow_stats: dict[str, int] = {}
+        self.discord_verdict_shadow_lock = threading.Lock()
         self.last_discord_suppressed_digest_flush_at = 0.0
         self.last_discord_suppressed_digest_flush_attempt_at = 0.0
         self.last_discord_suppressed_digest_flush_status = "not attempted"
@@ -5747,6 +5749,7 @@ class DerivativesMonitor:
                 return
             channel = discord_channel_for_route(conflict_decision, signal, self.discord_config.channel_ids)
             self.remove_queued_discord_symbol_messages(signal.symbol)
+            self.record_discord_verdict_shadow(signal, conflict_decision.route, channel, conflict_decision)
             self.enqueue_discord_message(
                 discord_conflict_observe_embed(
                     signal,
@@ -7103,6 +7106,137 @@ class DerivativesMonitor:
             logging.warning("Discord outbound queue is full; dropping message for channel=%s", item.channel_key)
             return False
 
+    def discord_verdict_shadow_stats_defaults(self) -> dict[str, int]:
+        return {
+            "long_high": 0,
+            "long_mid": 0,
+            "risk_mid": 0,
+            "conflict": 0,
+            "realtime_low": 0,
+            "high_non_realtime": 0,
+        }
+
+    def ensure_discord_verdict_shadow_state(self) -> None:
+        if not hasattr(self, "discord_verdict_shadow_stats") or self.discord_verdict_shadow_stats is None:
+            self.discord_verdict_shadow_stats = {}
+        if not hasattr(self, "discord_verdict_shadow_lock") or self.discord_verdict_shadow_lock is None:
+            self.discord_verdict_shadow_lock = threading.Lock()
+        for key, value in self.discord_verdict_shadow_stats_defaults().items():
+            self.discord_verdict_shadow_stats.setdefault(key, value)
+
+    def build_discord_verdict_shadow(self, signal: Signal, route_decision: RouteDecision | None):
+        snapshot = signal.snapshot
+        if snapshot is None:
+            return build_signal_verdict(signal, route_decision=route_decision)
+        price_action = safe_multi_timeframe_price_action(signal.symbol, log_result=False)
+        ev_score, ev_direction, ev_summary, _ev_items = evidence_score(snapshot, signal)
+        leading = leading_signal_score(snapshot, signal)
+        _short_flow, _mid_flow, _long_flow, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+        trap_score, _trap_label, _trap_reason = trap_risk_score(snapshot, signal)
+        return signal_verdict_for_discord_signal(
+            signal,
+            snapshot,
+            price_action,
+            route_decision,
+            ev_score,
+            ev_direction,
+            ev_summary,
+            leading,
+            flow_label,
+            trap_score,
+        )
+
+    def record_discord_verdict_shadow(
+        self,
+        signal: Signal,
+        old_route: str,
+        old_channel_key: str,
+        route_decision: RouteDecision | None = None,
+    ) -> None:
+        try:
+            verdict = self.build_discord_verdict_shadow(signal, route_decision)
+        except Exception:
+            logging.exception("SignalVerdict shadow failed: symbol=%s kind=%s old_route=%s", signal.symbol, signal.kind, old_route)
+            return
+
+        self.ensure_discord_verdict_shadow_state()
+        realtime_low = old_route == DISCORD_ROUTE_REALTIME and verdict.final_direction == "仅观察" and verdict.confidence == "低"
+        high_non_realtime = verdict.final_direction == "看多" and verdict.confidence == "高" and old_route != DISCORD_ROUTE_REALTIME
+        with self.discord_verdict_shadow_lock:
+            if verdict.final_direction == "看多" and verdict.confidence == "高":
+                self.discord_verdict_shadow_stats["long_high"] += 1
+            if verdict.final_direction == "看多" and verdict.confidence == "中":
+                self.discord_verdict_shadow_stats["long_mid"] += 1
+            if verdict.final_direction == "看空风险" and verdict.confidence == "中":
+                self.discord_verdict_shadow_stats["risk_mid"] += 1
+            if verdict.final_direction == "多空分歧":
+                self.discord_verdict_shadow_stats["conflict"] += 1
+            if realtime_low:
+                self.discord_verdict_shadow_stats["realtime_low"] += 1
+            if high_non_realtime:
+                self.discord_verdict_shadow_stats["high_non_realtime"] += 1
+
+        logging.info(
+            "SignalVerdict shadow: symbol=%s kind=%s old_route=%s old_channel_key=%s verdict=%s confidence=%s entry_state=%s L=%s R=%s C=%s E=%s",
+            signal.symbol,
+            signal.kind,
+            old_route or "-",
+            old_channel_key or "-",
+            verdict.final_direction,
+            verdict.confidence,
+            verdict.entry_state,
+            verdict.long_score,
+            verdict.risk_score,
+            verdict.conflict_score,
+            verdict.entry_score,
+        )
+        if realtime_low:
+            logging.warning(
+                "Verdict shadow downgrade candidate: symbol=%s kind=%s old_route=%s old_channel_key=%s verdict=%s/%s entry_state=%s L=%s R=%s C=%s E=%s",
+                signal.symbol,
+                signal.kind,
+                old_route or "-",
+                old_channel_key or "-",
+                verdict.final_direction,
+                verdict.confidence,
+                verdict.entry_state,
+                verdict.long_score,
+                verdict.risk_score,
+                verdict.conflict_score,
+                verdict.entry_score,
+            )
+        if high_non_realtime:
+            logging.info(
+                "Verdict shadow upgrade candidate: symbol=%s kind=%s old_route=%s old_channel_key=%s verdict=%s/%s entry_state=%s L=%s R=%s C=%s E=%s",
+                signal.symbol,
+                signal.kind,
+                old_route or "-",
+                old_channel_key or "-",
+                verdict.final_direction,
+                verdict.confidence,
+                verdict.entry_state,
+                verdict.long_score,
+                verdict.risk_score,
+                verdict.conflict_score,
+                verdict.entry_score,
+            )
+
+    def format_discord_verdict_shadow_stats(self) -> str:
+        self.ensure_discord_verdict_shadow_state()
+        with self.discord_verdict_shadow_lock:
+            stats = dict(self.discord_verdict_shadow_stats)
+        return "\n".join(
+            [
+                "SignalVerdict 影子统计（服务启动后）",
+                f"看多/高: {stats.get('long_high', 0)}",
+                f"看多/中: {stats.get('long_mid', 0)}",
+                f"看空风险/中: {stats.get('risk_mid', 0)}",
+                f"多空分歧: {stats.get('conflict', 0)}",
+                f"旧实时但裁判低确定: {stats.get('realtime_low', 0)}",
+                f"裁判高确定但旧非实时: {stats.get('high_non_realtime', 0)}",
+            ]
+        )
+
     def record_discord_route_audit(self, item: DiscordOutboundMessage) -> None:
         audit = getattr(self, "discord_route_audit", None)
         if audit is None:
@@ -7145,6 +7279,7 @@ class DerivativesMonitor:
         )
         if channel == "suppress":
             return
+        self.record_discord_verdict_shadow(signal, final_decision.route, channel, final_decision)
         self.enqueue_discord_message(
             discord_signal_embed_v2(signal, priority, quality_score, quality_reason, channel, final_decision)
         )
@@ -7184,6 +7319,8 @@ class DerivativesMonitor:
             if show_all:
                 return discord_topq_embeds_v2(message, "digest")
             return discord_topq_embed_v2(message, "digest")
+        if command == "!裁判统计":
+            return discord_summary_embed_v2("SignalVerdict 影子统计", self.format_discord_verdict_shadow_stats(), "debug")
         if command == "!山寨":
             return self.discord_alt_watch_command_response()
         if command == "!美股代币":

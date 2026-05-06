@@ -1,4 +1,5 @@
 import sys
+import logging
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -834,3 +835,82 @@ def test_discord_candidates_high_verdict_goes_to_high_confidence(monkeypatch):
     assert "ZEC 启动发现" in section_text(text, "🟢 高确定性")
     assert "Verdict: 看多/高｜可跟踪" in text
     assert "旧路由: realtime" in text
+
+
+def test_discord_verdict_shadow_counts_and_logs_candidates(monkeypatch, caplog):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    sig = m.Signal("MUSDT", "discovery", 1, "启动", "smoke", "k", None)
+    verdict = m.SignalVerdict(
+        final_direction="仅观察",
+        confidence="低",
+        entry_state="仅观察",
+        verdict_score=40,
+        long_score=80,
+        risk_score=0,
+        conflict_score=0,
+        entry_score=50,
+        primary_reasons=[],
+        risk_reasons=[],
+        display_title="普通观察",
+        action_text="确认不足",
+    )
+    monkeypatch.setattr(monitor, "build_discord_verdict_shadow", lambda *_args, **_kwargs: verdict)
+
+    caplog.set_level(logging.INFO)
+    monitor.record_discord_verdict_shadow(sig, m.DISCORD_ROUTE_REALTIME, "alerts", realtime_decision())
+
+    assert monitor.discord_verdict_shadow_stats["realtime_low"] == 1
+    assert monitor.discord_verdict_shadow_stats["long_high"] == 0
+    assert "SignalVerdict shadow: symbol=MUSDT kind=discovery old_route=realtime old_channel_key=alerts" in caplog.text
+    assert "Verdict shadow downgrade candidate: symbol=MUSDT" in caplog.text
+
+
+def test_discord_verdict_shadow_upgrade_candidate_count(monkeypatch, caplog):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    sig = m.Signal("ZECUSDT", "discovery", 1, "启动", "smoke", "k", None)
+    verdict = m.SignalVerdict(
+        final_direction="看多",
+        confidence="高",
+        entry_state="可跟踪",
+        verdict_score=90,
+        long_score=92,
+        risk_score=5,
+        conflict_score=0,
+        entry_score=95,
+        primary_reasons=[],
+        risk_reasons=[],
+        display_title="高确定性看多",
+        action_text="可跟踪，仍需按止损执行",
+    )
+    monkeypatch.setattr(monitor, "build_discord_verdict_shadow", lambda *_args, **_kwargs: verdict)
+
+    caplog.set_level(logging.INFO)
+    monitor.record_discord_verdict_shadow(sig, m.DISCORD_ROUTE_OBSERVE, "alt_watch", observe_decision())
+
+    assert monitor.discord_verdict_shadow_stats["long_high"] == 1
+    assert monitor.discord_verdict_shadow_stats["high_non_realtime"] == 1
+    assert "Verdict shadow upgrade candidate: symbol=ZECUSDT" in caplog.text
+
+
+def test_discord_verdict_shadow_stats_command():
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    monitor.discord_verdict_shadow_stats = {
+        "long_high": 2,
+        "long_mid": 3,
+        "risk_mid": 4,
+        "conflict": 5,
+        "realtime_low": 6,
+        "high_non_realtime": 7,
+    }
+    monitor.discord_verdict_shadow_lock = threading.Lock()
+
+    response = monitor.discord_command_response("!裁判统计")
+    text = "\n".join(value for _name, value, _inline in response.fields)
+
+    assert response.title == "SignalVerdict 影子统计"
+    assert "看多/高: 2" in text
+    assert "看多/中: 3" in text
+    assert "看空风险/中: 4" in text
+    assert "多空分歧: 5" in text
+    assert "旧实时但裁判低确定: 6" in text
+    assert "裁判高确定但旧非实时: 7" in text
