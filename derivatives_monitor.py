@@ -6890,7 +6890,11 @@ class DerivativesMonitor:
                 )
             return embed
 
-        async def send_discord_payload(channel: Any, payload: str | DiscordOutboundMessage) -> None:
+        async def send_discord_payload(channel: Any, payload: str | DiscordOutboundMessage | list[DiscordOutboundMessage]) -> None:
+            if isinstance(payload, list):
+                for item in payload[:6]:
+                    await send_discord_payload(channel, item)
+                return
             if isinstance(payload, DiscordOutboundMessage):
                 await channel.send(embed=build_embed(payload))
                 logging.info("Discord sent: channel=command title=%s", payload.title or payload.kind or payload.symbol or "-")
@@ -7168,7 +7172,18 @@ class DerivativesMonitor:
                 return discord_summary_embed_v2("市场摘要", summary_text, "summary")
             return "当前暂无市场摘要缓存，请等待下一轮扫描完成后重试。"
         if command == "!候选":
-            return discord_topq_embed_v2(self.format_topq_response(discord_view=True), "digest")
+            candidate_arg = parts[1] if len(parts) >= 2 else ""
+            show_all = candidate_arg == "全部"
+            candidate_limit = 8
+            if candidate_arg and not show_all:
+                try:
+                    candidate_limit = max(1, min(15, int(candidate_arg)))
+                except ValueError:
+                    candidate_limit = 8
+            message = self.format_topq_response(discord_view=True, limit=candidate_limit, include_all=show_all)
+            if show_all:
+                return discord_topq_embeds_v2(message, "digest")
+            return discord_topq_embed_v2(message, "digest")
         if command == "!山寨":
             return self.discord_alt_watch_command_response()
         if command == "!美股代币":
@@ -8283,7 +8298,11 @@ class DerivativesMonitor:
     def handle_topq_command(self, bot_token: str, chat_id: str) -> None:
         self.send_telegram_text(bot_token, chat_id, self.format_topq_response())
 
-    def format_discord_route_candidates_response(self) -> str:
+    def format_discord_route_candidates_response(
+        self,
+        limit: int = 8,
+        include_all: bool = False,
+    ) -> str:
         try:
             rows = self.load_recent_signal_rows(300)
         except Exception:
@@ -8354,21 +8373,51 @@ class DerivativesMonitor:
                     grouped[title].append((score_key, row, decision, price_action))
                     break
 
+        max_total = 10_000 if include_all else 3500
+        total_limit = 10_000 if include_all else max(1, min(15, int(limit or 8)))
+        per_section_limit = 25 if include_all else 4
+        shown_total = 0
+        truncated = False
         lines = ["Discord 候选"]
-        for title, _routes in sections:
-            limit = 4 if title == "👀 普通观察" else 8
-            items = sorted(grouped[title], key=lambda item: item[0], reverse=True)[:limit]
+        for section_index, (title, _routes) in enumerate(sections):
+            items = sorted(grouped[title], key=lambda item: item[0], reverse=True)
             lines.append(title)
             if not items:
                 lines.append("暂无")
                 continue
-            for index, (_score_key, row, decision, price_action) in enumerate(items, start=1):
-                lines.extend(discord_candidate_brief_lines(row, decision, price_action))
+            section_count = 0
+            for _index, (_score_key, row, decision, price_action) in enumerate(items, start=1):
+                if not include_all and shown_total >= total_limit:
+                    truncated = True
+                    break
+                if section_count >= per_section_limit:
+                    truncated = True
+                    break
+                block = discord_candidate_compact_block(row, decision, price_action)
+                candidate_lines = block.splitlines()
+                prospective = "\n".join([*lines, *candidate_lines])
+                if not include_all and len(prospective) > max_total:
+                    truncated = True
+                    break
+                lines.extend(candidate_lines)
+                section_count += 1
+                shown_total += 1
+            if not include_all and shown_total >= total_limit:
+                truncated = truncated or any(
+                    sorted(grouped[other_title], key=lambda item: item[0], reverse=True)
+                    for other_title, _other_routes in sections[section_index + 1 :]
+                )
+                break
+        if truncated and not include_all:
+            suffix = "已截断，使用 !候选 全部 查看更多。"
+            if len("\n".join([*lines, suffix])) > max_total:
+                lines = truncate_text_by_lines("\n".join(lines), max_total - len(suffix) - 1, suffix="").splitlines()
+            lines.append(suffix)
         return "\n".join(lines)
 
-    def format_topq_response(self, discord_view: bool = False) -> str:
+    def format_topq_response(self, discord_view: bool = False, limit: int = 8, include_all: bool = False) -> str:
         if discord_view:
-            return self.format_discord_route_candidates_response()
+            return self.format_discord_route_candidates_response(limit=limit, include_all=include_all)
         try:
             rows = self.load_recent_signal_rows(200)
         except Exception:
@@ -12251,6 +12300,52 @@ def discord_candidate_brief_lines(
     ]
 
 
+def discord_candidate_compact_block(
+    row: dict[str, str],
+    decision: RouteDecision,
+    price_action: MultiTimeframePriceAction | None,
+    limit: int = 280,
+) -> str:
+    if discord_is_conflict_observe(decision):
+        symbol = discord_symbol_pair(row.get("symbol"))
+        verdict = signal_verdict_for_candidate_row(row, decision, price_action)
+        header = (
+            f"🟡 多空分歧观察 {symbol}｜"
+            f"把握{format_csv_compact_number(row.get('conviction_score'), signed=False)}｜"
+            f"质量{format_csv_compact_number(row.get('signal_quality_score'), signed=False)}"
+        )
+        action = signal_verdict_display_action(verdict)
+        return truncate_text_by_lines(
+            f"{header}\n方向: 观察/暂不站队｜操作: {action}\n{signal_verdict_compact_line(verdict)}",
+            limit,
+            suffix="...已截断",
+        )
+
+    symbol = display_usdt_symbol(row.get("symbol"))
+    kind_text = discord_candidate_kind_text(row.get("kind"), decision.route)
+    conviction = format_csv_compact_number(row.get("conviction_score"), signed=False)
+    quality = format_csv_compact_number(row.get("signal_quality_score"), signed=False)
+    icon = "🔴" if decision.route == DISCORD_ROUTE_RISK_REALTIME else "🟢" if decision.route == DISCORD_ROUTE_REALTIME else "🟡"
+    verdict = signal_verdict_for_candidate_row(row, decision, price_action)
+    risk = discord_candidate_risk_text(row, decision, price_action)
+    kline = discord_candidate_kline_text(price_action)
+    flow = discord_candidate_flow_text(row.get("flow_trend_label"))
+    action = "等跌破确认，不追空" if discord_candidate_is_risk_kind(row.get("kind")) else discord_candidate_action_text(decision, risk, kline)
+    if (
+        (verdict.final_direction == "看多" and verdict.confidence == "中")
+        or (verdict.final_direction == "看空风险" and verdict.confidence == "中")
+        or verdict.final_direction == "多空分歧"
+    ):
+        action = signal_verdict_display_action(verdict)
+    header = f"{icon} {symbol} {kind_text}｜把握{conviction}｜质量{quality}"
+    summary = f"K线:{kline}｜资金:{flow}｜风险:{risk}｜操作:{action}"
+    return truncate_text_by_lines(
+        f"{header}\n{summary}\n{signal_verdict_compact_line(verdict)}",
+        limit,
+        suffix="...已截断",
+    )
+
+
 def discord_topq_candidate_fields(message: str, chunk_size: int = 950) -> list[tuple[str, str, bool]]:
     lines = [line.strip() for line in str(message or "").splitlines() if line.strip()]
     blocks: list[str] = []
@@ -12297,6 +12392,31 @@ def discord_topq_embed_v2(message: str, channel_key: str = "digest") -> DiscordO
         fields=fields[:10],
         kind="topq",
     )
+
+
+def discord_topq_embeds_v2(message: str, channel_key: str = "digest", max_embed_chars: int = 3500) -> list[DiscordOutboundMessage]:
+    lines = [line for line in str(message or "").splitlines() if line.strip()]
+    pages: list[str] = []
+    current = ""
+    for line in lines:
+        candidate = f"{current}\n{line}".strip() if current else line
+        if len(candidate) > max_embed_chars and current:
+            pages.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        pages.append(current)
+    return [
+        DiscordOutboundMessage(
+            channel_key=channel_key,
+            title="把握候选TOP10" if index == 1 else f"把握候选TOP10 ({index}/{len(pages)})",
+            color=DISCORD_COLOR_SUMMARY,
+            fields=discord_topq_candidate_fields(page),
+            kind="topq",
+        )
+        for index, page in enumerate(pages[:6], start=1)
+    ]
 
 
 def discord_suppressed_digest_embed_v2(
@@ -16777,6 +16897,13 @@ def signal_verdict_for_candidate_row(
             action_text="暂不站队，等待15m/1h方向重新一致",
         )
     return verdict
+
+
+def signal_verdict_compact_line(verdict: SignalVerdict) -> str:
+    return (
+        f"Verdict: {verdict.final_direction}/{verdict.confidence}｜{verdict.entry_state}｜"
+        f"L{verdict.long_score} R{verdict.risk_score} C{verdict.conflict_score} E{verdict.entry_score}"
+    )
 
 def discord_route_decision(
     signal: Signal | dict[str, Any],

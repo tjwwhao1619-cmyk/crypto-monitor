@@ -615,3 +615,107 @@ def test_discord_candidates_show_single_conflict_for_same_symbol(monkeypatch):
     assert "🟡 多空分歧观察 ADA/USDT" in text
     assert "底部反转" not in text
     assert "风险信号" not in text
+
+
+def test_discord_candidates_default_is_capped_and_keeps_verdict(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    rows = [
+        {
+            "symbol": f"TST{i}USDT",
+            "kind": "discovery",
+            "conviction_score": "80",
+            "evidence_score": "10",
+            "evidence_direction": "看多",
+            "evidence_summary": "主动买盘强 短线主力流入 中线主力流入 现货承接 OI增仓推涨",
+            "leading_score": "6",
+            "leading_direction": "long",
+            "signal_quality_score": "80",
+            "spot_onchain_label": "强",
+            "spot_onchain_score": "10",
+            "flow_trend_label": "资金分歧",
+            "kline_text": "4h延续强",
+        }
+        for i in range(20)
+    ]
+    monkeypatch.setattr(monitor, "load_recent_signal_rows", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(m, "is_valid_binance_usdt_symbol", lambda _symbol: True)
+    monkeypatch.setattr(m, "light_multi_timeframe_price_action", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(m, "discord_route_decision", lambda *_args, **_kwargs: priority_observe_decision())
+
+    text = monitor.format_discord_route_candidates_response()
+    candidate_count = sum(1 for line in text.splitlines() if line.startswith(("🟢 ", "🟡 ", "🔴 ")) and "｜把握" in line)
+
+    assert len(text) <= 3500
+    assert candidate_count <= 8
+    assert candidate_count == 4
+    assert "Verdict: 看多/中｜等回踩确认｜L" in text
+    assert "已截断，使用 !候选 全部 查看更多。" in text
+
+
+def test_discord_candidates_numeric_limit_caps_total(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    rows = [
+        {
+            "symbol": f"LIM{i}USDT",
+            "kind": "discovery",
+            "conviction_score": "80",
+            "evidence_score": "10",
+            "evidence_direction": "看多",
+            "evidence_summary": "主动买盘强 短线主力流入 中线主力流入 现货承接 OI增仓推涨",
+            "leading_score": "6",
+            "leading_direction": "long",
+            "signal_quality_score": "80",
+            "spot_onchain_label": "强",
+            "spot_onchain_score": "10",
+            "flow_trend_label": "资金分歧",
+            "kline_text": "4h延续强",
+        }
+        for i in range(20)
+    ]
+    monkeypatch.setattr(monitor, "load_recent_signal_rows", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(m, "is_valid_binance_usdt_symbol", lambda _symbol: True)
+    monkeypatch.setattr(m, "light_multi_timeframe_price_action", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(m, "discord_route_decision", lambda *_args, **_kwargs: priority_observe_decision())
+
+    response = monitor.discord_command_response("!候选 15")
+    text = "\n".join(value for _name, value, _inline in response.fields)
+    candidate_count = sum(1 for line in text.splitlines() if line.startswith(("🟢 ", "🟡 ", "🔴 ")) and "｜把握" in line)
+
+    assert candidate_count <= 15
+    assert len(text) <= 3500
+    assert "Verdict:" in text
+
+
+def test_discord_candidates_all_splits_safe_embeds(monkeypatch):
+    monitor = m.DerivativesMonitor.__new__(m.DerivativesMonitor)
+    rows = [
+        {
+            "symbol": f"ALL{i}USDT",
+            "kind": "discovery",
+            "conviction_score": "80",
+            "evidence_score": "10",
+            "evidence_direction": "看多",
+            "evidence_summary": "主动买盘强 短线主力流入 中线主力流入 现货承接 OI增仓推涨",
+            "leading_score": "6",
+            "leading_direction": "long",
+            "signal_quality_score": "80",
+            "spot_onchain_label": "强",
+            "spot_onchain_score": "10",
+            "flow_trend_label": "资金分歧",
+            "kline_text": "4h延续强",
+        }
+        for i in range(40)
+    ]
+    monkeypatch.setattr(monitor, "load_recent_signal_rows", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(m, "is_valid_binance_usdt_symbol", lambda _symbol: True)
+    monkeypatch.setattr(m, "light_multi_timeframe_price_action", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(m, "discord_route_decision", lambda *_args, **_kwargs: priority_observe_decision())
+
+    response = monitor.discord_command_response("!候选 全部")
+
+    assert isinstance(response, list)
+    assert response
+    for embed in response:
+        text = "\n".join(value for _name, value, _inline in embed.fields)
+        assert len(text) <= 3500
+    assert any("Verdict:" in value for embed in response for _name, value, _inline in embed.fields)
