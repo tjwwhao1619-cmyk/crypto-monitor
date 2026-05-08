@@ -14,7 +14,7 @@ screener:
   coingecko_request_delay_seconds: 8
   market_cap_cache_path: market_cap_cache.json
   market_cap_cache_ttl_seconds: 21600
-  max_symbols: 300
+  max_symbols: 80
   main_symbols:
   - BTCUSDT
   - ETHUSDT
@@ -80,7 +80,7 @@ telegram_commands:
   enabled: true
   poll_interval_seconds: 5
   offset_path: telegram_update_offset.txt
-scan_workers: 8
+scan_workers: 2
 state_path: monitor_state.json
 log_each_symbol: false
 confirmation:

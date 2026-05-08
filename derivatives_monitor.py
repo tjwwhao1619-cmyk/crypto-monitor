@@ -5850,6 +5850,7 @@ class DerivativesMonitor:
         if final_decision.route == DISCORD_ROUTE_SUPPRESS:
             return
         if final_decision.route == DISCORD_ROUTE_DIGEST:
+            self.enqueue_discord_alt_watch_signal(signal, priority, quality_score, quality_reason, final_decision)
             conviction = 0
             if signal.snapshot:
                 conviction, _conv_label, _conv_reason = conviction_score(signal.snapshot, signal)
@@ -6058,15 +6059,46 @@ class DerivativesMonitor:
         with self.pending_telegram_signal_merge_lock:
             return len(self.pending_telegram_signal_merges)
 
-    def get(self, path: str, params: dict[str, Any]) -> Any:
-        response = self.session.get(f"{BINANCE_FAPI_BASE}{path}", params=params, timeout=10)
+    def binance_get_json(self, url: str, params: dict[str, Any]) -> Any:
+        response = None
+        for attempt in range(4):
+            response = self.session.get(url, params=params, timeout=10)
+            if response.status_code in {418, 429}:
+                retry_after = safe_float(response.headers.get("Retry-After"))
+                wait_seconds = retry_after if retry_after and retry_after > 0 else min(2.0 * (attempt + 1), 8.0)
+                logging.warning(
+                    "Binance rate limited: status=%s path=%s symbol=%s attempt=%s wait=%.1fs",
+                    response.status_code,
+                    url.split(".com", 1)[-1],
+                    params.get("symbol", "-"),
+                    attempt + 1,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+                continue
+            if response.status_code >= 500 and attempt < 3:
+                wait_seconds = min(1.5 * (attempt + 1), 5.0)
+                logging.warning(
+                    "Binance server error retry: status=%s path=%s symbol=%s attempt=%s wait=%.1fs",
+                    response.status_code,
+                    url.split(".com", 1)[-1],
+                    params.get("symbol", "-"),
+                    attempt + 1,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+                continue
+            response.raise_for_status()
+            return response.json()
+        assert response is not None
         response.raise_for_status()
         return response.json()
 
+    def get(self, path: str, params: dict[str, Any]) -> Any:
+        return self.binance_get_json(f"{BINANCE_FAPI_BASE}{path}", params)
+
     def get_data(self, path: str, params: dict[str, Any]) -> Any:
-        response = self.session.get(f"{BINANCE_FUTURES_DATA_BASE}/{path}", params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
+        return self.binance_get_json(f"{BINANCE_FUTURES_DATA_BASE}/{path}", params)
 
     def post_json(self, url: str, payload: dict[str, Any]) -> None:
         try:
@@ -7410,6 +7442,23 @@ class DerivativesMonitor:
         route_decision: RouteDecision | None = None,
     ) -> None:
         final_decision = route_decision or discord_route_decision(signal, signal.snapshot, {"load_price_action": False})
+        try:
+            verdict = self.build_discord_verdict_shadow(signal, final_decision)
+            guarded_decision = discord_route_decision_after_verdict(final_decision, verdict)
+            if guarded_decision.route != final_decision.route:
+                logging.warning(
+                    "Discord route downgraded by SignalVerdict: symbol=%s kind=%s from=%s to=%s verdict=%s/%s entry_state=%s",
+                    signal.symbol,
+                    signal.kind,
+                    final_decision.route,
+                    guarded_decision.route,
+                    verdict.final_direction,
+                    verdict.confidence,
+                    verdict.entry_state,
+                )
+                final_decision = guarded_decision
+        except Exception:
+            logging.exception("Discord verdict route guard failed: symbol=%s kind=%s", signal.symbol, signal.kind)
         channel = channel_key or discord_channel_for_route(final_decision, signal, self.discord_config.channel_ids)
         channel = discord_correct_route_channel_mismatch(
             final_decision.route,
@@ -17241,6 +17290,36 @@ def signal_verdict_display_field(verdict: SignalVerdict) -> tuple[str, str, bool
     return ("SignalVerdict", discord_field_value(signal_verdict_display_value(verdict)), False)
 
 
+def discord_route_decision_after_verdict(route_decision: RouteDecision, verdict: SignalVerdict) -> RouteDecision:
+    if (
+        route_decision.route == DISCORD_ROUTE_REALTIME
+        and verdict.final_direction == "仅观察"
+        and verdict.confidence == "低"
+    ):
+        tags = list(dict.fromkeys([*route_decision.route_tags, "verdict_low_downgrade"]))
+        reason = "; ".join(part for part in (route_decision.reason, "SignalVerdict 仅观察/低，降级为重点观察") if part)
+        return replace(
+            route_decision,
+            route=DISCORD_ROUTE_PRIORITY_OBSERVE,
+            title_level=discord_route_level(DISCORD_ROUTE_PRIORITY_OBSERVE),
+            reason=reason,
+            suppress_realtime=True,
+            route_tags=tags,
+        )
+    if route_decision.route == DISCORD_ROUTE_REALTIME and verdict.final_direction == "多空分歧":
+        tags = list(dict.fromkeys([*route_decision.route_tags, DISCORD_CONFLICT_OBSERVE_TAG, "verdict_conflict_downgrade"]))
+        reason = "; ".join(part for part in (route_decision.reason, "SignalVerdict 多空分歧，降级为分歧观察") if part)
+        return replace(
+            route_decision,
+            route=DISCORD_ROUTE_CONFLICT_OBSERVE,
+            title_level=discord_route_level(DISCORD_ROUTE_CONFLICT_OBSERVE),
+            reason=reason,
+            suppress_realtime=True,
+            route_tags=tags,
+        )
+    return route_decision
+
+
 def signal_verdict_for_discord_signal(
     signal: Signal,
     snapshot: MarketSnapshot | None,
@@ -17456,10 +17535,22 @@ def discord_route_decision_legacy(
             and long_flow >= 4
             and flow_label not in {"资金分歧", "短强中弱", "短弱中强"}
         )
+        core_momentum_observe_ok = (
+            symbol in {"BTCUSDT", "ETHUSDT"}
+            and conviction >= 60
+            and evidence >= 8
+            and quality >= 70
+            and int(getattr(signal, "score", 0) or 0) >= 6
+            and flow_label in {"资金分歧", "短强中弱", "短弱中强"}
+        )
         if momentum_ok:
             route = DISCORD_ROUTE_REALTIME
         elif momentum_watch_ok:
             route = DISCORD_ROUTE_PRIORITY_OBSERVE
+        elif core_momentum_observe_ok:
+            route = DISCORD_ROUTE_OBSERVE
+            reasons.append("core momentum mixed-flow observe")
+            tags.append("core_momentum_observe")
         else:
             route = DISCORD_ROUTE_DIGEST
         reasons.append("main momentum confirmed" if momentum_ok else "main momentum narrowed to watch/digest")
@@ -17945,11 +18036,28 @@ def discord_route_decision(
     if kind == "main_momentum_watch":
         momentum_watch_clear = strong_long and bull_flow >= 3 and oi_change >= 1.0 and taker_ratio >= 1.05 and conviction >= 60
         momentum_realtime = very_strong_long and oi_change >= 2.0 and taker_ratio >= 1.08
-        route = DISCORD_ROUTE_DIGEST
-        if momentum_realtime or momentum_watch_clear:
-            reasons.append("momentum visible disabled by win-rate gate")
-            tags.extend(["core_long_bias", "momentum", "win_rate_gate"])
+        core_momentum_observe = (
+            symbol in {"BTCUSDT", "ETHUSDT"}
+            and conviction >= 60
+            and evidence >= 8
+            and quality >= 70
+            and int(getattr(signal, "score", 0) or 0) >= 6
+            and flow_label in {"资金分歧", "短强中弱", "短弱中强"}
+        )
+        if momentum_realtime:
+            route = DISCORD_ROUTE_REALTIME
+            reasons.append("core momentum realtime")
+            tags.extend(["core_long_bias", "momentum"])
+        elif momentum_watch_clear:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("core momentum watch")
+            tags.extend(["core_long_bias", "momentum"])
+        elif core_momentum_observe:
+            route = DISCORD_ROUTE_OBSERVE
+            reasons.append("core momentum mixed-flow observe")
+            tags.extend(["core_momentum_observe", "momentum"])
         else:
+            route = DISCORD_ROUTE_DIGEST
             reasons.append("momentum not clear on core factors")
             tags.extend(["core_unclear", "momentum"])
     elif kind == "main_risk_watch":
@@ -17976,13 +18084,35 @@ def discord_route_decision(
             tags.extend(["core_unclear", "main_risk"])
     elif kind in {"discovery", "bottom_reversal", "main_trend_watch", "hot_breakout"}:
         if kind == "discovery":
-            route = DISCORD_ROUTE_DIGEST
-            reasons.append("discovery visible disabled by win-rate gate")
-            tags.extend(["core_unclear", kind, "win_rate_gate"])
+            discovery_realtime = very_strong_long and bullish_strict_watch and conviction >= 70 and quality >= 70
+            discovery_watch = strong_long or bullish_strict_watch
+            if discovery_realtime:
+                route = DISCORD_ROUTE_REALTIME
+                reasons.append("core discovery realtime")
+                tags.extend(["core_long_bias", kind])
+            elif discovery_watch:
+                route = DISCORD_ROUTE_PRIORITY_OBSERVE
+                reasons.append("core discovery watch")
+                tags.extend(["core_long_bias", kind])
+            else:
+                route = DISCORD_ROUTE_DIGEST
+                reasons.append("discovery lacks core alignment")
+                tags.extend(["core_unclear", kind])
         elif kind == "main_trend_watch":
-            route = DISCORD_ROUTE_DIGEST
-            reasons.append("main trend visible disabled by win-rate gate")
-            tags.extend(["core_unclear", kind, "win_rate_gate"])
+            trend_realtime = very_strong_long and bullish_strict_watch and conviction >= 70 and quality >= 70
+            trend_watch = strong_long or bullish_strict_watch
+            if trend_realtime:
+                route = DISCORD_ROUTE_REALTIME
+                reasons.append("core main trend realtime")
+                tags.extend(["core_long_bias", kind])
+            elif trend_watch:
+                route = DISCORD_ROUTE_PRIORITY_OBSERVE
+                reasons.append("core main trend watch")
+                tags.extend(["core_long_bias", kind])
+            else:
+                route = DISCORD_ROUTE_DIGEST
+                reasons.append("main trend lacks core alignment")
+                tags.extend(["core_unclear", kind])
         elif strong_long and bullish_strict_watch:
             route = DISCORD_ROUTE_PRIORITY_OBSERVE
             reasons.append("strict bullish watch")
@@ -18000,10 +18130,6 @@ def discord_route_decision(
             route = DISCORD_ROUTE_PRIORITY_OBSERVE
             reasons.append("high risk reverse rescue: strong taker buy without hot funding")
             tags.extend(["high_risk_reverse", "rescue", "short", kind])
-        elif kind == "top_risk":
-            route = DISCORD_ROUTE_DIGEST
-            reasons.append("top risk visible disabled by win-rate gate")
-            tags.extend(["core_unclear", kind, "win_rate_gate"])
         elif very_strong_short:
             route = DISCORD_ROUTE_RISK_REALTIME
             reasons.append("core short bias confirmed")

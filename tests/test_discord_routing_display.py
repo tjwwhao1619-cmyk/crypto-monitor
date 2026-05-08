@@ -294,6 +294,153 @@ def test_mainstream_observe_routes_to_main_asset():
     assert channel == "main_asset"
 
 
+def route_metrics(symbol="ZECUSDT", kind="discovery", **overrides):
+    data = {
+        "symbol": symbol,
+        "kind": kind,
+        "conviction": 75,
+        "evidence": 9,
+        "quality": 80,
+        "trap": 2,
+        "leading": 7,
+        "evidence_direction": "看多",
+        "flow_label": "多周期共振流入",
+        "entry_label": "可跟踪",
+        "oi_change_percent": 3.0,
+        "taker_buy_sell_ratio": 1.12,
+        "funding_rate_percent": 0.01,
+        "global_long_short_ratio": 1.1,
+        "top_position_ratio": 1.25,
+        "top_account_ratio": 1.2,
+        "price_change_percent": 2.0,
+        "confirm_price_change_percent": 0.8,
+        "net_flow_15m": 1000.0,
+        "net_flow_1h": 2000.0,
+        "net_flow_4h": 3000.0,
+        "net_flow_12h": 4000.0,
+        "net_flow_24h": 5000.0,
+        "price_action": None,
+    }
+    data.update(overrides)
+    return data
+
+
+def test_clear_main_momentum_routes_to_main_asset(monkeypatch):
+    monkeypatch.setattr(m, "discord_route_metrics", lambda *_args, **_kwargs: route_metrics("BTCUSDT", "main_momentum_watch"))
+    sig = m.Signal("BTCUSDT", "main_momentum_watch", 1, "main", "", "k", snapshot("BTCUSDT"))
+
+    decision = m.discord_route_decision(sig, sig.snapshot)
+    channel = m.discord_channel_for_route(decision, sig, {"main_asset": "1500895602542903336", "alerts": "2", "observe": "3"})
+
+    assert decision.route in {m.DISCORD_ROUTE_REALTIME, m.DISCORD_ROUTE_PRIORITY_OBSERVE}
+    assert channel == "main_asset"
+
+
+def test_mixed_btc_momentum_observe_routes_to_main_asset(monkeypatch):
+    monkeypatch.setattr(
+        m,
+        "discord_route_metrics",
+        lambda *_args, **_kwargs: route_metrics(
+            "BTCUSDT",
+            "main_momentum_watch",
+            conviction=64,
+            evidence=10,
+            quality=85,
+            leading=0,
+            long_flow=2,
+            flow_label="短强中弱",
+            oi_change_percent=0.35,
+        ),
+    )
+    sig = m.Signal("BTCUSDT", "main_momentum_watch", 6, "main", "", "k", snapshot("BTCUSDT"))
+
+    decision = m.discord_route_decision(sig, sig.snapshot)
+    channel = m.discord_channel_for_route(decision, sig, {"main_asset": "1500895602542903336", "alerts": "2", "observe": "3"})
+
+    assert decision.route == m.DISCORD_ROUTE_OBSERVE
+    assert "core_momentum_observe" in decision.route_tags
+    assert channel == "main_asset"
+
+
+def test_strong_discovery_routes_to_realtime_high_confidence(monkeypatch):
+    monkeypatch.setattr(m, "discord_route_metrics", lambda *_args, **_kwargs: route_metrics())
+    sig = m.Signal("ZECUSDT", "discovery", 1, "discovery", "", "k", snapshot("ZECUSDT"))
+
+    decision = m.discord_route_decision(sig, sig.snapshot)
+    channel = m.discord_channel_for_route(decision, sig, {"alerts": "2", "moonshot": "3", "observe": "4"})
+
+    assert decision.route == m.DISCORD_ROUTE_REALTIME
+    assert channel == "alerts"
+
+
+def test_clear_main_trend_routes_to_main_asset(monkeypatch):
+    monkeypatch.setattr(m, "discord_route_metrics", lambda *_args, **_kwargs: route_metrics("ETHUSDT", "main_trend_watch"))
+    sig = m.Signal("ETHUSDT", "main_trend_watch", 8, "main", "", "k", snapshot("ETHUSDT"))
+
+    decision = m.discord_route_decision(sig, sig.snapshot)
+    channel = m.discord_channel_for_route(decision, sig, {"main_asset": "1500895602542903336", "alerts": "2", "observe": "3"})
+
+    assert decision.route in {m.DISCORD_ROUTE_REALTIME, m.DISCORD_ROUTE_PRIORITY_OBSERVE}
+    assert "win_rate_gate" not in decision.route_tags
+    assert channel == "main_asset"
+
+
+def test_clear_top_risk_is_not_forced_to_digest_by_win_rate_gate(monkeypatch):
+    monkeypatch.setattr(
+        m,
+        "discord_route_metrics",
+        lambda *_args, **_kwargs: route_metrics(
+            "COLLECTUSDT",
+            "top_risk",
+            conviction=72,
+            evidence=6,
+            quality=75,
+            evidence_direction="看空/风险",
+            flow_label="中长线派发",
+            price_change_percent=-2.0,
+            confirm_price_change_percent=-0.8,
+            taker_buy_sell_ratio=0.92,
+            global_long_short_ratio=0.82,
+            top_position_ratio=0.82,
+            top_account_ratio=0.8,
+            oi_change_percent=2.5,
+            net_flow_15m=-2000.0,
+            net_flow_1h=-3000.0,
+            net_flow_4h=-4000.0,
+            net_flow_12h=-5000.0,
+            net_flow_24h=-6000.0,
+        ),
+    )
+    sig = m.Signal("COLLECTUSDT", "top_risk", 8, "risk", "", "k", snapshot("COLLECTUSDT"))
+
+    decision = m.discord_route_decision(sig, sig.snapshot)
+
+    assert decision.route in {m.DISCORD_ROUTE_RISK_REALTIME, m.DISCORD_ROUTE_PRIORITY_OBSERVE}
+    assert "win_rate_gate" not in decision.route_tags
+
+
+def test_digest_alt_signal_is_queued_for_moonshot_workbench(monkeypatch):
+    monitor = init_discord_monitor_for_routing({"alerts": "1", "moonshot": "2", "digest": "3"})
+    monitor.discord_alt_watch_queue = []
+    monitor.discord_alt_watch_lock = threading.Lock()
+    monitor.discord_alt_watch_symbol_sent_at = {}
+    monitor.discord_suppressed_digest_lock = threading.Lock()
+    monitor.discord_suppressed_digest_queue = []
+    monitor.discord_suppressed_digest_recent = m.deque(maxlen=100)
+    sig = m.Signal("MUSDT", "discovery", 1, "discovery", "", "k", snapshot("MUSDT"))
+    decision = m.RouteDecision(m.DISCORD_ROUTE_DIGEST, "摘要", "digest candidate", 88, True, ["digest"])
+    monkeypatch.setattr(m, "discord_route_decision", lambda *_args, **_kwargs: decision)
+    monkeypatch.setattr(m, "conviction_score", lambda *_args, **_kwargs: (60, "中", "smoke"))
+    monkeypatch.setattr(m, "leading_signal_score", lambda *_args, **_kwargs: m.LeadingSignalScore(5, "long", "偏多", [], 5, 0))
+    monkeypatch.setattr(m, "evidence_score", lambda *_args, **_kwargs: (6, "看多", "smoke", []))
+    monkeypatch.setattr(m, "trap_risk_score", lambda *_args, **_kwargs: (2, "低", "smoke"))
+    monkeypatch.setattr(m, "flow_horizon_scores", lambda *_args, **_kwargs: (6, 7, 7, "多周期共振流入", "smoke"))
+
+    monitor.route_discord_signal(sig, "B", 60, "quality")
+
+    assert [item.symbol for item in monitor.discord_alt_watch_queue] == ["MUSDT"]
+
+
 def test_main_asset_missing_fallback_alerts_not_main():
     sig = m.Signal("BTCUSDT", "main_trend_watch", 1, "main", "", "k", snapshot("BTCUSDT"))
     decision = m.RouteDecision(m.DISCORD_ROUTE_REALTIME, "实时", "main", 90, False, [])

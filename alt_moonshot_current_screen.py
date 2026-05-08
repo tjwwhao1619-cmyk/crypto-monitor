@@ -1,7 +1,9 @@
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -27,6 +29,7 @@ from alt_moonshot_validate import enrich_validation_context, rule_hits
 
 
 FACTOR_WINDOW_HOURS = (2, 4, 6, 12, 24)
+DISCORD_API_BASE = "https://discord.com/api/v10"
 
 
 def current_row_from_klines(symbol, klines, end_time):
@@ -590,6 +593,163 @@ def build_report(rows, uncertain, args, client):
     return "\n".join(lines) + "\n"
 
 
+def discord_env_value(name):
+    value = os.environ.get(name, "")
+    if value:
+        return value.strip().strip("'\"")
+    env_file = Path("/etc/crypto-monitor.env")
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, raw_value = raw.split("=", 1)
+            if key.strip() == name:
+                return raw_value.strip().strip("'\"")
+    except Exception:
+        return ""
+    return ""
+
+
+def discord_moonshot_channel_id():
+    for name in (
+        "DISCORD_MOONSHOT_CHANNEL_ID",
+        "DISCORD_ALT_WATCH_CHANNEL_ID",
+        "DISCORD_OBSERVE_CHANNEL_ID",
+        "DISCORD_ALERTS_CHANNEL_ID",
+    ):
+        value = discord_env_value(name)
+        if value:
+            return value
+    return ""
+
+
+def report_publish_signature(rows):
+    signature_version = "discord_summary_v2"
+    workbench = [row for row in rows if row.get("trade_grade") in {"S级", "A级", "B级"}]
+    grade_order = {"S级": 3, "A级": 2, "B级": 1}
+    workbench.sort(key=lambda row: (grade_order.get(row.get("trade_grade"), 0), hist.safe_float(row.get("screen_score"), 0.0) or 0.0), reverse=True)
+    payload = {
+        "version": signature_version,
+        "items": [
+            {
+                "symbol": row.get("symbol"),
+                "grade": row.get("trade_grade"),
+                "status": row.get("trade_status"),
+                "score": round(hist.safe_float(row.get("screen_score"), 0.0) or 0.0, 1),
+                "exit": row.get("exit_risk_level"),
+                "short": row.get("short_bias"),
+            }
+            for row in workbench[:12]
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def discord_workbench_line(row):
+    symbol = str(row.get("symbol") or "-").replace("USDT", "")
+    parts = [
+        f"**{symbol}** {row.get('trade_grade')} {row.get('trade_status')}",
+        f"分{row.get('screen_score')}",
+        f"市值{fmt_m(row.get('estimated_event_size'))}",
+        f"Top10 {fmt_pct(row.get('holder_top10_adjusted_pct'))}",
+        f"24h {fmt_pct(row.get('price_change_24h'))}",
+        f"OI2h {fmt_pct(row.get('pre2h_oi_change'))}",
+    ]
+    return " | ".join(parts) + f"\n确认：{row.get('trade_confirmation')}\n操作：{row.get('trade_action')}\n风险：{row.get('trade_risk')}"
+
+
+def discord_exit_line(row):
+    symbol = str(row.get("symbol") or "-").replace("USDT", "")
+    return (
+        f"**{symbol}** {row.get('exit_risk_level')} / {row.get('short_bias')} | "
+        f"24h {fmt_pct(row.get('price_change_24h'))} | OI2h {fmt_pct(row.get('pre2h_oi_change'))} | "
+        f"主买2h {hist.safe_float(row.get('pre2h_taker_buy_sell'), 0):.2f}\n"
+        f"{row.get('exit_reason')}；{row.get('exit_action')}"
+    )
+
+
+def discord_join_lines(lines, limit=950):
+    kept = []
+    size = 0
+    for line in lines:
+        candidate_size = size + len(line) + (2 if kept else 0)
+        if candidate_size > limit:
+            break
+        kept.append(line)
+        size = candidate_size
+    return "\n\n".join(kept)
+
+
+def discord_report_fields(rows):
+    workbench = [row for row in rows if row.get("trade_grade") in {"S级", "A级", "B级"}]
+    grade_order = {"S级": 3, "A级": 2, "B级": 1}
+    workbench.sort(key=lambda row: (grade_order.get(row.get("trade_grade"), 0), hist.safe_float(row.get("screen_score"), 0.0) or 0.0), reverse=True)
+    exit_rows = [row for row in rows if hist.safe_float(row.get("exit_risk_score"), 0.0) >= 25]
+    exit_rows.sort(key=lambda row: hist.safe_float(row.get("exit_risk_score"), 0.0) or 0.0, reverse=True)
+
+    fields = []
+    for grade in ("S级", "A级", "B级"):
+        grade_rows = [row for row in workbench if row.get("trade_grade") == grade]
+        if not grade_rows:
+            continue
+        value = discord_join_lines([discord_workbench_line(row) for row in grade_rows[:4]])
+        if value:
+            fields.append({"name": f"{grade}候选", "value": value, "inline": False})
+    exit_value = discord_join_lines([discord_exit_line(row) for row in exit_rows[:5]])
+    if exit_value:
+        fields.append({"name": "过热 / 暂不做空", "value": exit_value, "inline": False})
+    fields.append({"name": "完整报告", "value": "`!妖币` 查看完整工作台；`!山寨` 查看实时观察队列。", "inline": False})
+    return fields or [{"name": "状态", "value": "当前暂无妖币候选。", "inline": False}]
+
+
+def publish_report_to_discord(report, rows, out_dir):
+    if discord_env_value("DISCORD_ENABLED").lower() not in {"1", "true", "yes", "on"}:
+        return
+    bot_token = discord_env_value("DISCORD_BOT_TOKEN")
+    channel_id = discord_moonshot_channel_id()
+    if not bot_token or not channel_id:
+        print("Discord moonshot publish skipped: token/channel missing", flush=True)
+        return
+
+    state_path = Path(out_dir) / "current_moonshot_screen_discord_state.json"
+    signature = report_publish_signature(rows)
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    except Exception:
+        state = {}
+    if state.get("signature") == signature:
+        print("Discord moonshot publish skipped: unchanged", flush=True)
+        return
+
+    payload = {
+        "embeds": [
+            {
+                "title": "🟣 妖币交易工作台",
+                "description": "S/A/B 妖币候选；只做观察和确认，不盲追。",
+                "color": 0x9B59B6,
+                "fields": discord_report_fields(rows),
+                "timestamp": hist.utc_now().isoformat(),
+            }
+        ]
+    }
+    url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages"
+    response = requests.post(
+        url,
+        headers={"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=15,
+    )
+    if response.status_code >= 300:
+        print(f"Discord moonshot publish failed: {response.status_code} {response.text[:300]}", flush=True)
+        return
+    state_path.write_text(
+        json.dumps({"signature": signature, "published_at": hist.utc_now().isoformat()}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Discord moonshot report sent: channel={channel_id[-4:]}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Current offline screen for controlled moonshot candidates.")
     parser.add_argument("--days", type=int, default=60)
@@ -654,6 +814,7 @@ def main():
     report = build_report(rows, uncertain, args, client)
     txt_path.write_text(report, encoding="utf-8")
     latest_path.write_text(report, encoding="utf-8")
+    publish_report_to_discord(report, rows, out_dir)
     print(report)
     print(f"wrote {csv_path}")
     print(f"wrote {txt_path}")

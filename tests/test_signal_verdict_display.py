@@ -84,6 +84,33 @@ def test_signal_verdict_medium_long_display_in_single_embed(monkeypatch):
     assert "SignalVerdict" not in text
 
 
+def test_realtime_low_verdict_downgrades_route_and_title():
+    sig = m.Signal("LINEAUSDT", "discovery", 1, "启动", "smoke", "k", snapshot("LINEAUSDT"))
+    decision = m.RouteDecision(m.DISCORD_ROUTE_REALTIME, "实时", "core discovery realtime", 172, False, ["realtime"])
+    verdict = m.SignalVerdict(
+        final_direction="仅观察",
+        confidence="低",
+        entry_state="仅观察",
+        verdict_score=57,
+        long_score=57,
+        risk_score=22,
+        conflict_score=15,
+        entry_score=32,
+        primary_reasons=["确认不足，先观察"],
+        risk_reasons=["暂无压倒性风险"],
+        display_title="普通观察",
+        action_text="确认不足，降低打扰，等待资金和K线共振",
+    )
+
+    guarded = m.discord_route_decision_after_verdict(decision, verdict)
+    title = m.discord_signal_title_for_route(sig, "A", guarded)
+
+    assert guarded.route == m.DISCORD_ROUTE_PRIORITY_OBSERVE
+    assert "verdict_low_downgrade" in guarded.route_tags
+    assert "高把握信号" not in title
+    assert "重点观察" in title
+
+
 def test_signal_verdict_risk_medium_display_in_candidate():
     row = {
         "symbol": "TSTUSDT",
