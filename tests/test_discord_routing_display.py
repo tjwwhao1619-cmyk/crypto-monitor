@@ -263,8 +263,8 @@ def test_conflict_observe_channel_is_not_main_or_risk():
 
     channel = m.discord_channel_for_route(decision, sig, {"main": "1", "risk": "2", "alerts": "3"})
 
-    assert channel == "alerts"
-    assert channel not in {"main", "risk", "high-confidence", "high_confidence"}
+    assert channel == "suppress"
+    assert channel not in {"main", "risk", "alerts", "high-confidence", "high_confidence"}
 
 
 def test_conflict_observe_channel_prefers_observe_when_configured():
@@ -375,13 +375,15 @@ def test_discord_channel_command_outputs_matrix_keywords():
     assert "Discord 频道治理矩阵" in text
     assert "main id configured?" in text
     assert "main_asset id configured?" in text
+    assert "moonshot id configured?" in text
     assert "主流雷达" in text
+    assert "妖币交易工作台" in text
     assert "priority_observe" in text
     assert "suppressed_digest" in text
     assert "美股代币" in text
 
 
-def test_conflict_title_channel_fallback_alerts_without_observe():
+def test_conflict_title_channel_does_not_fallback_to_alerts_without_observe():
     corrected = m.discord_correct_route_channel_mismatch(
         m.DISCORD_ROUTE_CONFLICT_OBSERVE,
         "main",
@@ -391,10 +393,10 @@ def test_conflict_title_channel_fallback_alerts_without_observe():
         title="🟡 多空分歧观察 ADA/USDT",
     )
 
-    assert corrected == "alerts"
+    assert corrected == "suppress"
 
 
-def test_conflict_title_channel_defense_corrects_main_to_alerts(caplog):
+def test_conflict_title_channel_defense_suppresses_without_observe_or_alt(caplog):
     item = m.DiscordOutboundMessage(
         channel_key="main",
         title="🟡 多空分歧观察 TST/USDT",
@@ -407,10 +409,8 @@ def test_conflict_title_channel_defense_corrects_main_to_alerts(caplog):
     monitor.discord_outbound_queue = queue.Queue()
 
     with caplog.at_level("WARNING"):
-        assert monitor.enqueue_discord_message(item)
+        assert not monitor.enqueue_discord_message(item)
 
-    queued = monitor.discord_outbound_queue.get_nowait()
-    assert queued.channel_key == "alerts"
     assert "Discord conflict channel mismatch corrected: symbol=TSTUSDT" in caplog.text
 
 
@@ -511,7 +511,7 @@ def test_conflict_observe_copy_and_long_evidence_sanitized(monkeypatch):
     title = m.discord_signal_title_for_route(sig, "B", decision)
     fields = m.discord_signal_fields(sig, "B", 60, "smoke", decision)
     text = "\n".join([title] + [f"{name}\n{value}" for name, value, _inline in fields])
-    long_value = next(value for name, value, _inline in fields if name == "看多证据")
+    long_value = next(value for name, value, _inline in fields if name == "看多理由")
 
     assert "多空分歧观察" in text
     assert "暂不站队" in text
@@ -563,13 +563,11 @@ def test_single_signal_internal_conflict_risk_with_bullish_kline_display(monkeyp
     title = m.discord_signal_title_for_route(sig, "B", decision)
     fields = m.discord_signal_fields(sig, "B", 60, "smoke", decision)
     channel = m.discord_channel_for_route(decision, sig, {"main": "1", "risk": "2", "alerts": "3", "observe": "4"})
-    direction_value = next(value for name, value, _inline in fields if name == "币种/方向")
-    long_value = next(value for name, value, _inline in fields if name == "看多证据")
+    long_value = next(value for name, value, _inline in fields if name == "看多理由")
     text = "\n".join(value for _name, value, _inline in fields)
 
     assert decision.route == m.DISCORD_ROUTE_CONFLICT_OBSERVE
     assert "多空分歧观察" in title
-    assert "观察 / 暂不站队" in direction_value
     assert channel == "observe"
     assert channel not in {"risk", "main"}
     assert "短线结构转强，但中长线资金和大周期仍不支持，暂不站队" in text

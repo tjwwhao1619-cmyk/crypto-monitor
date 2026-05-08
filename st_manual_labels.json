@@ -1,0 +1,144 @@
+{
+  "labels": [
+    {
+      "address": "0xa7a07277f8624866dce340115a9d88451e687e2b",
+      "type": "project_treasury",
+      "label": "ST 疑似项目方总仓",
+      "note": "Top1 88.9%，极静态集中仓，优先视作项目方仓/金库",
+      "priority": "critical"
+    },
+    {
+      "address": "0x73d8bd54f7cf5fab43fe4ef40a62d390644946db",
+      "type": "binance_alpha_distribution",
+      "label": "Binance Alpha 分发/活动钱包",
+      "note": "外部资料指向 Binance Alpha 重复空投/分发钱包；ST 高频动作优先按 Alpha 活动/分发噪音解释，只有进入 DEX 或 confirmed exchange 才升级风险",
+      "priority": "critical"
+    },
+    {
+      "address": "0xb33fdb82eeb599ea219c0c4a82f3bdd4f63bcc7e",
+      "type": "standard_whale",
+      "label": "ST 标准大户 A",
+      "note": "大额持仓但对手少，偏静态普通大户",
+      "priority": "high"
+    },
+    {
+      "address": "0x317cd61fa24e2e4068b4c47bd58d5fc9f4e7a12b",
+      "type": "hidden_hub",
+      "label": "ST 隐性Hub A",
+      "note": "对手数和流出次数极高，不宜仅当普通大户",
+      "priority": "high"
+    },
+    {
+      "address": "0xa28fbe10f33f1ba9bcdfddaff1bd224e01583581",
+      "type": "static_treasury",
+      "label": "ST 静态仓 B",
+      "note": "静态分仓，长期不动时信号噪音低",
+      "priority": "high"
+    },
+    {
+      "address": "0xd9842b436a1cc6f39a24a8bedb22d22e889698f9",
+      "type": "standard_whale",
+      "label": "ST 标准大户 B",
+      "note": "有一定历史调仓，但不具备明显Hub形态",
+      "priority": "high"
+    },
+    {
+      "address": "0x5978ee22a60d85d01cfcfa8c5da029e5b6c63ac1",
+      "type": "standard_whale",
+      "label": "ST 标准大户 C",
+      "note": "低频大户，适合观察持仓稳定性变化",
+      "priority": "medium"
+    },
+    {
+      "address": "0x357c11fa815b25fc8175d917642ba79436c9e073",
+      "type": "static_treasury",
+      "label": "ST 静态仓 A",
+      "note": "单笔接收后长期静置，首次明显转出需最高优先级提醒",
+      "priority": "critical"
+    },
+    {
+      "address": "0x238a358808379702088667322f80ac48bad5e6c4",
+      "type": "core_hub",
+      "label": "ST 核心Hub B",
+      "note": "超高频核心枢纽地址，疑似主分发/归集节点",
+      "priority": "critical"
+    },
+    {
+      "address": "0xc9129bc3f7744bf7d509d26f99930da5c6e12331",
+      "type": "static_treasury",
+      "label": "ST 静态仓 C",
+      "note": "静态中型分仓，若突然转出需提高警惕",
+      "priority": "high"
+    },
+    {
+      "address": "0xfb770638ac4bc24720aac4b337ec098a26685f64",
+      "type": "static_treasury",
+      "label": "ST 静态仓 D",
+      "note": "静态小分仓，平时噪音低，动作时更有价值",
+      "priority": "high"
+    },
+    {
+      "address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe",
+      "type": "accumulator_priority",
+      "label": "ST 优先吸筹地址",
+      "note": "当前最值得跟的一跳扩散吸筹源头",
+      "priority": "high"
+    },
+    {
+      "address": "0x6fdf1f0dd9d1533f31d87787bda9cbcc7a311bf8",
+      "type": "hidden_hub",
+      "label": "ST 隐性Hub C",
+      "note": "中等规模高流转地址，适合辅助判断扩散/归集",
+      "priority": "high"
+    },
+    {
+      "address": "0x4982085c9e2f89f2ecb8131eca71afad896e89cb",
+      "type": "hidden_hub",
+      "label": "ST 隐性Hub D",
+      "note": "已命中MEXC热钱包标签且周转明显，偏交易流转型",
+      "priority": "high"
+    },
+    {
+      "address": "0x36accdfa8fd659640e7067c90715f055686ab3ba",
+      "type": "standard_whale",
+      "label": "ST 标准大户 D",
+      "note": "交易对手少，偏少数地址间反复调仓",
+      "priority": "medium"
+    },
+    {
+      "address": "0xb300000b72deaeb607a12d5f54773d1c19c7028d",
+      "type": "hidden_hub",
+      "label": "ST 隐性Hub B",
+      "note": "超高周转且余额低，典型流转型大户",
+      "priority": "high"
+    },
+    {
+      "address": "0xcc282e2004428939ee5149a9e7872f0b4d5d5ec7",
+      "type": "static_treasury",
+      "label": "ST 静态仓 E",
+      "note": "几乎静态的小分仓，首次外流比日常波动更重要",
+      "priority": "high"
+    },
+    {
+      "address": "0xcd8e6798673a8ab3184895f9836ab40202b4e47d",
+      "type": "accumulator_priority",
+      "label": "ST 优先吸筹地址 B",
+      "note": "纯净流入型吸筹候选，当前无明显流出",
+      "priority": "high"
+    },
+    {
+      "address": "0x6d401d9ba5746783bf0e8ca25a6168faf94a2609",
+      "type": "accumulator_priority",
+      "label": "ST 优先吸筹地址 C",
+      "note": "多笔流入零流出，适合纳入吸筹跟踪池",
+      "priority": "high"
+    },
+    {
+      "address": "0x587b83d62e0fb65ac9b4b97e5aad1d657e6e877c",
+      "type": "accumulator_priority",
+      "label": "ST 优先吸筹地址 D",
+      "note": "有进有出但净流入为正，适合跟踪是否继续承接",
+      "priority": "medium"
+    }
+  ]
+}

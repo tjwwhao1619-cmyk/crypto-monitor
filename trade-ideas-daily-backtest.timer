@@ -1,0 +1,10 @@
+[Unit]
+Description=Run daily high R/R trade ideas backtest
+
+[Timer]
+OnCalendar=*-*-* 00:35:00
+Persistent=true
+Unit=trade-ideas-daily-backtest.service
+
+[Install]
+WantedBy=timers.target

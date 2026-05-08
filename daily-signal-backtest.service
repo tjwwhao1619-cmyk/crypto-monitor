@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily contract signal backtest
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/crypto-monitor
+EnvironmentFile=-/etc/crypto-monitor.env
+ExecStart=/opt/crypto-monitor/.venv/bin/python /opt/crypto-monitor/daily_signal_backtest_job.py --limit 80 --print-summary

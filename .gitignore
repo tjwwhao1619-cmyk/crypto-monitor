@@ -17,5 +17,23 @@ external_data.sqlite
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
+*.sqlite3
 .cache/
 backtest_klines/
+
+# Runtime reports, ledgers, state, and local watch snapshots
+reports/
+HANDOFF_*.md
+*.log
+*.lock
+*_state.json
+*_cache.json
+*_status.json
+*_watch_addresses.json
+personal_holding_st_state.json
+personal_watch_*_state.json
+trade_ideas_state.json
+st_watch_addresses.json
+watchlist_tokens.json
+moonshot_watchlist_tokens.json
+lyn_watch_addresses.json

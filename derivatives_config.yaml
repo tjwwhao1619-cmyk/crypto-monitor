@@ -23,11 +23,9 @@ screener:
   - XRPUSDT
   - DOGEUSDT
   - ADAUSDT
-  - AVAXUSDT
-  - LINKUSDT
-  - TONUSDT
   - TRXUSDT
-  - DOTUSDT
+  - TONUSDT
+  - AVAXUSDT
   include_symbols: []
   exclude_symbols:
   - BTCDOMUSDT
@@ -104,6 +102,15 @@ flow:
   - 15m
   - 1h
   - 4h
+contract_context:
+  enabled: false
+  periods:
+  - 15m
+  - 1h
+  - 4h
+  - 24h
+  - 72h
+  - 168h
 alert_cooldowns:
   hot_breakout: 1200
   top_risk: 1800

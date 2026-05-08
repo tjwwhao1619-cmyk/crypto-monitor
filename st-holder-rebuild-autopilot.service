@@ -1,0 +1,19 @@
+[Unit]
+Description=ST holder rebuild autopilot
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-monitor
+EnvironmentFile=/etc/crypto-monitor.env
+Environment=ST_HOLDER_AUTOPILOT_BATCH_SEGMENTS=120
+Environment=ST_HOLDER_AUTOPILOT_SLEEP_SECONDS=2
+Environment=ST_HOLDER_AUTOPILOT_MAX_IDLE_ROUNDS=8
+Environment=ST_HOLDER_AUTOPILOT_MAX_LOAD1=8
+Environment=ST_HOLDER_AUTOPILOT_PAUSE_ON_HIGH_LOAD=30
+ExecStart=/opt/crypto-monitor/.venv/bin/python /opt/crypto-monitor/st_holder_rebuild_autopilot.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

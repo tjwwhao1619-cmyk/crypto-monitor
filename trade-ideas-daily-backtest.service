@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily high R/R trade ideas backtest
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/crypto-monitor
+EnvironmentFile=-/etc/crypto-monitor.env
+ExecStart=/opt/crypto-monitor/.venv/bin/python /opt/crypto-monitor/trade_ideas_daily_backtest.py --lookback-days 3 --print-summary

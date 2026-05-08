@@ -69,6 +69,7 @@ FLOW_MID_PERIODS = ["4h", "12h", "24h"]
 FLOW_LONG_PERIODS = ["48h", "72h", "96h", "120h", "144h"]
 FLOW_PANEL_PERIODS = ["5m", "15m", "1h", "4h", "12h", "24h", "72h", "144h"]
 FLOW_PERIODS = FLOW_SHORT_PERIODS + FLOW_MID_PERIODS + FLOW_LONG_PERIODS
+CONTRACT_CONTEXT_PERIODS = ["15m", "1h", "4h", "24h", "72h", "168h"]
 FLOW_SHORT_CACHE_TTL_SECONDS = 120
 FLOW_MID_CACHE_TTL_SECONDS = 900
 FLOW_LONG_CACHE_TTL_SECONDS = 2700
@@ -88,16 +89,14 @@ CORE_MOMENTUM_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"}
 MAINSTREAM_WATCH_SYMBOLS = {
     "BTCUSDT",
     "ETHUSDT",
-    "SOLUSDT",
     "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
     "DOGEUSDT",
     "ADAUSDT",
-    "XRPUSDT",
-    "AVAXUSDT",
-    "LINKUSDT",
+    "TRXUSDT",
     "TONUSDT",
-    "OPUSDT",
-    "ARBUSDT",
+    "AVAXUSDT",
 }
 ONCHAIN_SUMMARY_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"]
 DISCORD_CHANNEL_ENV_KEYS = {
@@ -109,6 +108,7 @@ DISCORD_CHANNEL_ENV_KEYS = {
     "summary": "DISCORD_SUMMARY_CHANNEL_ID",
     "digest": "DISCORD_DIGEST_CHANNEL_ID",
     "debug": "DISCORD_DEBUG_CHANNEL_ID",
+    "moonshot": "DISCORD_MOONSHOT_CHANNEL_ID",
     "alt_watch": "DISCORD_ALT_WATCH_CHANNEL_ID",
     "onchain": "DISCORD_ONCHAIN_CHANNEL_ID",
     "stock_token": "DISCORD_STOCK_TOKEN_CHANNEL_ID",
@@ -153,6 +153,11 @@ class MarketSnapshot:
     close_price: float
     spot_price: float | None = None
     price_change_periods: dict[str, float] | None = None
+    oi_change_periods: dict[str, float] | None = None
+    global_long_short_periods: dict[str, float] | None = None
+    top_position_periods: dict[str, float] | None = None
+    top_account_periods: dict[str, float] | None = None
+    taker_buy_sell_periods: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -594,6 +599,17 @@ SIGNAL_LOG_FIELDS = [
     "discord_route_tags",
     "suppressed_from_telegram",
 ]
+for _period in reversed(CONTRACT_CONTEXT_PERIODS):
+    _insert_at = SIGNAL_LOG_FIELDS.index("price_position_24h")
+    for _field in reversed((
+        f"oi_change_{_period}_percent",
+        f"global_long_short_ratio_{_period}",
+        f"top_position_ratio_{_period}",
+        f"top_account_ratio_{_period}",
+        f"taker_buy_sell_ratio_{_period}",
+    )):
+        if _field not in SIGNAL_LOG_FIELDS:
+            SIGNAL_LOG_FIELDS.insert(_insert_at, _field)
 
 
 class DerivativesMonitor:
@@ -611,6 +627,7 @@ class DerivativesMonitor:
         self.confirmation_config = config.get("confirmation", {})
         self.market_filter_config = config.get("market_filter", {})
         self.flow_config = config.get("flow", {})
+        self.contract_context_config = config.get("contract_context", {})
         self.benchmark_snapshot: MarketSnapshot | None = None
         self.poll_interval = int(config.get("poll_interval_seconds", 300))
         self.scan_workers = int(config.get("scan_workers", 8))
@@ -2736,10 +2753,50 @@ class DerivativesMonitor:
     def collect_external_data_if_due(self) -> None:
         self.collect_defillama_stablecoin_supply_if_due()
         self.collect_defillama_extended_metrics_if_due()
+        self.collect_coinglass_market_context_if_due()
         self.collect_dexscreener_market_snapshots_if_due()
         self.collect_futures_only_liquidity_watch_if_due()
         self.collect_onchain_scan_transfers_if_due()
         self.collect_stock_token_snapshots_if_due()
+
+    def collect_coinglass_market_context_if_due(self) -> None:
+        if not self.coinglass_api_key:
+            self.update_source_health("CoinGlass aggregation", False, "COINGLASS_API_KEY not configured")
+            return
+        fetched = written = 0
+        errors = 0
+        for symbol in ONCHAIN_SUMMARY_SYMBOLS:
+            try:
+                before_count = self.count_recent_coinglass_metrics(symbol, since_seconds=COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS)
+                self.format_coinglass_market_context(symbol)
+                after_count = self.count_recent_coinglass_metrics(symbol, since_seconds=COINGLASS_MARKET_CONTEXT_CACHE_TTL_SECONDS)
+                fetched += 1
+                if after_count > before_count:
+                    written += after_count - before_count
+            except Exception as exc:
+                errors += 1
+                logging.debug("CoinGlass scheduled context refresh failed: %s", symbol, exc_info=True)
+        if fetched and errors < fetched:
+            self.update_source_health("CoinGlass aggregation", True, fetched_count=fetched, written_count=written)
+            logging.info("CoinGlass scheduled context refreshed: symbols=%s written=%s errors=%s", fetched, written, errors)
+        else:
+            self.update_source_health("CoinGlass aggregation", False, "scheduled refresh failed or no usable context", fetched_count=fetched, written_count=written)
+
+    def count_recent_coinglass_metrics(self, symbol: str, since_seconds: int = 3600) -> int:
+        cutoff = time.time() - since_seconds
+        with self.external_data_lock:
+            with self.external_db_connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM external_data_points
+                    WHERE source = 'CoinGlass aggregation'
+                      AND symbol = ?
+                      AND timestamp >= ?
+                    """,
+                    (normalize_usdt_symbol(symbol), cutoff),
+                ).fetchone()
+        return int(row[0] or 0) if row else 0
 
     def stock_token_enabled(self) -> bool:
         return bool(self.stock_token_config.get("enabled", False))
@@ -3829,6 +3886,8 @@ class DerivativesMonitor:
 
     def send_coinglass_summary_if_due(self) -> None:
         if not self.discord_config.enabled or not self.discord_config.bot_token:
+            return
+        if os.getenv("COINGLASS_MAIN_FUNDS_SUMMARY_ENABLED", "0").lower() not in {"1", "true", "on", "yes"}:
             return
         now = time.time()
         hour_key = int(now // 3600)
@@ -4921,6 +4980,7 @@ class DerivativesMonitor:
         last_oi = float(oi_rows[-1]["sumOpenInterestValue"])
         price_change_periods = price_change_periods_from_klines(klines, self.period)
         net_flow_usd, net_flow_ratio = self.fetch_flow_metrics(symbol, last_close)
+        contract_context = self.fetch_contract_context_metrics(symbol)
         high_24h = float(ticker_24h.get("highPrice", last_close) or last_close)
         low_24h = float(ticker_24h.get("lowPrice", last_close) or last_close)
         if high_24h > low_24h:
@@ -4951,7 +5011,63 @@ class DerivativesMonitor:
             close_price=last_close,
             spot_price=safe_float(funding.get("indexPrice")),
             price_change_periods=price_change_periods,
+            oi_change_periods=contract_context.get("oi_change_periods"),
+            global_long_short_periods=contract_context.get("global_long_short_periods"),
+            top_position_periods=contract_context.get("top_position_periods"),
+            top_account_periods=contract_context.get("top_account_periods"),
+            taker_buy_sell_periods=contract_context.get("taker_buy_sell_periods"),
         )
+
+    def fetch_contract_context_metrics(self, symbol: str) -> dict[str, dict[str, float]]:
+        if not self.contract_context_config.get("enabled", False):
+            return {
+                "oi_change_periods": {},
+                "global_long_short_periods": {},
+                "top_position_periods": {},
+                "top_account_periods": {},
+                "taker_buy_sell_periods": {},
+            }
+
+        configured_periods = [str(period) for period in self.contract_context_config.get("periods", CONTRACT_CONTEXT_PERIODS)]
+        periods = list(dict.fromkeys(configured_periods))
+        oi_change_periods: dict[str, float] = {}
+        global_long_short_periods: dict[str, float] = {}
+        top_position_periods: dict[str, float] = {}
+        top_account_periods: dict[str, float] = {}
+        taker_buy_sell_periods: dict[str, float] = {}
+
+        for period in periods:
+            binance_period, limit, required_rows = contract_context_binance_request(period)
+            try:
+                oi_rows = self.get_data("openInterestHist", {"symbol": symbol, "period": binance_period, "limit": limit})
+                if oi_rows and len(oi_rows) >= required_rows:
+                    value = history_percent_change(oi_rows[-required_rows:], "sumOpenInterestValue")
+                    if value is not None:
+                        oi_change_periods[period] = value
+            except Exception:
+                logging.debug("Failed to fetch contract OI context for %s %s", symbol, period, exc_info=True)
+            for endpoint, key, output in (
+                ("globalLongShortAccountRatio", "longShortRatio", global_long_short_periods),
+                ("topLongShortPositionRatio", "longShortRatio", top_position_periods),
+                ("topLongShortAccountRatio", "longShortRatio", top_account_periods),
+                ("takerlongshortRatio", "buySellRatio", taker_buy_sell_periods),
+            ):
+                try:
+                    rows = self.get_data(endpoint, {"symbol": symbol, "period": binance_period, "limit": limit})
+                    if rows and len(rows) >= required_rows:
+                        value = average_float(rows[-required_rows:], key)
+                        if value is not None:
+                            output[period] = value
+                except Exception:
+                    logging.debug("Failed to fetch contract ratio context for %s %s %s", symbol, endpoint, period, exc_info=True)
+
+        return {
+            "oi_change_periods": oi_change_periods,
+            "global_long_short_periods": global_long_short_periods,
+            "top_position_periods": top_position_periods,
+            "top_account_periods": top_account_periods,
+            "taker_buy_sell_periods": taker_buy_sell_periods,
+        }
 
     def fetch_flow_metrics(self, symbol: str, price: float) -> tuple[dict[str, float], dict[str, float]]:
         if not self.flow_config.get("enabled", False):
@@ -5039,7 +5155,7 @@ class DerivativesMonitor:
         return signals
 
     def main_asset_radar_signal(self, snapshot: MarketSnapshot) -> Signal | None:
-        if not is_major_asset_tier(snapshot.symbol):
+        if str(snapshot.symbol or "").strip().upper() not in MAINSTREAM_WATCH_SYMBOLS:
             return None
 
         leading = leading_signal_score(snapshot, None)
@@ -5539,6 +5655,13 @@ class DerivativesMonitor:
             "discord_route_tags": ";".join(discord_route.route_tags),
             "suppressed_from_telegram": int(suppressed_from_telegram),
         }
+        if snapshot:
+            for period in CONTRACT_CONTEXT_PERIODS:
+                row[f"oi_change_{period}_percent"] = (snapshot.oi_change_periods or {}).get(period, "")
+                row[f"global_long_short_ratio_{period}"] = (snapshot.global_long_short_periods or {}).get(period, "")
+                row[f"top_position_ratio_{period}"] = (snapshot.top_position_periods or {}).get(period, "")
+                row[f"top_account_ratio_{period}"] = (snapshot.top_account_periods or {}).get(period, "")
+                row[f"taker_buy_sell_ratio_{period}"] = (snapshot.taker_buy_sell_periods or {}).get(period, "")
         path = Path(self.signal_log_path)
         fieldnames, write_header = ensure_csv_schema(path, SIGNAL_LOG_FIELDS)
         with path.open("a", newline="", encoding="utf-8") as file:
@@ -6514,7 +6637,7 @@ class DerivativesMonitor:
         logging.info("Discord alt watch queued: %s %s score=%s", symbol, signal.kind, sort_score)
 
     def discord_alt_watch_channel_key(self) -> str:
-        return "alt_watch" if self.discord_config.channel_ids.get("alt_watch") else "digest"
+        return discord_moonshot_channel_key(self.discord_config.channel_ids)
 
     def format_discord_alt_watch_digest(self, items: list[DiscordAltWatchItem]) -> str:
         lines: list[str] = []
@@ -6599,6 +6722,23 @@ class DerivativesMonitor:
         if not items:
             return "当前暂无山寨观察候选。"
         return discord_alt_watch_embed_v2(items, self.discord_alt_watch_channel_key(), "山寨观察", self.latest_snapshots)
+
+    def discord_moonshot_workbench_response(self) -> str | DiscordOutboundMessage:
+        path = Path("reports/alt_moonshots/latest_current_moonshot_screen.txt")
+        if not path.exists():
+            return "当前暂无妖币工作台报告，请先运行 alt_moonshot_current_screen.py。"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            logging.exception("Failed to read moonshot workbench report from %s", path)
+            return "妖币工作台读取失败，请查看服务日志。"
+        return DiscordOutboundMessage(
+            channel_key=self.discord_alt_watch_channel_key(),
+            title="🟣 妖币交易工作台",
+            color=DISCORD_COLOR_WATCH,
+            fields=discord_chunk_fields(text, "妖币", 850) or [("状态", "当前暂无妖币候选。", False)],
+            kind="moonshot_workbench",
+        )
 
     def flush_discord_alt_watch_digest_if_due(self, now: float | None = None) -> None:
         if not self.discord_config.enabled or not self.discord_config.bot_token:
@@ -6935,6 +7075,7 @@ class DerivativesMonitor:
                 ("summary", "市场摘要频道", "测试 市场摘要"),
                 ("digest", "静默摘要频道", "测试 静默摘要"),
                 ("debug", "机器人调试频道", "测试 调试"),
+                ("moonshot", "妖币工作台频道", "测试 妖币工作台"),
                 ("onchain", "外部资金频道", "测试 外部资金诊断"),
             ]
             failures: list[str] = []
@@ -7321,6 +7462,8 @@ class DerivativesMonitor:
             return discord_topq_embed_v2(message, "digest")
         if command == "!裁判统计":
             return discord_summary_embed_v2("SignalVerdict 影子统计", self.format_discord_verdict_shadow_stats(), "debug")
+        if command in ("!妖币", "!妖币工作台"):
+            return self.discord_moonshot_workbench_response()
         if command == "!山寨":
             return self.discord_alt_watch_command_response()
         if command == "!美股代币":
@@ -7397,16 +7540,17 @@ class DerivativesMonitor:
     def format_discord_channel_config_response(self) -> str:
         channel_ids = self.discord_config.channel_ids
         lines = ["Discord 频道治理矩阵"]
-        for key in ("main", "main_asset", "alerts", "observe", "risk", "alt_watch", "digest", "summary", "onchain", "stock_token"):
+        for key in ("main", "main_asset", "alerts", "observe", "risk", "moonshot", "alt_watch", "digest", "summary", "onchain", "stock_token"):
             lines.append(f"- {key} id configured? {'yes' if channel_ids.get(key) else 'no'}")
         lines.extend(
             [
                 "",
-                "main: 只接收 route=realtime 的 🟢 高把握信号 / 🟢 实时重点。",
-                "main_asset: 主流雷达，接收主流币趋势/风险/分歧观察；未配置时 fallback alerts，不 fallback main。",
-                "alerts/observe: priority_observe、多空分歧观察、非高风险爆发观察、高位观察、普通重点观察；observe 未配置时 fallback alerts。",
+                "main: 只接收 route=realtime 的 🟢 高把握信号 / 🟢 实时重点；不放主流观察、分歧、妖币观察。",
+                "main_asset: 主流方向盘/主流雷达，只接收市值前10主流币趋势/风险；未配置时 fallback alerts，不 fallback main。",
+                "moonshot: 妖币交易工作台、S/A/B 妖币候选、山寨观察摘要；未配置时 fallback alt_watch/observe/alerts。",
+                "alerts/observe: priority_observe、多空分歧观察、高位观察、普通重点观察；observe 未配置时 fallback alerts。",
                 "risk: 只接收 final_route=risk_realtime 的 top_risk/top_exhaustion/distribution/main_risk_watch。",
-                "alt_watch: 山寨观察摘要、普通观察、route=observe 的非主流非风险实时；futures-only DEX watch 走 onchain。",
+                "alt_watch: 兼容旧山寨观察频道；配置 moonshot 后优先用 moonshot。",
                 "digest: suppressed_digest、静默信号摘要、route=digest。",
                 "summary: 每小时市场简报、市场温度摘要；不放单币信号。",
                 "onchain: 主流外部资金观察、稳定币流动性背景、CoinGlass主流资金、DEX流动性、链上事件、数据源/采集统计自动摘要。",
@@ -9475,6 +9619,37 @@ def flow_binance_request(period: str) -> tuple[str, int, int]:
     return period, 1, 1
 
 
+def contract_context_binance_request(period: str) -> tuple[str, int, int]:
+    daily_periods = {
+        "24h": 1,
+        "72h": 3,
+        "168h": 7,
+    }
+    if period in daily_periods:
+        periods = daily_periods[period]
+        rows = periods + 1
+        return "1d", rows, rows
+    return period, 2, 2
+
+
+def history_percent_change(rows: list[dict[str, Any]], key: str) -> float | None:
+    if not rows or len(rows) < 2:
+        return None
+    first = safe_float(rows[0].get(key))
+    last = safe_float(rows[-1].get(key))
+    if first is None or last is None:
+        return None
+    return percent_change(first, last)
+
+
+def average_float(rows: list[dict[str, Any]], key: str) -> float | None:
+    values = [safe_float(row.get(key)) for row in (rows or [])]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
 def normalize_market_cap_symbol(base_asset: str) -> str:
     symbol = str(base_asset).lower()
     while symbol and symbol[0].isdigit():
@@ -9625,9 +9800,31 @@ def discord_observe_channel_key(channel_ids: dict[str, str] | None = None) -> st
     return "alerts"
 
 
+def discord_conflict_channel_key(channel_ids: dict[str, str] | None = None) -> str:
+    channel_ids = channel_ids or {}
+    if channel_ids.get("observe"):
+        return "observe"
+    if channel_ids.get("alt_watch"):
+        return "alt_watch"
+    if channel_ids.get("digest"):
+        return "digest"
+    return "suppress"
+
+
 def discord_stock_token_channel_key(channel_ids: dict[str, str] | None = None) -> str:
     channel_ids = channel_ids or {}
     return "stock_token" if channel_ids.get("stock_token") else "summary"
+
+
+def discord_moonshot_channel_key(channel_ids: dict[str, str] | None = None) -> str:
+    channel_ids = channel_ids or {}
+    if channel_ids.get("moonshot"):
+        return "moonshot"
+    if channel_ids.get("alt_watch"):
+        return "alt_watch"
+    if channel_ids.get("observe"):
+        return "observe"
+    return "alerts"
 
 
 def discord_main_asset_channel_key(channel_ids: dict[str, str] | None = None) -> str:
@@ -9647,8 +9844,8 @@ def discord_is_main_asset_signal(
     normalized_kind = topq_kind_normalized(kind)
     return (
         normalized_symbol in MAINSTREAM_WATCH_SYMBOLS
-        or normalized_kind in {"main_momentum_watch", "main_trend_watch", "main_risk_watch"}
-        or text_has_any(str(title or ""), ("主流", "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "DOGE/USDT", "XRP/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "TON/USDT"))
+        or (normalized_kind in {"main_momentum_watch", "main_trend_watch", "main_risk_watch"} and normalized_symbol in MAINSTREAM_WATCH_SYMBOLS)
+        or text_has_any(str(title or ""), ("BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT", "TRX/USDT", "TON/USDT", "AVAX/USDT"))
     )
 
 
@@ -9722,6 +9919,8 @@ def discord_channel_for_payload(
         return "debug" if payload == "diagnosis" else "command"
     if payload in {"stock_token", "stock_token_risk", "stock_token_source"} or "美股代币" in title_text:
         return discord_stock_token_channel_key(channel_ids)
+    if payload in {"moonshot", "moonshot_workbench", "alt_watch", "topq"} or text_has_any(title_text, ("妖币", "山寨观察")):
+        return discord_moonshot_channel_key(channel_ids)
     if payload in {"onchain", "external_funds_overview", "futures_only_liquidity"} or text_has_any(
         title_text,
         DISCORD_SUMMARY_ONCHAIN_TITLE_KEYWORDS,
@@ -9739,15 +9938,12 @@ def discord_channel_for_payload(
         if "美股代币" in title_text:
             return discord_stock_token_channel_key(channel_ids)
         return "summary"
-    if payload in {"alt_watch", "topq"}:
-        return "alt_watch" if payload == "alt_watch" else "digest"
-
+    if discord_is_conflict_observe(route_decision):
+        return discord_conflict_channel_key(channel_ids)
+    if route == DISCORD_ROUTE_CONFLICT_OBSERVE:
+        return discord_conflict_channel_key(channel_ids)
     if discord_is_main_asset_signal(payload_symbol, normalized_kind, title_text, route):
         return discord_main_asset_channel_key(channel_ids)
-    if discord_is_conflict_observe(route_decision):
-        return discord_observe_channel_key(channel_ids)
-    if route == DISCORD_ROUTE_CONFLICT_OBSERVE:
-        return discord_observe_channel_key(channel_ids)
     if route == DISCORD_ROUTE_REALTIME:
         if normalized_kind in {"main_momentum_watch", "main_trend_watch"}:
             return "main"
@@ -9758,10 +9954,10 @@ def discord_channel_for_payload(
         return discord_observe_channel_key(channel_ids)
     if route == DISCORD_ROUTE_OBSERVE:
         if normalized_kind in DISCORD_RISK_KINDS or "risk" in tag_set:
-            return "alt_watch" if channel_ids.get("alt_watch") else "alerts"
+            return discord_moonshot_channel_key(channel_ids)
         if signal and signal.symbol in MAINSTREAM_WATCH_SYMBOLS:
             return discord_observe_channel_key(channel_ids)
-        return "alt_watch" if channel_ids.get("alt_watch") else "alerts"
+        return discord_moonshot_channel_key(channel_ids)
     return "suppress"
 
 
@@ -9791,6 +9987,30 @@ def discord_correct_route_channel_mismatch(
             channel_key,
         )
         return "onchain"
+    if text_has_any(title_text, ("妖币", "山寨观察")) and channel_key not in {"moonshot", "alt_watch", "observe", "alerts"}:
+        corrected = discord_moonshot_channel_key(channel_ids)
+        logging.warning(
+            "Discord moonshot channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+            resolved_symbol or "-",
+            resolved_kind or "-",
+            route or "-",
+            channel_key,
+            corrected,
+            title or "-",
+        )
+        return corrected
+    if "多空分歧观察" in title_text and channel_key in {"main", "main_asset", "alerts", "high-confidence", "high_confidence", "risk", "digest", "alt_watch"}:
+        corrected = discord_conflict_channel_key(channel_ids)
+        logging.warning(
+            "Discord conflict channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
+            resolved_symbol or "-",
+            resolved_kind or "-",
+            route or DISCORD_ROUTE_CONFLICT_OBSERVE,
+            channel_key,
+            corrected,
+            title or "-",
+        )
+        return corrected
     if discord_is_main_asset_signal(resolved_symbol, resolved_kind, title_text, route) and channel_key not in {"main_asset", "alerts"}:
         corrected = discord_main_asset_channel_key(channel_ids)
         logging.warning(
@@ -9816,7 +10036,7 @@ def discord_correct_route_channel_mismatch(
         )
         return corrected
     if "多空分歧观察" in title_text and channel_key in {"main", "high-confidence", "high_confidence", "risk", "digest", "alt_watch"}:
-        corrected = discord_observe_channel_key(channel_ids)
+        corrected = discord_conflict_channel_key(channel_ids)
         logging.warning(
             "Discord conflict channel mismatch corrected: symbol=%s kind=%s final_route=%s from=%s to=%s title=%s",
             resolved_symbol or "-",
@@ -10148,6 +10368,13 @@ def discord_field_value(text: str) -> str:
     return truncate_text(str(text or ""), 900)
 
 
+def discord_plain_reason(text: str | None, max_len: int = 140) -> str:
+    value = clean_discord_reason(text)
+    value = re.sub(r"^[🔴🟢🟡⚪\s]+", "", value)
+    value = value.replace("；", "，")
+    return truncate_text(value, max_len)
+
+
 def discord_clamp_score_10(value: Any) -> tuple[int | None, float | None]:
     raw = parse_float(value)
     if raw is None:
@@ -10187,6 +10414,31 @@ def discord_price_oi_field_value(snapshot: MarketSnapshot) -> str:
         f"价格 {snapshot.close_price:.8g} | 涨跌 {snapshot.price_change_percent:+.2f}% | "
         f"OI {snapshot.oi_change_percent:+.2f}%{confirm_text}"
     )
+
+
+def discord_human_key_values(snapshot: MarketSnapshot, flow_label: str) -> str:
+    return discord_field_value(
+        f"价格 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}% | "
+        f"主买 {format_optional_value(snapshot.taker_buy_sell_ratio)} | "
+        f"费率 {format_optional_value(snapshot.funding_rate_percent)}% | "
+        f"资金 {flow_label}"
+    )
+
+
+def discord_human_risk_line(
+    snapshot: MarketSnapshot,
+    signal: Signal | None,
+    price_action: MultiTimeframePriceAction | None,
+) -> str:
+    trap_score, trap_label, trap_reason = trap_risk_score(snapshot, signal)
+    risk_bits = []
+    if trap_score >= 6:
+        risk_bits.append(f"{trap_label}: {trap_reason}")
+    if price_action is not None and price_action.risk_items:
+        risk_bits.extend(str(item) for item in price_action.risk_items[:2])
+    if not risk_bits:
+        risk_bits.append("暂无明显结构风险，但仍等15m/1h确认。")
+    return discord_field_value("；".join(dict.fromkeys(risk_bits[:3])))
 
 
 def discord_derivatives_field_value(snapshot: MarketSnapshot) -> str:
@@ -10741,13 +10993,10 @@ def discord_signal_fields(
         return discord_conflict_observe_fields(signal, route_decision=route_decision)
     if snapshot is None:
         evidence_name = "风险证据" if is_risk_structure_kind(signal.kind) else "证据"
-        verdict = build_signal_verdict(signal, route_decision=route_decision)
         return [
-            ("币种", signal.symbol, True),
-            ("方向", direction, True),
-            ("等级/把握", f"{priority} / 质量 {quality_score} / 信号 {signal.score}", True),
-            signal_verdict_display_field(verdict),
-            (evidence_name, truncate_text(quality_reason or signal.message, 1024), False),
+            ("结论", discord_field_value(f"{signal.symbol}：{direction}，数据不足，只做观察。"), False),
+            ("怎么做", discord_field_value("先不追，等下一轮价格/OI/资金确认。"), False),
+            (evidence_name, truncate_text(quality_reason or signal.message, 600), False),
         ]
 
     conviction, conviction_label, _conviction_reason = conviction_score(snapshot, signal)
@@ -10842,34 +11091,25 @@ def discord_signal_fields(
     if display_downgraded:
         level_text = f"{level_text}\n资金/结构未共振，观察为主"
     conclusion_text = DISCORD_CONSERVATIVE_OBSERVE_CONCLUSION if conservative_observe else clean_discord_reason(conflict_summary)
+    key_values = discord_human_key_values(snapshot, flow_label)
+    short_reason = discord_field_value(discord_plain_reason(human_route_reason))
+    short_risk = discord_human_risk_line(snapshot, signal, price_action)
     fields = [
-        ("币种/方向", discord_field_value(f"{signal.symbol} / {direction}"), True),
-        ("等级/把握", discord_field_value(level_text), True),
-        (
-            "Discord路由",
-            discord_field_value(route_text),
-            False,
-        ),
-        ("价格/OI", discord_price_oi_field_value(snapshot), False),
-        ("衍生品状态", discord_derivatives_field_value(snapshot), False),
-        ("资金流", discord_field_value(discord_flow_field_value(snapshot, conservative_observe)), False),
-        ("领先信号", discord_leading_field_value(snapshot, signal), False),
-        ("证据", discord_evidence_field_value(snapshot, signal), False),
-        ("风险提示", discord_risk_field_value(snapshot, signal, price_action, conservative_observe), False),
-        ("K线结构", discord_price_action_field_value(price_action, conservative_observe), False),
-        signal_verdict_display_field(verdict),
-        ("结论", discord_field_value(conclusion_text), False),
-        ("操作建议", discord_field_value(human_action), False),
+        ("结论", discord_field_value(f"{signal.symbol}：{discord_plain_reason(conclusion_text, 180)}"), False),
+        ("怎么做", discord_field_value(human_action), False),
+        ("关键值", key_values, False),
+        ("原因", short_reason, False),
+        ("风险", short_risk, False),
     ]
     if breakout_entry_confirmation_enabled(route_decision):
         entry = breakout_entry_confirmation(snapshot, price_action, signal, route_decision)
-        fields.insert(10, breakout_entry_confirmation_field(entry))
+        fields.insert(2, ("入场状态", discord_field_value(f"{BREAKOUT_ENTRY_STATE_LABELS.get(entry.state, '确认不足')}：{entry.summary}"), False))
     if conservative_observe:
         fields = [
             (name, discord_field_value(discord_conservative_observe_sanitize(value)), inline)
             for name, value, inline in fields
         ]
-    return fields[:13]
+    return fields[:10]
 
 
 def discord_signal_embed_v2(
@@ -11049,12 +11289,10 @@ def discord_alt_watch_embed_v2(
             kline_line = "K线：大周期确认不足"
             observe_explanation = f"\n说明：{DISCORD_PRIORITY_OBSERVE_CONFLICT_EXPLANATION}"
         value = (
-            f"{item.symbol} {signal_kind_label(item.kind)} | 把握{item.conviction_score} 质量{item.quality_score} | "
-            f"领先{item.leading_score} 证据{discord_compact_score_10_text(item.evidence_score)} 风险{item.trap_score} | 路由={discord_route_human_label(item.route)}\n"
-            f"价格 {format_percent_optional(item.price_change_percent)} | OI {format_percent_optional(item.oi_change_percent)} | 费率 {funding_text} | 基差 {basis_text}\n"
-            f"资金 15m {flow_15m} / 1h {flow_1h} / 4h {flow_4h} | 短{short_flow}/中{mid_flow}/长{long_flow} | {humanize_flow_label(flow_label)}\n"
-            f"{kline_line}\n"
-            f"结论：{clean_discord_reason(conclusion)}"
+            f"结论：{clean_discord_reason(conclusion)}\n"
+            f"原因：{signal_kind_label(item.kind)}｜把握{item.conviction_score}｜质量{item.quality_score}｜{humanize_flow_label(flow_label)}\n"
+            f"关键值：价{format_percent_optional(item.price_change_percent)}｜OI{format_percent_optional(item.oi_change_percent)}｜费率{funding_text}｜基差{basis_text}\n"
+            f"怎么看：{kline_line.replace('K线：', '')}"
             f"{observe_explanation}"
         )
         if conservative_observe:
@@ -12445,7 +12683,7 @@ def discord_candidate_compact_block(
 ) -> str:
     verdict = verdict or signal_verdict_for_candidate_row(row, decision, price_action)
     old_route = decision.route if decision else "-"
-    if discord_is_conflict_observe(decision):
+    if discord_is_conflict_observe(decision) or getattr(verdict, "final_direction", "") == "多空分歧":
         symbol = discord_symbol_pair(row.get("symbol"))
         header = (
             f"🟡 多空分歧观察 {symbol}｜"
@@ -13183,11 +13421,26 @@ def coinglass_orderbook_human_from_metrics(metrics: dict[str, Any]) -> str:
     return "暂无数据" if judgement == "n/a" else judgement
 
 
+def coinglass_taker_human_from_metrics(metrics: dict[str, Any]) -> str:
+    buy_ratio = metric_value(metrics, "taker_flow_buy_ratio")
+    sell_ratio = metric_value(metrics, "taker_flow_sell_ratio")
+    if ratio_gte(buy_ratio, 52):
+        return "主动买入偏多"
+    if ratio_gte(sell_ratio, 52):
+        return "主动卖出偏多"
+    if buy_ratio is not None or sell_ratio is not None:
+        return "主动买卖均衡"
+    return "主动买卖暂无数据"
+
+
 def coinglass_human_judgement(metrics: dict[str, Any], balances: dict[str, Any]) -> str:
     judgement = coinglass_panel_judgement(metrics, balances)
     orderbook = coinglass_orderbook_human_from_metrics(metrics)
+    taker = coinglass_taker_human_from_metrics(metrics)
     if "余额回流" in judgement and "卖压" in orderbook:
         return "抛压观察"
+    if "余额回流" in judgement and "主动卖出偏多" in taker:
+        return "分歧偏谨慎"
     if "支撑" in judgement and "承接" in orderbook:
         return "偏支撑"
     if "数据不足" in judgement:
@@ -13207,9 +13460,10 @@ def format_coinglass_human_summary_line(snapshot: dict[str, Any]) -> str:
     balances = snapshot.get("balances") if isinstance(snapshot.get("balances"), dict) else {}
     balance_text = format_coinglass_balance_human(balances)
     orderbook = coinglass_orderbook_human_from_metrics(metrics)
+    taker = coinglass_taker_human_from_metrics(metrics)
     judgement = coinglass_human_judgement(metrics, balances)
     if balance_text == "暂无数据":
-        return f"{symbol}: 余额缺失，订单簿{orderbook} -> {judgement}"
+        return f"{symbol}: 余额缺失，{taker}，订单簿{orderbook} -> {judgement}"
     balance_bias = "交易所余额短期流出" if any(
         parse_float((balances.get(period) or {}).get("change")) is not None
         and parse_float((balances.get(period) or {}).get("change")) < 0
@@ -13220,7 +13474,7 @@ def format_coinglass_human_summary_line(snapshot: dict[str, Any]) -> str:
         for period in ("24h", "7d")
     ) else f"交易所余额 {balance_text}"
     joiner = " + " if "回流" in balance_bias and "卖压" in orderbook else "，"
-    return f"{symbol}: {balance_bias}{joiner}订单簿{orderbook} -> {judgement}"
+    return f"{symbol}: {balance_bias}{joiner}{taker}，订单簿{orderbook} -> {judgement}"
 
 
 def coinglass_panel_judgement(metrics: dict[str, Any], balances: dict[str, Any]) -> str:
@@ -15862,9 +16116,17 @@ def discord_route_metrics(
             "long_flow": int(long_flow_alignment_score(snapshot) or 0),
             "net_flow_15m": summary_flow_value(snapshot, "15m"),
             "net_flow_1h": summary_flow_value(snapshot, "1h"),
+            "net_flow_4h": summary_flow_value(snapshot, "4h"),
+            "net_flow_12h": summary_flow_value(snapshot, "12h"),
+            "net_flow_24h": summary_flow_value(snapshot, "24h"),
             "oi_change_percent": float(snapshot.oi_change_percent or 0),
             "confirm_price_change_percent": float(snapshot.confirm_price_change_percent or 0),
             "confirm_oi_change_percent": float(snapshot.confirm_oi_change_percent or 0),
+            "global_long_short_ratio": float(snapshot.global_long_short_ratio or 0),
+            "top_position_ratio": float(snapshot.top_position_ratio or 0),
+            "top_account_ratio": float(snapshot.top_account_ratio or 0),
+            "taker_buy_sell_ratio": float(snapshot.taker_buy_sell_ratio or 0),
+            "funding_rate_percent": float(snapshot.funding_rate_percent or 0),
             "flow_label": str(flow_label or ""),
             "spot_onchain_label": str(spot_label or ""),
             "contract_spot_divergence_label": str(div_label or ""),
@@ -15904,9 +16166,17 @@ def discord_route_metrics(
         "long_flow": int(discord_route_float(signal, "long_flow_alignment_score", discord_route_float(signal, "long_flow_score", 0))),
         "net_flow_15m": discord_route_float(signal, "net_flow_15m_usd", 0),
         "net_flow_1h": discord_route_float(signal, "net_flow_1h_usd", 0),
+        "net_flow_4h": discord_route_float(signal, "net_flow_4h_usd", 0),
+        "net_flow_12h": discord_route_float(signal, "net_flow_12h_usd", 0),
+        "net_flow_24h": discord_route_float(signal, "net_flow_24h_usd", 0),
         "oi_change_percent": discord_route_float(signal, "oi_change_percent", 0),
         "confirm_price_change_percent": discord_route_float(signal, "confirm_price_change_percent", 0),
         "confirm_oi_change_percent": discord_route_float(signal, "confirm_oi_change_percent", 0),
+        "global_long_short_ratio": discord_route_float(signal, "global_long_short_ratio", 0),
+        "top_position_ratio": discord_route_float(signal, "top_position_ratio", 0),
+        "top_account_ratio": discord_route_float(signal, "top_account_ratio", 0),
+        "taker_buy_sell_ratio": discord_route_float(signal, "taker_buy_sell_ratio", 0),
+        "funding_rate_percent": discord_route_float(signal, "funding_rate_percent", 0),
         "flow_label": str(signal.get("flow_trend_label") or ""),
         "spot_onchain_label": str(signal.get("spot_onchain_label") or ""),
         "contract_spot_divergence_label": str(signal.get("contract_spot_divergence_label") or ""),
@@ -17056,7 +17326,7 @@ def discord_candidate_verdict_section(verdict: SignalVerdict) -> str:
         return "🟡 多空分歧"
     return "👀 普通观察/静默"
 
-def discord_route_decision(
+def discord_route_decision_legacy(
     signal: Signal | dict[str, Any],
     snapshot: MarketSnapshot | None = None,
     context: dict[str, Any] | None = None,
@@ -17179,8 +17449,20 @@ def discord_route_decision(
             and long_flow >= 5
             and evidence >= 8
         )
-        route = DISCORD_ROUTE_REALTIME if momentum_ok else DISCORD_ROUTE_OBSERVE
-        reasons.append("main momentum confirmed" if momentum_ok else "main momentum observe")
+        momentum_watch_ok = (
+            conviction >= 70
+            and leading >= 5
+            and evidence >= 6
+            and long_flow >= 4
+            and flow_label not in {"资金分歧", "短强中弱", "短弱中强"}
+        )
+        if momentum_ok:
+            route = DISCORD_ROUTE_REALTIME
+        elif momentum_watch_ok:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+        else:
+            route = DISCORD_ROUTE_DIGEST
+        reasons.append("main momentum confirmed" if momentum_ok else "main momentum narrowed to watch/digest")
         tags.append("main_momentum")
     elif kind == "main_risk_watch":
         main_risk_ok = (
@@ -17188,8 +17470,23 @@ def discord_route_decision(
             and evidence_direction == "看空/风险"
             and (price_action_structure_risk_confirmed(price_action) or evidence >= 5)
         )
-        route = DISCORD_ROUTE_RISK_REALTIME if main_risk_ok else (DISCORD_ROUTE_OBSERVE if conviction >= 50 else DISCORD_ROUTE_DIGEST)
-        reasons.append("main risk confirmed" if main_risk_ok else "main risk default observe")
+        main_risk_watch_ok = (
+            conviction >= 70
+            and evidence_direction == "看空/风险"
+            and (
+                evidence >= 4
+                or price_action_structure_risk_confirmed(price_action)
+                or flow_label in {"中长线派发", "短弱中强"}
+                or leading >= 5
+            )
+        )
+        if main_risk_ok:
+            route = DISCORD_ROUTE_RISK_REALTIME
+        elif main_risk_watch_ok:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+        else:
+            route = DISCORD_ROUTE_DIGEST
+        reasons.append("main risk confirmed" if main_risk_ok else "main risk narrowed to watch/digest")
         tags.append("main_risk")
 
     if bullish_kind and price_action is not None and (
@@ -17288,6 +17585,473 @@ DISCORD_CONFLICT_OBSERVE_TAG)
     if route == DISCORD_ROUTE_RISK_REALTIME and trap <= 6:
         score += 8
         tags.append("trap_ok")
+    suppress_realtime = route not in {DISCORD_ROUTE_REALTIME, DISCORD_ROUTE_RISK_REALTIME, DISCORD_ROUTE_PRIORITY_OBSERVE}
+    return RouteDecision(route, discord_route_level(route), "; ".join(dict.fromkeys(reasons)), score, suppress_realtime, list(dict.fromkeys(tags)))
+
+
+def _core_factor_flow_score(*values: float) -> tuple[int, int]:
+    bull = 0
+    bear = 0
+    for value in values:
+        if value > 0:
+            bull += 1
+        elif value < 0:
+            bear += 1
+    if bull >= 4:
+        bull_score = 4
+    elif bull == 3:
+        bull_score = 3
+    elif bull == 2:
+        bull_score = 2
+    elif bull == 1:
+        bull_score = 1
+    else:
+        bull_score = 0
+    if bear >= 4:
+        bear_score = 4
+    elif bear == 3:
+        bear_score = 3
+    elif bear == 2:
+        bear_score = 2
+    elif bear == 1:
+        bear_score = 1
+    else:
+        bear_score = 0
+    return bull_score, bear_score
+
+
+def _core_factor_bias(data: dict[str, Any]) -> dict[str, Any]:
+    oi = float(data.get("oi_change_percent") or 0.0)
+    confirm_price = float(data.get("confirm_price_change_percent") or 0.0)
+    price_change = float(data.get("price_change_percent") or 0.0)
+    taker = float(data.get("taker_buy_sell_ratio") or 0.0)
+    funding = float(data.get("funding_rate_percent") or 0.0)
+    global_ratio = float(data.get("global_long_short_ratio") or 0.0)
+    top_position = float(data.get("top_position_ratio") or 0.0)
+    top_account = float(data.get("top_account_ratio") or 0.0)
+    flow_15m = float(data.get("net_flow_15m") or 0.0)
+    flow_1h = float(data.get("net_flow_1h") or 0.0)
+    flow_4h = float(data.get("net_flow_4h") or 0.0)
+    flow_12h = float(data.get("net_flow_12h") or 0.0)
+    flow_24h = float(data.get("net_flow_24h") or 0.0)
+
+    if oi >= 8:
+        oi_strength = 3
+    elif oi >= 4:
+        oi_strength = 2
+    elif oi >= 1.5:
+        oi_strength = 1
+    else:
+        oi_strength = 0
+
+    if taker >= 1.15:
+        bull_taker = 3
+    elif taker >= 1.08:
+        bull_taker = 2
+    elif taker >= 1.02:
+        bull_taker = 1
+    else:
+        bull_taker = 0
+    if taker <= 0.87:
+        bear_taker = 3
+    elif taker <= 0.93:
+        bear_taker = 2
+    elif taker <= 0.98:
+        bear_taker = 1
+    else:
+        bear_taker = 0
+
+    bull_flow, bear_flow = _core_factor_flow_score(flow_15m, flow_1h, flow_4h, flow_12h, flow_24h)
+
+    bull_ratio = 0
+    bear_ratio = 0
+    if top_position >= 1.15:
+        bull_ratio += 2
+    elif top_position >= 1.05:
+        bull_ratio += 1
+    if top_account >= 1.15:
+        bull_ratio += 2
+    elif top_account >= 1.05:
+        bull_ratio += 1
+    if top_position <= 0.85:
+        bear_ratio += 2
+    elif 0 < top_position <= 0.95:
+        bear_ratio += 1
+    if top_account <= 0.85:
+        bear_ratio += 2
+    elif 0 < top_account <= 0.95:
+        bear_ratio += 1
+    if 0.9 <= global_ratio <= 1.6:
+        bull_ratio += 1
+    elif 0 < global_ratio <= 0.95:
+        bear_ratio += 1
+    if global_ratio > 0 and top_position > 0 and top_account > 0:
+        top_avg = (top_position + top_account) / 2
+        if top_avg >= global_ratio + 0.08:
+            bull_ratio += 1
+        elif top_avg <= global_ratio - 0.08:
+            bear_ratio += 1
+
+    price_long_confirm = 0
+    price_short_confirm = 0
+    if price_change > 0:
+        price_long_confirm += 1
+    elif price_change < 0:
+        price_short_confirm += 1
+    if confirm_price > 0:
+        price_long_confirm += 1
+    elif confirm_price < 0:
+        price_short_confirm += 1
+
+    long_score = oi_strength + bull_taker + bull_flow + bull_ratio + price_long_confirm
+    short_score = oi_strength + bear_taker + bear_flow + bear_ratio + price_short_confirm
+
+    crowded_long_risk = 0
+    crowded_short_risk = 0
+    if global_ratio >= 1.8:
+        crowded_long_risk += 2
+    if funding >= 0.08:
+        crowded_long_risk += 2
+    if top_position > 0 and top_account > 0 and global_ratio > 0 and max(top_position, top_account) <= global_ratio - 0.12:
+        crowded_long_risk += 2
+    if taker > 0 and taker < 0.98:
+        crowded_long_risk += 1
+    if flow_1h <= 0 or flow_4h <= 0:
+        crowded_long_risk += 1
+
+    if 0 < global_ratio <= 0.85:
+        crowded_short_risk += 2
+    if funding <= -0.08:
+        crowded_short_risk += 2
+    if top_position > 0 and top_account > 0 and global_ratio > 0 and min(top_position, top_account) >= global_ratio + 0.10:
+        crowded_short_risk += 2
+    if taker >= 1.02:
+        crowded_short_risk += 1
+    if flow_1h >= 0 or flow_4h >= 0:
+        crowded_short_risk += 1
+
+    long_reasons: list[str] = []
+    short_reasons: list[str] = []
+    reverse_reasons: list[str] = []
+    if oi_strength:
+        long_reasons.append(f"OI放大{oi:+.1f}%")
+        short_reasons.append(f"OI放大{oi:+.1f}%")
+    if bull_taker >= 2:
+        long_reasons.append("主动买盘偏强")
+    if bear_taker >= 2:
+        short_reasons.append("主动卖盘偏强")
+    if bull_flow >= 3:
+        long_reasons.append("中短周期资金回流")
+    elif bull_flow >= 2:
+        long_reasons.append("资金偏多")
+    if bear_flow >= 3:
+        short_reasons.append("中短周期资金流出")
+    elif bear_flow >= 2:
+        short_reasons.append("资金偏空")
+    if bull_ratio >= 3:
+        long_reasons.append("大户多头比确认")
+    elif bull_ratio >= 2:
+        long_reasons.append("多空比偏多")
+    if bear_ratio >= 3:
+        short_reasons.append("大户空头比确认")
+    elif bear_ratio >= 2:
+        short_reasons.append("多空比偏空")
+    if price_long_confirm >= 1:
+        long_reasons.append("价格方向配合")
+    if price_short_confirm >= 1:
+        short_reasons.append("价格方向配合")
+    if crowded_long_risk >= 5:
+        reverse_reasons.append("多头拥挤且承接转弱")
+    if crowded_short_risk >= 5:
+        reverse_reasons.append("空头拥挤且被动挤压风险")
+
+    return {
+        "long_score": int(long_score),
+        "short_score": int(short_score),
+        "bull_flow": int(bull_flow),
+        "bear_flow": int(bear_flow),
+        "crowded_long_risk": int(crowded_long_risk),
+        "crowded_short_risk": int(crowded_short_risk),
+        "long_reasons": long_reasons[:3],
+        "short_reasons": short_reasons[:3],
+        "reverse_reasons": reverse_reasons[:3],
+    }
+
+
+def _core_factor_kline_breakout_like(data: dict[str, Any]) -> bool:
+    label = str(data.get("kline_label") or "")
+    text = str(data.get("kline_text") or label)
+    short_score = int(data.get("kline_short_score") or 0)
+    mid_score = int(data.get("kline_mid_score") or 0)
+    return (
+        text_has_any(label + " " + text, ("4h延续强", "短中线突破延续", "短中线转强"))
+        or (short_score >= 6 and mid_score >= 6)
+    )
+
+
+def _core_factor_risk_reverse_score(data: dict[str, Any], core: dict[str, Any]) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    leading = int(data.get("leading") or 0)
+    evidence = int(data.get("evidence") or 0)
+    trap = int(data.get("trap") or 0)
+    oi_change = float(data.get("oi_change_percent") or 0.0)
+    entry_label = str(data.get("entry_label") or "")
+    flow_label = str(data.get("flow_label") or "")
+    evidence_direction = str(data.get("evidence_direction") or "")
+    kline_breakout = _core_factor_kline_breakout_like(data)
+
+    if leading >= 7:
+        score += 2
+        reasons.append("领先风险信号强")
+    elif leading >= 5:
+        score += 1
+        reasons.append("领先风险信号有效")
+    if text_has_any(entry_label, ("逃顶", "减仓优先", "追高风险", "不宜追")):
+        score += 2
+        reasons.append(entry_label)
+    if trap >= 6:
+        score += 1
+        reasons.append(f"诱多/风险{trap}")
+    if kline_breakout:
+        score += 2
+        reasons.append("短中线过热/突破延续")
+    if evidence >= 8 or evidence_direction == "看多":
+        score += 1
+        reasons.append("证据偏多但风险信号触发")
+    if flow_label in {"多周期共振流入", "短强中弱", "短弱中强", "中长线派发"}:
+        score += 1
+        reasons.append(flow_label)
+    if oi_change >= 1.5:
+        score += 1
+        reasons.append(f"OI放大{oi_change:+.1f}%")
+    if int(core.get("crowded_long_risk") or 0) >= 5:
+        score += 2
+        reasons.append("多头拥挤")
+
+    return score, list(dict.fromkeys(reasons))[:4]
+
+
+def _core_factor_output(data: dict[str, Any], core: dict[str, Any]) -> dict[str, Any]:
+    long_score = int(core["long_score"])
+    short_score = int(core["short_score"])
+    margin = abs(long_score - short_score)
+    risk_reverse_score, risk_reverse_reasons = _core_factor_risk_reverse_score(data, core)
+    bias = "neutral"
+    if long_score >= 9 and long_score >= short_score + 3:
+        bias = "偏多"
+    elif short_score >= 9 and short_score >= long_score + 3:
+        bias = "偏空"
+    if risk_reverse_score >= 6:
+        bias = "高风险反向"
+    return {
+        "bias": bias,
+        "margin": margin,
+        "risk_reverse_score": risk_reverse_score,
+        "risk_reverse_reasons": risk_reverse_reasons,
+    }
+
+
+def discord_route_decision(
+    signal: Signal | dict[str, Any],
+    snapshot: MarketSnapshot | None = None,
+    context: dict[str, Any] | None = None,
+) -> RouteDecision:
+    context = context or {}
+    data = discord_route_metrics(signal, snapshot, context.get("price_action"))
+    symbol = data["symbol"]
+    kind = data["kind"]
+    conviction = int(data["conviction"])
+    evidence = int(data["evidence"])
+    quality = int(data["quality"])
+    risk_kind = kind in DISCORD_RISK_KINDS or topq_is_risk_candidate(kind)
+    bullish_kind = kind in DISCORD_BULLISH_KINDS or topq_is_bullish_candidate(kind)
+
+    if not symbol or not is_valid_binance_usdt_symbol(symbol):
+        return RouteDecision(DISCORD_ROUTE_SUPPRESS, "静默", "invalid symbol", 0, True, ["invalid"])
+    if context.get("duplicate"):
+        return RouteDecision(DISCORD_ROUTE_DIGEST, "摘要", "duplicate merge", 0, True, ["duplicate"])
+
+    core = _core_factor_bias(data)
+    core_output = _core_factor_output(data, core)
+    long_score = int(core["long_score"])
+    short_score = int(core["short_score"])
+    bull_flow = int(core["bull_flow"])
+    bear_flow = int(core["bear_flow"])
+    crowded_long_risk = int(core["crowded_long_risk"])
+    crowded_short_risk = int(core["crowded_short_risk"])
+    margin = abs(long_score - short_score)
+    oi_change = float(data.get("oi_change_percent") or 0.0)
+    taker_ratio = float(data.get("taker_buy_sell_ratio") or 0.0)
+    funding_rate = float(data.get("funding_rate_percent") or 0.0)
+    flow_label = str(data.get("flow_label") or "")
+    reasons: list[str] = []
+    core_bias = str(core_output["bias"])
+    risk_reverse_score = int(core_output["risk_reverse_score"])
+    risk_reverse_reasons = list(core_output["risk_reverse_reasons"])
+    tags: list[str] = ["core_factor_model", f"core_{core_bias}"]
+
+    strong_long = (
+        long_score >= 9
+        and margin >= 3
+        and bull_flow >= 2
+        and (data["net_flow_1h"] > 0 or data["net_flow_4h"] > 0 or data["net_flow_15m"] > 0)
+        and crowded_long_risk <= 4
+    )
+    very_strong_long = strong_long and long_score >= 11 and bull_flow >= 3 and conviction >= 55 and evidence >= 4
+    strong_short = (
+        short_score >= 9
+        and margin >= 3
+        and bear_flow >= 2
+        and (data["net_flow_1h"] < 0 or data["net_flow_4h"] < 0 or data["net_flow_15m"] < 0)
+        and crowded_short_risk <= 4
+    )
+    very_strong_short = strong_short and short_score >= 11 and bear_flow >= 3 and conviction >= 55 and evidence >= 4
+    high_risk_reverse_long = crowded_short_risk >= 6 and long_score >= 8 and data["net_flow_1h"] > 0
+    high_risk_reverse_short = (
+        risk_kind
+        and risk_reverse_score >= 7
+        and conviction >= 50
+        and quality >= 55
+        and 0 < taker_ratio <= 0.98
+    )
+    high_risk_reverse_rescue = (
+        risk_kind
+        and risk_reverse_score >= 7
+        and quality >= 55
+        and taker_ratio >= 1.08
+        and funding_rate < 0.08
+    )
+    bullish_strict_watch = (
+        bullish_kind
+        and quality >= 55
+        and int(data.get("trap") or 0) <= 5
+        and str(data.get("evidence_direction") or "") == "看多"
+        and evidence >= 8
+        and taker_ratio >= 1.08
+    )
+    medium_short_watch = (
+        short_score >= 8
+        and short_score >= long_score + 2
+        and bear_flow >= 2
+        and conviction >= 55
+        and (
+            str(data.get("evidence_direction") or "") == "看空/风险"
+            or flow_label == "中长线派发"
+            or int(data.get("leading") or 0) >= 6
+        )
+    )
+
+    if kind == "main_momentum_watch":
+        momentum_watch_clear = strong_long and bull_flow >= 3 and oi_change >= 1.0 and taker_ratio >= 1.05 and conviction >= 60
+        momentum_realtime = very_strong_long and oi_change >= 2.0 and taker_ratio >= 1.08
+        route = DISCORD_ROUTE_DIGEST
+        if momentum_realtime or momentum_watch_clear:
+            reasons.append("momentum visible disabled by win-rate gate")
+            tags.extend(["core_long_bias", "momentum", "win_rate_gate"])
+        else:
+            reasons.append("momentum not clear on core factors")
+            tags.extend(["core_unclear", "momentum"])
+    elif kind == "main_risk_watch":
+        main_risk_watch_clear = (
+            (strong_short and bear_flow >= 3 and oi_change >= 1.5 and taker_ratio <= 0.98 and conviction >= 60)
+            or (medium_short_watch and oi_change >= 1.0)
+        )
+        main_risk_realtime = very_strong_short and oi_change >= 2.0 and taker_ratio <= 0.95
+        if main_risk_realtime:
+            route = DISCORD_ROUTE_RISK_REALTIME
+            reasons.append("core short bias confirmed")
+            tags.extend(["core_short_bias", "main_risk"])
+        elif main_risk_watch_clear:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("core short bias watch")
+            tags.extend(["core_short_bias", "main_risk"])
+        elif high_risk_reverse_short and risk_reverse_score >= 7 and conviction >= 55:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("high risk reverse short: " + " / ".join(risk_reverse_reasons))
+            tags.extend(["high_risk_reverse", "short", "main_risk"])
+        else:
+            route = DISCORD_ROUTE_DIGEST
+            reasons.append("main risk not clear on core factors")
+            tags.extend(["core_unclear", "main_risk"])
+    elif kind in {"discovery", "bottom_reversal", "main_trend_watch", "hot_breakout"}:
+        if kind == "discovery":
+            route = DISCORD_ROUTE_DIGEST
+            reasons.append("discovery visible disabled by win-rate gate")
+            tags.extend(["core_unclear", kind, "win_rate_gate"])
+        elif kind == "main_trend_watch":
+            route = DISCORD_ROUTE_DIGEST
+            reasons.append("main trend visible disabled by win-rate gate")
+            tags.extend(["core_unclear", kind, "win_rate_gate"])
+        elif strong_long and bullish_strict_watch:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("strict bullish watch")
+            tags.extend(["core_long_bias", kind])
+        elif high_risk_reverse_short:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("high risk reverse short")
+            tags.extend(["high_risk_reverse", "short", kind])
+        else:
+            route = DISCORD_ROUTE_DIGEST
+            reasons.append("bullish setup lacks core alignment")
+            tags.extend(["core_unclear", kind])
+    elif kind in {"top_risk", "top_exhaustion", "distribution"}:
+        if kind == "top_risk" and high_risk_reverse_rescue:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("high risk reverse rescue: strong taker buy without hot funding")
+            tags.extend(["high_risk_reverse", "rescue", "short", kind])
+        elif kind == "top_risk":
+            route = DISCORD_ROUTE_DIGEST
+            reasons.append("top risk visible disabled by win-rate gate")
+            tags.extend(["core_unclear", kind, "win_rate_gate"])
+        elif very_strong_short:
+            route = DISCORD_ROUTE_RISK_REALTIME
+            reasons.append("core short bias confirmed")
+            tags.extend(["core_short_bias", kind])
+        elif strong_short or medium_short_watch:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("core short bias watch")
+            tags.extend(["core_short_bias", kind])
+        elif high_risk_reverse_short:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("high risk reverse short: " + " / ".join(risk_reverse_reasons))
+            tags.extend(["high_risk_reverse", "short", kind])
+        elif high_risk_reverse_rescue:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("high risk reverse rescue: strong taker buy without hot funding")
+            tags.extend(["high_risk_reverse", "rescue", "short", kind])
+        elif high_risk_reverse_long:
+            route = DISCORD_ROUTE_PRIORITY_OBSERVE
+            reasons.append("high risk reverse long")
+            tags.extend(["high_risk_reverse", "long", kind])
+        else:
+            route = DISCORD_ROUTE_DIGEST
+            reasons.append("risk setup lacks core alignment")
+            tags.extend(["core_unclear", kind])
+    else:
+        route = DISCORD_ROUTE_PRIORITY_OBSERVE if strong_long or strong_short else DISCORD_ROUTE_DIGEST
+        reasons.append("fallback by core bias" if route == DISCORD_ROUTE_PRIORITY_OBSERVE else "fallback digest")
+        tags.append("fallback")
+
+    if core_bias == "高风险反向" and route in {DISCORD_ROUTE_REALTIME, DISCORD_ROUTE_RISK_REALTIME}:
+        route = DISCORD_ROUTE_PRIORITY_OBSERVE
+        reasons.append("high risk reverse downgrade: " + " / ".join(risk_reverse_reasons))
+        tags.append("high_risk_reverse_downgrade")
+    if quality < 35 and route in {DISCORD_ROUTE_REALTIME, DISCORD_ROUTE_RISK_REALTIME}:
+        route = DISCORD_ROUTE_PRIORITY_OBSERVE
+        reasons.append("quality low downgrade")
+        tags.append("quality_downgrade")
+    if conviction < 45 and route == DISCORD_ROUTE_PRIORITY_OBSERVE:
+        route = DISCORD_ROUTE_DIGEST
+        reasons.append("conviction low digest")
+        tags.append("low_conviction")
+    if single_signal_direction_conflict(data):
+        route = DISCORD_ROUTE_CONFLICT_OBSERVE
+        reasons.append("single signal internal direction conflict")
+        tags.append(DISCORD_CONFLICT_OBSERVE_TAG)
+        tags.append("single_signal_direction_conflict")
+
+    score = int(max(long_score, short_score) * 8 + margin * 3 + max(0, conviction - 40) * 0.4)
     suppress_realtime = route not in {DISCORD_ROUTE_REALTIME, DISCORD_ROUTE_RISK_REALTIME, DISCORD_ROUTE_PRIORITY_OBSERVE}
     return RouteDecision(route, discord_route_level(route), "; ".join(dict.fromkeys(reasons)), score, suppress_realtime, list(dict.fromkeys(tags)))
 
@@ -17828,25 +18592,23 @@ def discord_conflict_observe_fields(
             else "不追多，也不急着追空。等待 15m/1h 方向重新一致。"
         )
     else:
-        conclusion = "短线资金和结构出现反复，多空证据冲突，等待方向确认。"
+        conclusion = "短线资金和结构出现反复，多空证据冲突，暂不站队。"
         action = "暂不追多，也不追空。等待 15m/1h 方向重新一致。"
-    verdict = build_signal_verdict(signal, kline_structure=price_action, route_decision=route_decision)
-    verdict = replace(
-        verdict,
-        final_direction="多空分歧",
-        confidence="中" if verdict.confidence == "高" else verdict.confidence,
-        entry_state="暂不站队",
-        action_text="暂不站队，等待15m/1h方向重新一致",
-    )
+    snapshot = signal.snapshot
+    key_text = "-"
+    if snapshot is not None:
+        _short_score, _mid_score, _long_score, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+        key_text = (
+            f"价 {snapshot.price_change_percent:+.2f}% | OI {snapshot.oi_change_percent:+.2f}% | "
+            f"主买 {format_optional_value(snapshot.taker_buy_sell_ratio)} | 资金 {flow_label}"
+        )
     return [
-        ("币种/方向", discord_field_value(f"{signal.symbol} / 观察 / 暂不站队"), True),
-        ("Discord路由", discord_field_value("观察\n原因：多空证据冲突，等待方向确认"), False),
-        signal_verdict_display_field(verdict),
         ("结论", discord_field_value(conclusion), False),
-        ("操作建议", discord_field_value(action), False),
-        ("看多证据", discord_field_value("\n".join(f"- {item}" for item in long_items)), False),
-        ("风险证据", discord_field_value("\n".join(f"- {item}" for item in risk_items)), False),
-    ][:12]
+        ("怎么做", discord_field_value(action), False),
+        ("关键值", discord_field_value(key_text), False),
+        ("看多理由", discord_field_value("；".join(long_items[:3])), False),
+        ("风险理由", discord_field_value("；".join(risk_items[:3])), False),
+    ]
 
 
 def discord_conflict_observe_embed(
@@ -19002,9 +19764,8 @@ def format_telegram_signal_digest(
             oi_text = format_compact_percent(item.oi_change_percent)
             lines.append(
                 f"{item.symbol} {direction_badge(signal_direction_label(item.kind))} "
-                f"{priority_badge(item.priority)} 质量{item.quality_score} "
-                f"{trap_badge(item.trap_score)} 强度{item.strength_score:.1f} "
-                f"{price_text} OI{oi_text} | {item.reason}"
+                f"{priority_badge(item.priority)} q{item.quality_score} | "
+                f"价{price_text} OI{oi_text} | 结论: {item.reason}"
             )
 
     lines.append("")
@@ -19640,12 +20401,113 @@ def format_trader_panel(
     return telegram_text("\n".join(lines), 1600)
 
 
+def compact_signal_conclusion(signal: Signal, action: str, risk_panel: bool) -> str:
+    if risk_panel:
+        if any(text in action for text in ("减仓", "避险", "关注顶部", "关注跳水")):
+            return "偏空/风险，先防守。"
+        return "有风险信号，但确认还不够。"
+    if any(text in action for text in ("强烈建议关注买入", "关注买入", "关注反弹")):
+        return "偏多，但只适合等确认后跟。"
+    if any(text in action for text in ("不追", "先等稳定", "禁止")):
+        return "有异动，但不适合直接追。"
+    if signal.kind == "main_momentum_watch":
+        return "主流有异动，更像试盘而不是确定启动。"
+    return "方向未完全确认，先观察。"
+
+
+def compact_signal_explanation(snapshot: MarketSnapshot, signal: Signal, risk_panel: bool) -> str:
+    base = panel_flow_judgement(snapshot, risk_panel, signal.kind)
+    if signal.kind == "main_risk_watch" and "确认" not in base:
+        return f"{base}；若继续转弱，风险会升级。"
+    if signal.kind == "main_momentum_watch" and "确认" not in base:
+        return f"{base}；若 15m/1h 延续，才算更像真启动。"
+    return base
+
+
+def compact_signal_reason_lines(
+    signal: Signal,
+    snapshot: MarketSnapshot,
+    pending: PendingTelegramSignalMerge,
+    limit: int = 2,
+) -> list[str]:
+    kinds: list[str] = []
+    for item in pending.signals:
+        label = signal_kind_label(item.kind)
+        if label not in kinds:
+            kinds.append(label)
+    risk_panel = is_telegram_risk_signal(signal)
+    leading = leading_signal_score(snapshot, signal)
+    _trigger_score, triggers = trader_panel_triggers(snapshot, signal, kinds)
+    _leading_score, leading_items = trader_panel_leading_items(
+        leading,
+        "看空" if risk_panel else signal_direction_label(signal.kind),
+        limit,
+    )
+    source = triggers if triggers else leading_items
+    cleaned = []
+    for item in source:
+        text = re.sub(r"^[•-]\s*", "", str(item or "").strip())
+        text = re.sub(r"\s*\+\d+\s*$", "", text)
+        text = truncate_text(text, 42)
+        if text and text not in cleaned:
+            cleaned.append(text)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def format_compact_signal_for_telegram(
+    pending: PendingTelegramSignalMerge,
+    liquidation_text: str | None = None,
+    coinglass_text: str | None = None,
+) -> str:
+    best_index = best_pending_signal_index(pending)
+    signal = pending.signals[best_index]
+    if signal.snapshot is None:
+        return telegram_text(f"{pending.symbol} n/a", 1600)
+
+    snapshot = signal.snapshot
+    risk_panel = is_telegram_risk_signal(signal)
+    conviction, _conv_label, _conv_reason = conviction_score(snapshot, signal)
+    action, _action_reason = action_label(snapshot, signal)
+    quality_score = pending.quality_scores[best_index] if best_index < len(pending.quality_scores) else None
+    priority = pending.priorities[best_index] if best_index < len(pending.priorities) else "-"
+    conclusion = compact_signal_conclusion(signal, action, risk_panel)
+    explanation = compact_signal_explanation(snapshot, signal, risk_panel)
+    reasons = compact_signal_reason_lines(signal, snapshot, pending, 2)
+    symbol_text = snapshot.symbol.replace("USDT", "/USDT")
+    price_15m = format_panel_percent(panel_price_change(snapshot, "15m"))
+    price_1h = format_panel_percent(panel_price_change(snapshot, "1h"))
+    oi_1h = panel_oi_state(snapshot, "1h")
+    short_score, mid_score, long_score, flow_label, _flow_reason = flow_horizon_scores(snapshot)
+    lines = [
+        f"{trader_panel_title(signal, market_intent(snapshot, signal)[0], conviction)} {symbol_text}",
+        f"结论：{conclusion}",
+        f"说明：{explanation}",
+    ]
+    if reasons:
+        lines.append("理由：" + "；".join(reasons))
+    lines.extend(
+        [
+            f"怎么看：{action}",
+            (
+                f"关键值：15m {price_15m}｜1h {price_1h}｜OI 1h {oi_1h}｜"
+                f"资金 {flow_label or f'短{short_score}/中{mid_score}/长{long_score}'}｜q {priority}/{quality_score if quality_score is not None else '-'}"
+            ),
+        ]
+    )
+    compact_liq = compact_realtime_liquidation_line(liquidation_text)
+    if compact_liq:
+        lines.append(compact_liq)
+    return telegram_text("\n".join(lines), 1600)
+
+
 def format_merged_signal_for_telegram(
     pending: PendingTelegramSignalMerge,
     liquidation_text: str | None = None,
     coinglass_text: str | None = None,
 ) -> str:
-    return format_trader_panel(pending, liquidation_text, coinglass_text)
+    return format_compact_signal_for_telegram(pending, liquidation_text, coinglass_text)
 
 
 def why_symbol_conclusion(rows: list[dict[str, str]]) -> str:
@@ -20645,8 +21507,15 @@ def summary_flow_value(snapshot: MarketSnapshot, period: str) -> float:
 
 
 def is_summary_discovery(snapshot: MarketSnapshot) -> bool:
+    position = snapshot.price_position_24h
+    already_extended = (
+        snapshot.price_change_percent >= 8
+        or (position is not None and position >= 80)
+        or (snapshot.funding_rate_percent is not None and snapshot.funding_rate_percent >= 0.06)
+    )
     return (
         snapshot.price_change_percent >= 1.2
+        and not already_extended
         and snapshot.oi_change_percent >= 4
         and (snapshot.taker_buy_sell_ratio or 0) >= 1.15
         and summary_flow_value(snapshot, "15m") > 0
@@ -20675,12 +21544,19 @@ def is_summary_distribution(snapshot: MarketSnapshot) -> bool:
 def discovery_score(snapshot: MarketSnapshot) -> float:
     taker = min(snapshot.taker_buy_sell_ratio or 0, 3.0)
     crowd_penalty = max((snapshot.global_long_short_ratio or 1) - 1.8, 0) * 2
+    chase_penalty = 0.0
+    if snapshot.price_change_percent >= 6:
+        chase_penalty += (snapshot.price_change_percent - 6) * 1.5
+    if snapshot.price_position_24h is not None and snapshot.price_position_24h >= 70:
+        chase_penalty += (snapshot.price_position_24h - 70) * 0.15
+    if snapshot.funding_rate_percent is not None and snapshot.funding_rate_percent >= 0.03:
+        chase_penalty += snapshot.funding_rate_percent * 50
     flow_bonus = 0
     if summary_flow_value(snapshot, "15m") > 0:
         flow_bonus += 2
     if summary_flow_value(snapshot, "1h") > 0:
         flow_bonus += 2
-    return snapshot.price_change_percent + snapshot.oi_change_percent + max(taker - 1, 0) * 2 + flow_bonus - crowd_penalty
+    return snapshot.price_change_percent + snapshot.oi_change_percent + max(taker - 1, 0) * 2 + flow_bonus - crowd_penalty - chase_penalty
 
 
 def summary_discovery_display_score(snapshot: MarketSnapshot) -> float:

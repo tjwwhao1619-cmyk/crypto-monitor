@@ -1,0 +1,10 @@
+[Unit]
+Description=Run moonshot factor extractor daily
+
+[Timer]
+OnCalendar=*-*-* 09:20:00
+Persistent=true
+Unit=moonshot-factor-extractor.service
+
+[Install]
+WantedBy=timers.target

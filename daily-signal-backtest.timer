@@ -1,0 +1,11 @@
+[Unit]
+Description=Run daily contract signal backtest every day
+
+[Timer]
+OnCalendar=*-*-* 00:20:00
+Persistent=true
+Unit=daily-signal-backtest.service
+
+[Install]
+WantedBy=timers.target
+

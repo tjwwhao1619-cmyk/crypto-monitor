@@ -18,8 +18,8 @@ import derivatives_monitor as live_routes
 BASE = "https://fapi.binance.com"
 BULL = {"discovery", "hot_breakout", "bottom_reversal", "main_trend_watch", "main_momentum_watch"}
 BEAR = {"top_risk", "distribution", "top_exhaustion", "main_risk_watch"}
-HORIZONS = {"15m": 900, "1h": 3600, "4h": 14400, "12h": 43200, "24h": 86400}
-REPORT_HORIZONS = ["15m", "1h", "4h", "12h", "24h"]
+HORIZONS = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "12h": 43200, "24h": 86400}
+REPORT_HORIZONS = ["5m", "15m", "30m", "1h", "4h", "12h", "24h"]
 LONG_FLOW_GROUPS = (
     ("0-3", "长周期弱", 0, 3),
     ("4-6", "长周期分歧", 4, 6),
@@ -159,6 +159,13 @@ def parse_time(value):
     return t.astimezone(dt.UTC)
 
 
+def row_day(row):
+    value = str(row.get("time") or "").strip()
+    if not value:
+        return ""
+    return value.split(" ")[0].split("T")[0]
+
+
 def pct(a, b):
     return 0.0 if not a else (b - a) / a * 100
 
@@ -257,6 +264,15 @@ def eval_signal(session, row, ctx: BacktestKlineContext | None = None):
     out["oi_change_percent"] = parse_float(row.get("oi_change_percent"))
     out["confirm_price_change_percent"] = parse_float(row.get("confirm_price_change_percent"))
     out["confirm_oi_change_percent"] = parse_float(row.get("confirm_oi_change_percent"))
+    out["global_long_short_ratio"] = parse_float(row.get("global_long_short_ratio"))
+    out["top_position_ratio"] = parse_float(row.get("top_position_ratio"))
+    out["top_account_ratio"] = parse_float(row.get("top_account_ratio"))
+    out["taker_buy_sell_ratio"] = parse_float(row.get("taker_buy_sell_ratio"))
+    out["price_position_24h"] = parse_float(row.get("price_position_24h"))
+    out["high_24h"] = parse_float(row.get("high_24h"))
+    out["low_24h"] = parse_float(row.get("low_24h"))
+    out["quote_volume_24h"] = parse_float(row.get("quote_volume_24h"))
+    out["volume_ratio_24h"] = parse_float(row.get("volume_ratio_24h"))
     out["long_flow_alignment_score"] = parse_int(row.get("long_flow_alignment_score"))
     out["main_asset_score"] = parse_int(row.get("main_asset_score"))
     out["trap_risk_score"] = parse_int(row.get("trap_risk_score"))
@@ -268,6 +284,8 @@ def eval_signal(session, row, ctx: BacktestKlineContext | None = None):
     out["contract_spot_divergence_label"] = (row.get("contract_spot_divergence_label") or "").strip() or None
     out["major_flow_score"] = parse_int(row.get("major_flow_score"))
     out["major_flow_label"] = (row.get("major_flow_label") or "").strip() or None
+    out["spot_absorption_score"] = parse_int(row.get("spot_absorption_score"))
+    out["spot_absorption_label"] = (row.get("spot_absorption_label") or "").strip() or None
     out["signal_priority"] = (row.get("signal_priority") or "").strip().upper() or None
     out["signal_quality_score"] = parse_int(row.get("signal_quality_score"))
     out["signal_quality_reason"] = row.get("signal_quality_reason") or ""
@@ -287,9 +305,23 @@ def eval_signal(session, row, ctx: BacktestKlineContext | None = None):
     out["leading_label"] = (row.get("leading_label") or "").strip() or None
     out["funding_rate_percent"] = parse_float(row.get("funding_rate_percent"))
     out["suppressed_from_telegram"] = parse_bool_int(row.get("suppressed_from_telegram"))
-    for name in ("12h", "24h", "48h", "72h", "96h", "120h", "144h"):
-        out[f"flow_{name}"] = parse_float(row.get(f"net_flow_{name}_usd"))
-        out[f"flow_{name}_ratio"] = parse_float(row.get(f"net_flow_{name}_ratio"))
+    out["discord_route"] = (row.get("discord_route") or "").strip() or "none"
+    out["discord_route_reason"] = (row.get("discord_route_reason") or "").strip() or None
+    out["discord_route_tags"] = (row.get("discord_route_tags") or "").strip() or None
+    out["row_day"] = row_day(row) or None
+    for name in ("5m", "15m", "1h", "4h", "12h", "24h", "48h", "72h", "96h", "120h", "144h"):
+        flow_usd = parse_float(row.get(f"net_flow_{name}_usd"))
+        flow_ratio = parse_float(row.get(f"net_flow_{name}_ratio"))
+        out[f"net_flow_{name}_usd"] = flow_usd
+        out[f"net_flow_{name}_ratio"] = flow_ratio
+        out[f"flow_{name}"] = flow_usd
+        out[f"flow_{name}_ratio"] = flow_ratio
+    for name in ("15m", "1h", "4h", "24h", "72h", "168h"):
+        out[f"oi_change_{name}_percent"] = parse_float(row.get(f"oi_change_{name}_percent"))
+        out[f"global_long_short_ratio_{name}"] = parse_float(row.get(f"global_long_short_ratio_{name}"))
+        out[f"top_position_ratio_{name}"] = parse_float(row.get(f"top_position_ratio_{name}"))
+        out[f"top_account_ratio_{name}"] = parse_float(row.get(f"top_account_ratio_{name}"))
+        out[f"taker_buy_sell_ratio_{name}"] = parse_float(row.get(f"taker_buy_sell_ratio_{name}"))
     for name, sec in HORIZONS.items():
         horizon_rows = [item for item in rows if int(item[0]) <= int((start + sec) * 1000)]
         if horizon_rows:
@@ -1056,6 +1088,493 @@ def print_combo_filter_report(results):
     print("")
 
 
+def row_text_has_any(row, field, terms):
+    text = str(row.get(field) or "")
+    return any(term in text for term in terms)
+
+
+def route_row_core(row):
+    try:
+        data = live_routes.discord_route_metrics(row, None, None)
+        core = live_routes._core_factor_bias(data)
+        output = live_routes._core_factor_output(data, core)
+        return data, core, output
+    except Exception:
+        return {}, {}, {}
+
+
+def high_risk_reverse_features(row):
+    data, core, output = route_row_core(row)
+    leading = row.get("leading_score") or 0
+    evidence = row.get("evidence_score") or 0
+    trap = row.get("trap_risk_score") or 0
+    quality = row.get("signal_quality_score") or 0
+    conviction = row.get("conviction_score") or 0
+    oi = row.get("oi_change_percent") or 0.0
+    taker = row.get("taker_buy_sell_ratio") or 0.0
+    funding = row.get("funding_rate_percent") or 0.0
+    kline_label = row.get("kline_label") or ""
+    flow_label = row.get("flow_trend_label") or ""
+    entry_label = row.get("entry_timing_label") or ""
+    evidence_direction = row.get("evidence_direction") or ""
+    long_score = int(core.get("long_score") or 0)
+    short_score = int(core.get("short_score") or 0)
+    risk_reverse_score = int(output.get("risk_reverse_score") or 0)
+    return {
+        "lead>=7": leading >= 7,
+        "lead>=6": leading >= 6,
+        "conv>=50": conviction >= 50,
+        "conv>=55": conviction >= 55,
+        "q>=55": quality >= 55,
+        "q>=70": quality >= 70,
+        "entry_escape": any(term in entry_label for term in ("逃顶", "减仓优先")),
+        "entry_chase_risk": any(term in entry_label for term in ("追高风险", "不宜追")),
+        "trap>=6": trap >= 6,
+        "trap>=7": trap >= 7,
+        "kline_breakout": kline_label in {"4h延续强", "短中线突破延续", "短中线转强大周期未确认"},
+        "kline_pressure": kline_label == "短线承压",
+        "ev_bull>=8": evidence >= 8 and evidence_direction == "看多",
+        "ev_watch_or_bull": evidence_direction in {"观察", "看多"},
+        "flow_in": flow_label in {"多周期共振流入", "短强中弱", "短弱中强"},
+        "flow_distribution": flow_label == "中长线派发",
+        "flow_not_divergent": flow_label != "资金分歧",
+        "oi>=1.5": oi >= 1.5,
+        "oi>=4": oi >= 4,
+        "taker_sell": 0 < taker <= 0.98,
+        "taker_buy": taker >= 1.02,
+        "funding_hot": funding >= 0.08,
+        "core_long>=7": long_score >= 7,
+        "core_short>=8": short_score >= 8,
+        "reverse>=6": risk_reverse_score >= 6,
+        "reverse>=7": risk_reverse_score >= 7,
+    }
+
+
+def combo_stat(rows):
+    one_values = [row.get("1h") for row in rows if row.get("1h") is not None]
+    four_values = [row.get("4h") for row in rows if row.get("4h") is not None]
+    bad_values = [route_bad_score(row) for row in rows]
+    bad_values = [value for value in bad_values if value is not None]
+    win_1h = sum(1 for value in one_values if value > 0)
+    win_4h = sum(1 for value in four_values if value > 0)
+    return {
+        "n": len(rows),
+        "n1": len(one_values),
+        "win1": win_1h,
+        "wr1": win_1h / len(one_values) * 100 if one_values else 0.0,
+        "avg1": statistics.mean(one_values) if one_values else None,
+        "n4": len(four_values),
+        "win4": win_4h,
+        "wr4": win_4h / len(four_values) * 100 if four_values else 0.0,
+        "avg4": statistics.mean(four_values) if four_values else None,
+        "worst": min(bad_values) if bad_values else None,
+    }
+
+
+def combo_stat_line(stat):
+    return (
+        f"样本={stat['n']} "
+        f"1h={stat['win1']}/{stat['n1']} {stat['wr1']:.1f}% avg={fmt_stat_value(stat['avg1'])} "
+        f"4h={stat['win4']}/{stat['n4']} {stat['wr4']:.1f}% avg={fmt_stat_value(stat['avg4'])} "
+        f"worst={fmt_stat_value(stat['worst'])}"
+    )
+
+
+def feature_combinations(features, max_size=4):
+    names = list(features)
+    combos = []
+    for size in range(1, max_size + 1):
+        def build(start, current):
+            if len(current) == size:
+                combos.append(tuple(current))
+                return
+            for index in range(start, len(names)):
+                current.append(names[index])
+                build(index + 1, current)
+                current.pop()
+        build(0, [])
+    return combos
+
+
+def print_high_risk_reverse_combo_report(results):
+    candidates = [row for row in results if row.get("kind") in {"top_risk", "top_exhaustion", "distribution"}]
+    feature_rows = [(row, high_risk_reverse_features(row)) for row in candidates]
+    feature_names = [
+        "lead>=7",
+        "conv>=50",
+        "q>=55",
+        "entry_escape",
+        "entry_chase_risk",
+        "trap>=6",
+        "kline_breakout",
+        "kline_pressure",
+        "ev_bull>=8",
+        "flow_in",
+        "flow_distribution",
+        "flow_not_divergent",
+        "oi>=1.5",
+        "oi>=4",
+        "taker_sell",
+        "funding_hot",
+        "core_long>=7",
+        "reverse>=6",
+        "reverse>=7",
+    ]
+    combos = feature_combinations(feature_names, 4)
+    def score_combos(combo_items):
+        scored_items = []
+        for combo in combo_items:
+            rows = [row for row, features in feature_rows if all(features.get(name) for name in combo)]
+            if len(rows) < 12:
+                continue
+            stat = combo_stat(rows)
+            if stat["n1"] < 12:
+                continue
+            score = (stat["wr1"], stat["avg1"] or -99, stat["wr4"], stat["avg4"] or -99, stat["n"])
+            scored_items.append((score, combo, stat))
+        scored_items.sort(key=lambda item: item[0], reverse=True)
+        return scored_items
+
+    scored = score_combos(combos)
+    no_kline_combos = [
+        combo for combo in combos
+        if not any(name.startswith("kline_") for name in combo)
+    ]
+    no_kline_scored = score_combos(no_kline_combos)
+
+    def print_ranked(title, items, limit, min_n=12):
+        print(title)
+        shown = 0
+        for _score, combo, stat in items:
+            if stat["n"] < min_n:
+                continue
+            shown += 1
+            print(f"{shown:02d}. {' + '.join(combo)} | {combo_stat_line(stat)}")
+            if shown >= limit:
+                break
+        if shown == 0:
+            print("暂无")
+
+    print("[HIGH RISK REVERSE COMBOS] 风险侧组合扫描")
+    print("范围: top_risk/top_exhaustion/distribution；按 1h 胜率、1h均值、4h 胜率排序；样本<12跳过。")
+    print("提示: kline_* 是回测 K线代理，含未来表现，只能作为上限参考；固化规则优先看无 kline 组合。")
+    print_ranked("TOP20（含K线代理，上限参考）:", scored, 20)
+    print("")
+    print_ranked("样本>=30 TOP15（含K线代理，上限参考）:", scored, 15, min_n=30)
+    print("")
+    print_ranked("TOP20（无K线代理，可固化参考）:", no_kline_scored, 20)
+    print("")
+    print_ranked("样本>=30 TOP15（无K线代理，可固化参考）:", no_kline_scored, 15, min_n=30)
+    print("")
+
+
+def bullish_features(row):
+    data, core, output = route_row_core(row)
+    leading = row.get("leading_score") or 0
+    evidence = row.get("evidence_score") or 0
+    trap = row.get("trap_risk_score") or 0
+    quality = row.get("signal_quality_score") or 0
+    conviction = row.get("conviction_score") or 0
+    oi = row.get("oi_change_percent") or 0.0
+    taker = row.get("taker_buy_sell_ratio") or 0.0
+    funding = row.get("funding_rate_percent") or 0.0
+    flow_label = row.get("flow_trend_label") or ""
+    evidence_direction = row.get("evidence_direction") or ""
+    long_flow = row.get("long_flow_alignment_score") or 0
+    long_score = int(core.get("long_score") or 0)
+    crowded_long = int(core.get("crowded_long_risk") or 0)
+    return {
+        "lead>=6": leading >= 6,
+        "lead>=7": leading >= 7,
+        "conv>=55": conviction >= 55,
+        "conv>=65": conviction >= 65,
+        "q>=55": quality >= 55,
+        "q>=70": quality >= 70,
+        "trap<=3": trap <= 3,
+        "trap<=5": trap <= 5,
+        "ev_bull>=8": evidence >= 8 and evidence_direction == "看多",
+        "ev_bull>=10": evidence >= 10 and evidence_direction == "看多",
+        "flow_absorb": flow_label in {"多周期共振流入", "中长线吸筹"},
+        "flow_not_weak": flow_label not in {"资金分歧", "短强中弱", "中长线派发"},
+        "longflow>=5": long_flow >= 5,
+        "longflow>=7": long_flow >= 7,
+        "oi>=1.5": oi >= 1.5,
+        "oi>=4": oi >= 4,
+        "taker_buy": taker >= 1.02,
+        "taker_buy_strong": taker >= 1.08,
+        "funding_not_hot": funding < 0.08,
+        "core_long>=9": long_score >= 9,
+        "core_long>=11": long_score >= 11,
+        "crowded<=4": crowded_long <= 4,
+    }
+
+
+def print_bullish_combo_report(results):
+    candidates = [row for row in results if row.get("kind") in {"discovery", "bottom_reversal", "hot_breakout", "main_trend_watch"}]
+    feature_rows = [(row, bullish_features(row)) for row in candidates]
+    feature_names = [
+        "lead>=6",
+        "lead>=7",
+        "conv>=55",
+        "conv>=65",
+        "q>=55",
+        "q>=70",
+        "trap<=3",
+        "trap<=5",
+        "ev_bull>=8",
+        "ev_bull>=10",
+        "flow_absorb",
+        "flow_not_weak",
+        "longflow>=5",
+        "longflow>=7",
+        "oi>=1.5",
+        "oi>=4",
+        "taker_buy",
+        "taker_buy_strong",
+        "funding_not_hot",
+        "core_long>=9",
+        "core_long>=11",
+        "crowded<=4",
+    ]
+    scored = []
+    for combo in feature_combinations(feature_names, 4):
+        rows = [row for row, features in feature_rows if all(features.get(name) for name in combo)]
+        if len(rows) < 15:
+            continue
+        stat = combo_stat(rows)
+        if stat["n1"] < 15:
+            continue
+        score = (stat["wr1"], stat["avg1"] or -99, stat["wr4"], stat["avg4"] or -99, stat["n"])
+        scored.append((score, combo, stat))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    print("[BULLISH COMBOS] 偏多侧组合扫描")
+    print("范围: discovery/bottom_reversal/hot_breakout/main_trend_watch；只用信号当时可用字段。")
+    print("TOP20:")
+    for index, (_score, combo, stat) in enumerate(scored[:20], start=1):
+        print(f"{index:02d}. {' + '.join(combo)} | {combo_stat_line(stat)}")
+    print("")
+    print("样本>=30 TOP15:")
+    shown = 0
+    for _score, combo, stat in scored:
+        if stat["n"] < 30:
+            continue
+        shown += 1
+        print(f"{shown:02d}. {' + '.join(combo)} | {combo_stat_line(stat)}")
+        if shown >= 15:
+            break
+    if shown == 0:
+        print("暂无")
+    print("")
+
+
+def rescue_candidate_features(row):
+    data, core, output = route_row_core(row)
+    kind = row.get("kind") or ""
+    leading = row.get("leading_score") or 0
+    evidence = row.get("evidence_score") or 0
+    trap = row.get("trap_risk_score") or 0
+    quality = row.get("signal_quality_score") or 0
+    conviction = row.get("conviction_score") or 0
+    oi = row.get("oi_change_percent") or 0.0
+    taker = row.get("taker_buy_sell_ratio") or 0.0
+    funding = row.get("funding_rate_percent") or 0.0
+    flow_label = row.get("flow_trend_label") or ""
+    evidence_direction = row.get("evidence_direction") or ""
+    long_flow = row.get("long_flow_alignment_score") or 0
+    basis_state = row.get("basis_state") or ""
+    squeeze_state = row.get("squeeze_state_label") or ""
+    long_score = int(core.get("long_score") or 0)
+    short_score = int(core.get("short_score") or 0)
+    reverse_score = int(output.get("risk_reverse_score") or 0)
+    return {
+        "kind_discovery": kind == "discovery",
+        "kind_bottom_reversal": kind == "bottom_reversal",
+        "kind_top_risk": kind == "top_risk",
+        "kind_top_exhaustion": kind == "top_exhaustion",
+        "conv>=50": conviction >= 50,
+        "conv>=65": conviction >= 65,
+        "q>=55": quality >= 55,
+        "q>=70": quality >= 70,
+        "lead>=6": leading >= 6,
+        "lead>=8": leading >= 8,
+        "trap<=5": trap <= 5,
+        "trap>=6": trap >= 6,
+        "ev_bull>=8": evidence >= 8 and evidence_direction == "看多",
+        "ev_bull>=10": evidence >= 10 and evidence_direction == "看多",
+        "ev_risk": evidence_direction == "看空/风险",
+        "flow_in": flow_label in {"多周期共振流入", "中长线吸筹", "短强中弱", "短弱中强"},
+        "flow_absorb": flow_label in {"多周期共振流入", "中长线吸筹"},
+        "flow_distribution": flow_label == "中长线派发",
+        "flow_divergent": flow_label == "资金分歧",
+        "longflow>=5": long_flow >= 5,
+        "longflow>=7": long_flow >= 7,
+        "oi>=1.5": oi >= 1.5,
+        "oi>=4": oi >= 4,
+        "taker_buy": taker >= 1.02,
+        "taker_buy_strong": taker >= 1.08,
+        "taker_sell": 0 < taker <= 0.98,
+        "funding_not_hot": funding < 0.08,
+        "basis_ok": basis_state in {"基差正常", "贴水", "轻微升水"},
+        "squeeze_ok": squeeze_state not in {"强挤压", "多头挤压"},
+        "core_long>=9": long_score >= 9,
+        "core_short>=8": short_score >= 8,
+        "reverse>=7": reverse_score >= 7,
+    }
+
+
+def print_rescue_combo_report(results):
+    routed = [(row, route_simulation_decision(row)) for row in results]
+    base_rows = [
+        row for row, decision in routed
+        if decision.route in {"realtime", "risk_realtime", "priority_observe"}
+    ]
+    candidates = [
+        row for row, decision in routed
+        if decision.route == "digest"
+        and row.get("kind") in {"discovery", "bottom_reversal", "top_risk", "top_exhaustion"}
+    ]
+    feature_rows = [(row, rescue_candidate_features(row)) for row in candidates]
+    feature_names = [
+        "kind_discovery",
+        "kind_bottom_reversal",
+        "kind_top_risk",
+        "kind_top_exhaustion",
+        "conv>=50",
+        "conv>=65",
+        "q>=55",
+        "q>=70",
+        "lead>=6",
+        "lead>=8",
+        "trap<=5",
+        "trap>=6",
+        "ev_bull>=8",
+        "ev_bull>=10",
+        "ev_risk",
+        "flow_in",
+        "flow_absorb",
+        "flow_distribution",
+        "flow_divergent",
+        "longflow>=5",
+        "longflow>=7",
+        "oi>=1.5",
+        "oi>=4",
+        "taker_buy",
+        "taker_buy_strong",
+        "taker_sell",
+        "funding_not_hot",
+        "basis_ok",
+        "squeeze_ok",
+        "core_long>=9",
+        "core_short>=8",
+        "reverse>=7",
+    ]
+    scored = []
+    for combo in feature_combinations(feature_names, 4):
+        rows = [row for row, features in feature_rows if all(features.get(name) for name in combo)]
+        if len(rows) < 8:
+            continue
+        added = combo_stat(rows)
+        if added["n1"] < 8:
+            continue
+        combined = combo_stat(base_rows + rows)
+        score = (
+            combined["wr1"],
+            combined["avg1"] or -99,
+            added["wr1"],
+            added["avg1"] or -99,
+            combined["wr4"],
+            len(rows),
+        )
+        scored.append((score, combo, added, combined))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    print("[RESCUE COMBOS] 摘要赢家救回组合扫描")
+    print("范围: 当前 digest 的 discovery/bottom_reversal/top_risk/top_exhaustion；只用信号当时字段，不使用 K线未来代理。")
+    print(f"当前基线可见: {combo_stat_line(combo_stat(base_rows))}")
+    print("TOP20（按合并后1h胜率、合并1h均值、新增1h胜率排序）:")
+    for index, (_score, combo, added, combined) in enumerate(scored[:20], start=1):
+        print(
+            f"{index:02d}. {' + '.join(combo)} | "
+            f"新增 {combo_stat_line(added)} | 合并 {combo_stat_line(combined)}"
+        )
+    print("")
+
+
+def print_bullish_rescue_combo_report(results):
+    routed = [(row, route_simulation_decision(row)) for row in results]
+    base_rows = [
+        row for row, decision in routed
+        if decision.route in {"realtime", "risk_realtime", "priority_observe"}
+    ]
+    candidates = [
+        row for row, decision in routed
+        if decision.route == "digest"
+        and row.get("kind") in {"discovery", "bottom_reversal", "hot_breakout", "main_trend_watch"}
+    ]
+    feature_rows = [(row, rescue_candidate_features(row)) for row in candidates]
+    feature_names = [
+        "kind_discovery",
+        "kind_bottom_reversal",
+        "conv>=50",
+        "conv>=65",
+        "q>=55",
+        "q>=70",
+        "lead>=6",
+        "lead>=8",
+        "trap<=5",
+        "ev_bull>=8",
+        "ev_bull>=10",
+        "flow_in",
+        "flow_absorb",
+        "longflow>=5",
+        "longflow>=7",
+        "oi>=1.5",
+        "oi>=4",
+        "taker_buy",
+        "taker_buy_strong",
+        "funding_not_hot",
+        "basis_ok",
+        "squeeze_ok",
+        "core_long>=9",
+    ]
+    scored = []
+    for combo in feature_combinations(feature_names, 4):
+        rows = [row for row, features in feature_rows if all(features.get(name) for name in combo)]
+        if len(rows) < 6:
+            continue
+        added = combo_stat(rows)
+        if added["n1"] < 6:
+            continue
+        combined = combo_stat(base_rows + rows)
+        score = (
+            combined["wr1"],
+            combined["wr4"],
+            added["wr1"],
+            added["wr4"],
+            combined["avg1"] or -99,
+            added["n"],
+        )
+        scored.append((score, combo, added, combined))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    print("[BULLISH RESCUE COMBOS] 偏多摘要救回组合扫描")
+    print("范围: 当前 digest 的 discovery/bottom_reversal/hot_breakout/main_trend_watch；只用信号当时字段。")
+    print(f"当前基线可见: {combo_stat_line(combo_stat(base_rows))}")
+    print("TOP20（按合并后1h/4h胜率、新增1h/4h胜率排序）:")
+    shown = 0
+    for _score, combo, added, combined in scored:
+        if added["wr1"] < 60.0 or added["wr4"] < 55.0:
+            continue
+        shown += 1
+        print(
+            f"{shown:02d}. {' + '.join(combo)} | "
+            f"新增 {combo_stat_line(added)} | 合并 {combo_stat_line(combined)}"
+        )
+        if shown >= 20:
+            break
+    if shown == 0:
+        print("暂无满足新增1h>=60%且4h>=55%的组合")
+    print("")
+
+
 def duplicate_groups(results):
     ordered = sorted([x for x in results if x.get("time_ts") is not None], key=lambda item: item["time_ts"])
     last_by_key = {}
@@ -1087,12 +1606,13 @@ def print_duplicates_report(results):
     print("")
 
 
-def route_simulation_decision(row, disable_breakout_watch=False):
+def route_simulation_decision(row, disable_breakout_watch=False, model="core"):
     # Backtest rows do not persist live multi_timeframe_price_action. Reuse the
     # live Discord route rules with price_action=None so non-Kline gates stay
     # consistent. Risk realtime uses evidence_direction/evidence_score as a
     # backtest-only proxy when live Kline bearish confirmation is unavailable.
-    return live_routes.discord_route_decision(
+    fn = live_routes.discord_route_decision if model != "legacy" else live_routes.discord_route_decision_legacy
+    return fn(
         row,
         context={
             "load_price_action": False,
@@ -1218,6 +1738,21 @@ def print_route_simulation_report(results):
     print(f"realtime+priority_observe: 样本={len(realtime_priority_rows)}")
     for horizon in ("1h", "4h"):
         print_horizon_stat_line("  ", realtime_priority_rows, horizon, include_worst=True)
+    print("按方向拆分:")
+    for label, kinds in (("bullish", BULL), ("risk", BEAR)):
+        rows = [
+            x for x, decision, _base_decision in routed
+            if decision.route in {"realtime", "risk_realtime", "priority_observe"}
+            and x.get("kind") in kinds
+        ]
+        print(f"  {label}: 样本={len(rows)}")
+        for horizon in ("1h", "4h"):
+            print_horizon_stat_line("    ", rows, horizon, include_worst=True)
+        kind_counts = Counter(row.get("kind") for row in rows)
+        for kind, _count in kind_counts.most_common():
+            kind_rows = [row for row in rows if row.get("kind") == kind]
+            print(f"    {kind}: 样本={len(kind_rows)}")
+            print_horizon_stat_line("      ", kind_rows, "1h", include_worst=True)
     print("")
     print_breakout_entry_confirmation_report(routed)
 
@@ -1302,6 +1837,95 @@ def print_route_simulation_report(results):
     print("[BAD BREAKOUT WATCH FALLBACK] Discord 爆发观察兜底噪声 TOP20")
     for index, (score, x, decision) in enumerate(bad_breakout_fallback[:20], start=1):
         print(f"{index:02d}. {route_detail_line(x, decision, score)}")
+    print("")
+
+
+def _route_visible(decision):
+    return decision.route in {"realtime", "risk_realtime", "priority_observe", "observe", "conflict_observe"}
+
+
+def _route_directional_winner(row):
+    values = [row.get("1h"), row.get("4h")]
+    values = [value for value in values if value is not None]
+    return bool(values) and max(values) >= 1.5
+
+
+def _route_neutral_noise(row):
+    one = row.get("1h")
+    four = row.get("4h")
+    if one is None and four is None:
+        return False
+    one = 0.0 if one is None else one
+    four = 0.0 if four is None else four
+    return abs(one) < 0.6 and abs(four) < 1.5
+
+
+def print_route_model_comparison_report(results):
+    legacy = [(row, route_simulation_decision(row, model="legacy")) for row in results]
+    core = [(row, route_simulation_decision(row, model="core")) for row in results]
+
+    def visible_rows(items):
+        return [row for row, decision in items if _route_visible(decision)]
+
+    def visible_kind_counts(items):
+        counter = Counter()
+        for row, decision in items:
+            if _route_visible(decision):
+                counter[row["kind"]] += 1
+        return counter
+
+    old_visible = visible_rows(legacy)
+    new_visible = visible_rows(core)
+    old_winners = [row for row in old_visible if _route_directional_winner(row)]
+    new_winners = [row for row in new_visible if _route_directional_winner(row)]
+    old_noise = [row for row in old_visible if _route_neutral_noise(row)]
+    new_noise = [row for row in new_visible if _route_neutral_noise(row)]
+
+    print("[ROUTE MODEL COMPARISON] 旧逻辑 vs 新核心因子模型")
+    print("visible 定义: realtime / risk_realtime / priority_observe / observe / conflict_observe")
+    print(f"legacy visible: {len(old_visible)}")
+    for horizon in ("1h", "4h"):
+        print_horizon_stat_line("  ", old_visible, horizon, include_worst=True)
+    print(f"legacy directional_winners: {len(old_winners)}")
+    print(f"legacy neutral_noise: {len(old_noise)}")
+    print(f"core visible: {len(new_visible)}")
+    for horizon in ("1h", "4h"):
+        print_horizon_stat_line("  ", new_visible, horizon, include_worst=True)
+    print(f"core directional_winners: {len(new_winners)}")
+    print(f"core neutral_noise: {len(new_noise)}")
+    print("")
+
+    legacy_counts = visible_kind_counts(legacy)
+    core_counts = visible_kind_counts(core)
+    kinds = sorted(set(legacy_counts) | set(core_counts))
+    print("各信号类型 visible 变化:")
+    for kind in kinds:
+        old_count = legacy_counts.get(kind, 0)
+        new_count = core_counts.get(kind, 0)
+        delta = new_count - old_count
+        print(f"  {kind}: {old_count} -> {new_count} ({delta:+d})")
+    print("")
+
+    kept_winners = 0
+    downgraded_winners = []
+    for row, old_decision in legacy:
+        if not _route_visible(old_decision) or not _route_directional_winner(row):
+            continue
+        new_decision = route_simulation_decision(row, model="core")
+        if _route_visible(new_decision):
+            kept_winners += 1
+        else:
+            downgraded_winners.append((row, old_decision, new_decision))
+    print(f"旧逻辑 visible 赢家保留: {kept_winners}/{len(old_winners)}")
+    print("被新模型降回 digest 的旧 visible 赢家 TOP20:")
+    downgraded_winners.sort(key=lambda item: route_eval_score(item[0]) or 0, reverse=True)
+    for index, (row, old_decision, new_decision) in enumerate(downgraded_winners[:20], start=1):
+        score = route_eval_score(row)
+        print(
+            f"{index:02d}. {row['symbol']} {row['kind']} 旧={old_decision.route} 新={new_decision.route} "
+            f"1h={fmt(row.get('1h'))} 4h={fmt(row.get('4h'))} score={fmt(score)} "
+            f"reason={new_decision.reason}"
+        )
     print("")
 
 
@@ -1499,6 +2123,18 @@ def print_missed_winner_features_report(results):
     print("")
 
 
+def print_actual_route_report(results):
+    print("[ACTUAL ROUTES] 实际已记录路由表现")
+    for route in ("realtime", "risk_realtime", "priority_observe", "observe", "conflict_observe", "digest", "suppress", "none"):
+        rows = [x for x in results if (x.get("discord_route") or "none") == route]
+        if not rows:
+            continue
+        print(f"{route}: 样本={len(rows)}")
+        for horizon in ("1h", "4h"):
+            print_horizon_stat_line("  ", rows, horizon, include_worst=True)
+    print("")
+
+
 def print_data_coverage(total_rows, results, ctx: BacktestKlineContext):
     print("[DATA COVERAGE] 回测数据覆盖")
     print(f"总样本: {total_rows}")
@@ -1523,7 +2159,18 @@ def run_backtest(args):
     path = Path(str(cfg.get("signal_log_path", "signals.csv")))
     if not path.is_absolute():
         path = Path.cwd() / path
-    rows = list(csv.DictReader(path.open("r", encoding="utf-8")))[-args.limit:][::-1]
+    rows = list(csv.DictReader(path.open("r", encoding="utf-8")))
+    if args.date_from:
+        rows = [row for row in rows if row_day(row) >= args.date_from]
+    if args.date_to:
+        rows = [row for row in rows if row_day(row) <= args.date_to]
+    if args.sent_only:
+        rows = [
+            row for row in rows
+            if parse_bool_int(row.get("suppressed_from_telegram")) != 1
+            and (str(row.get("discord_route") or "").strip() not in {"", "suppress"})
+        ]
+    rows = rows[-args.limit:][::-1] if args.limit and args.limit > 0 else rows[::-1]
 
     session = requests.Session()
     ctx = BacktestKlineContext(
@@ -1609,6 +2256,12 @@ def run_backtest(args):
     print_combo_filter_report(results)
     print_duplicates_report(results)
     print_missed_winner_features_report(results)
+    print_actual_route_report(results)
+    print_route_model_comparison_report(results)
+    print_high_risk_reverse_combo_report(results)
+    print_bullish_combo_report(results)
+    print_rescue_combo_report(results)
+    print_bullish_rescue_combo_report(results)
     print_route_simulation_report(results)
 
 
@@ -1630,6 +2283,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--config", default="derivatives_config.yaml")
     ap.add_argument("--limit", type=int, default=80)
+    ap.add_argument("--date-from")
+    ap.add_argument("--date-to")
+    ap.add_argument("--sent-only", action="store_true")
     ap.add_argument("--export-report")
     ap.add_argument("--cache-dir", default=".cache/backtest_klines")
     ap.add_argument("--no-network", action="store_true")

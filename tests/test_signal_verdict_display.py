@@ -76,17 +76,12 @@ def test_signal_verdict_medium_long_display_in_single_embed(monkeypatch):
 
     fields = m.discord_signal_fields(sig, "B", 70, "smoke", decision)
     text = "\n".join(value for _name, value, _inline in fields)
-    verdict_value = next(value for name, value, _inline in fields if name == "SignalVerdict")
-    action_value = next(value for name, value, _inline in fields if name == "操作建议")
+    action_value = next(value for name, value, _inline in fields if name == "怎么做")
 
-    assert "裁判方向：看多" in verdict_value
-    assert "确定性：中" in verdict_value
-    assert "入场状态：等回踩确认" in verdict_value
-    assert "裁判建议：看多重点观察，等回踩确认，不追高" in verdict_value
-    assert "分数：Long" in verdict_value
     assert action_value == "看多重点观察，等回踩确认，不追高"
     assert "高确定性" not in text
     assert "强烈买入" not in text
+    assert "SignalVerdict" not in text
 
 
 def test_signal_verdict_risk_medium_display_in_candidate():

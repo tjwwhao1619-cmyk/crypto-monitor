@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Moonshot Watchlist Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-monitor
+EnvironmentFile=-/etc/crypto-monitor.env
+ExecStart=/opt/crypto-monitor/.venv/bin/python /opt/crypto-monitor/moonshot_watchlist_monitor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

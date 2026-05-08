@@ -1,0 +1,11 @@
+[Unit]
+Description=Run high R/R trade ideas scanner every 30 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Unit=trade-ideas-scanner.service
+
+[Install]
+WantedBy=timers.target

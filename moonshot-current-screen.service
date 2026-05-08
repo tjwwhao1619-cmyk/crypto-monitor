@@ -1,0 +1,10 @@
+[Unit]
+Description=Crypto Monitor current moonshot trading workbench refresh
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/crypto-monitor
+EnvironmentFile=-/etc/crypto-monitor.env
+ExecStart=/opt/crypto-monitor/.venv/bin/python /opt/crypto-monitor/alt_moonshot_current_screen.py --days 60 --min-score 55

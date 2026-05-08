@@ -1,0 +1,11 @@
+[Unit]
+Description=Crypto Monitor moonshot factor extractor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/crypto-monitor
+EnvironmentFile=-/etc/crypto-monitor.env
+ExecStart=/opt/crypto-monitor/.venv/bin/python /opt/crypto-monitor/alt_moonshot_factor_extractor.py --days 60
+Nice=10
